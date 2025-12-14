@@ -1,84 +1,91 @@
 <!doctype html>
 <html lang="de">
-<head>
-  <meta charset="utf-8" />
-  <title>OSM Offline Routing (API-first)</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="app-version" content="{{.Version}}">
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-  <link rel="stylesheet" href="/static/style.css?v={{.Version}}" />
-</head>
-<body>
-<header>
-  <h1>Offline OSM Routing (API-first)</h1>
+  <head>
+    <meta charset="utf-8" />
+    <title>OSMmini — modern UI</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="app-version" content="{{.Version}}">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="/static/style.css?v={{.Version}}" />
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="header">
+          <div class="header-top">
+            <h1>OSMmini</h1>
+            <button id="themeToggle" class="theme-toggle" title="Toggle Dark/Light Mode" aria-label="Theme toggle">🌙</button>
+          </div>
+          <p class="tag">Offline Routing</p>
+        </div>
 
-  <div class="row">
-    <div class="field">
-      <input id="from" placeholder="Start (Adresse oder 'lat lon')" value="Karl-Schmid-Straße 2, 94522 Wallersdorf" autocomplete="off" />
-      <div id="from-suggest" class="suggest"></div>
+        <section class="card route-card">
+          <h2>Route</h2>
+          <div class="input-group" id="from-group">
+            <label>Start</label>
+            <div id="from-suggest" class="suggest"></div>
+            <div id="from-container"></div>
+          </div>
+
+          <div id="waypointsContainer" class="waypoints"></div>
+          
+          <button id="addWaypoint" class="btn btn-sm btn-outline">+ Zwischenstopp</button>
+
+          <div class="input-group" id="to-group">
+            <label>Ziel</label>
+            <div id="to-suggest" class="suggest"></div>
+            <div id="to-container"></div>
+          </div>
+
+          <div class="actions">
+            <button id="go" class="btn btn-primary">Route berechnen</button>
+            <button id="clear" class="btn btn-secondary">Reset</button>
+          </div>
+        </section>
+
+        <section class="card settings-card">
+          <div class="card-header">
+            <h2>Einstellungen</h2>
+          </div>
+          <div class="row small">
+            <select id="engine">
+              <option value="astar">A* (default)</option>
+              <option value="dijkstra">Dijkstra</option>
+            </select>
+            <select id="objective">
+              <option value="distance">Distanz</option>
+              <option value="duration">Dauer</option>
+              <option value="economy">Ökonomie</option>
+            </select>
+          </div>
+          <label class="checkbox"><input id="optimize" type="checkbox" checked/> Reihenfolge optimieren</label>
+          <label class="checkbox"><input id="pro" type="checkbox"/> Erweiterte Gewichte</label>
+
+          <div id="weights" class="weights hidden">
+            <label>Linksabbiegen <input id="w_left" type="number" step="0.1"/></label>
+            <label>Rechtsabbiegen <input id="w_right" type="number" step="0.1"/></label>
+            <button id="save" class="btn btn-outline">Speichern</button>
+          </div>
+        </section>
+
+        <section class="card stops-card">
+          <h2>Ergebnis</h2>
+          <div id="info" class="info">
+            <div id="status">Bereit</div>
+            <div id="distance"></div>
+            <div class="external-links">
+                <a id="gmaps" class="link" href="#" target="_blank" style="display:none">Google Maps</a>
+                <a id="amaps" class="link" href="#" target="_blank" style="display:none">Apple Maps</a>
+            </div>
+          </div>
+          <div id="stopList" class="stop-list"></div>
+        </section>
+      </aside>
+
+      <main id="map" class="map"></main>
     </div>
-    <div class="field">
-      <input id="to" placeholder="Ziel (Adresse oder 'lat lon')" value="Marktpl. 19, 94522 Wallersdorf" autocomplete="off" />
-      <div id="to-suggest" class="suggest"></div>
-    </div>
-    <button id="go">Route</button>
-  </div>
 
-  <div class="row panel">
-    <label class="small">Engine
-      <select id="engine">
-        <option value="astar">astar</option>
-        <option value="dijkstra">dijkstra</option>
-      </select>
-    </label>
-
-    <label class="small">Objective
-      <select id="objective">
-        <option value="distance">distance</option>
-        <option value="duration">duration</option>
-        <option value="economy">economy</option>
-      </select>
-    </label>
-
-    <label class="small chk">
-      <input id="pro" type="checkbox" />
-      Pro weights
-    </label>
-
-    <label class="small chk">
-      <input id="optimize" type="checkbox" checked />
-      Optimize (TSP)
-    </label>
-
-    <button id="clear">Stops löschen</button>
-    <span class="small">Map click: Stop hinzufügen • Drag: Stop verschieben • Rechtsklick: Stop löschen</span>
-  </div>
-
-  <div class="weights" id="weights">
-    <input id="w_left"  placeholder="left_turn"  type="number" step="0.1" />
-    <input id="w_right" placeholder="right_turn" type="number" step="0.1" />
-    <input id="w_uturn" placeholder="u_turn"     type="number" step="0.1" />
-    <input id="w_cross" placeholder="crossing"   type="number" step="0.1" />
-    <input id="w_max"   placeholder="max_speed_kph" type="number" step="1" />
-    <input id="w_h"     placeholder="vehicle_height_m" type="number" step="0.1" />
-    <input id="w_w"     placeholder="vehicle_weight_t" type="number" step="0.1" />
-    <button id="save">Save settings</button>
-    <a class="small" href="/docs/" target="_blank" rel="noopener">API Docs</a>
-  </div>
-
-  <div class="list" id="stopList"></div>
-</header>
-
-<div id="map"></div>
-
-<div id="info">
-  <div class="pill" id="status">Ready</div>
-  <div class="pill" id="distance"></div>
-  <a class="pill link" id="gmaps" href="#" target="_blank" rel="noopener" style="display:none;">Google Maps</a>
-  <a class="pill link" id="amaps" href="#" target="_blank" rel="noopener" style="display:none;">Apple Maps</a>
-</div>
-
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script src="/static/app.js?v={{.Version}}"></script>
-</body>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="/static/app.js?v={{.Version}}"></script>
+  </body>
 </html>

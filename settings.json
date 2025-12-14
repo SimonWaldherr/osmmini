@@ -1,14 +1,14 @@
 {
   "routing": {
-    "engine": "astar",
+    "engine": "dijkstra",
     "objective": "distance",
-    "pro": false,
+    "pro": true,
     "weights": {
-      "left_turn": 0,
+      "left_turn": 2.4,
       "right_turn": 0,
       "u_turn": 0,
       "crossing": 0,
-      "max_speed_kph": 130,
+      "max_speed_kph": 0,
       "vehicle_height_m": 0,
       "vehicle_weight_t": 0
     }

@@ -403,12 +403,12 @@ func main() {
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 
-	// Static assets
-	webFS, _ := fs.Sub(embedded, "web")
-	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(webFS))))
+	// Static assets - prefer local files over embedded for development
+	webHandler := createHybridFileServer("cmd/web", "web")
+	mux.Handle("/static/", http.StripPrefix("/static/", webHandler))
 
-	docsFS, _ := fs.Sub(embedded, "docs")
-	mux.Handle("/docs/", http.StripPrefix("/docs/", http.FileServer(http.FS(docsFS))))
+	docsHandler := createHybridFileServer("cmd/docs", "docs")
+	mux.Handle("/docs/", http.StripPrefix("/docs/", docsHandler))
 	mux.HandleFunc("/docs", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/docs/", http.StatusFound)
 	})
@@ -431,6 +431,23 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/", s.handleIndex)
 
 	return withLogging(withCORS(mux))
+}
+
+// createHybridFileServer returns a handler that serves from localDir if it exists,
+// otherwise falls back to embedded files.
+func createHybridFileServer(localDir, embeddedDir string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Try local file first
+		localPath := filepath.Join(localDir, r.URL.Path)
+		if info, err := os.Stat(localPath); err == nil && !info.IsDir() {
+			http.ServeFile(w, r, localPath)
+			return
+		}
+
+		// Fall back to embedded
+		embedFS, _ := fs.Sub(embedded, embeddedDir)
+		http.FileServer(http.FS(embedFS)).ServeHTTP(w, r)
+	})
 }
 
 func withLogging(next http.Handler) http.Handler {
