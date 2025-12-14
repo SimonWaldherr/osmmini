@@ -29,16 +29,13 @@ func ExtractFile(path string, opts Options, cb Callbacks) error {
 }
 
 func Extract(r io.Reader, opts Options, cb Callbacks) error {
-	// sinnvolle Defaults
-	if opts.EmitWayNodeIDs == false {
-		// ok: default ist false/true je nach Wunsch; wir lassen’s wie gesetzt
-	}
-	if opts.EmitRelationMembers == false {
-		// ok
-	}
-
 	wantHighway := cb.HighwayWay != nil
-	wantAddrNode := cb.AddressNode != nil
+
+	// IMPORTANT:
+	// Nodes must still be processed if cb.Node is set, even if no address callback is used.
+	// Otherwise Router building (which relies on cb.Node) silently builds an empty graph.
+	wantNode := cb.Node != nil || cb.AddressNode != nil
+
 	wantAddrWay := cb.AddressWay != nil
 	wantAddrRel := cb.AddressRelation != nil
 
@@ -55,14 +52,14 @@ func Extract(r io.Reader, opts Options, cb Callbacks) error {
 
 		switch typ {
 		case "OSMHeader":
-			// HeaderBlock ist für unsere Filter nicht nötig
+			// HeaderBlock is not needed for our extraction/filtering.
 			continue
 		case "OSMData":
-			if err := processOSMData(raw, wantHighway, wantAddrNode, wantAddrWay, wantAddrRel, opts, cb); err != nil {
+			if err := processOSMData(raw, wantHighway, wantNode, wantAddrWay, wantAddrRel, opts, cb); err != nil {
 				return err
 			}
 		default:
-			// unbekannter Blocktyp -> ignorieren
+			// unknown block type -> ignore
 			continue
 		}
 	}
@@ -288,7 +285,7 @@ func parseAndDecompressBlob(b []byte) ([]byte, error) {
 
 // ---- OSMData: PrimitiveBlock / PrimitiveGroup ----
 
-func processOSMData(raw []byte, wantHighway, wantAddrNode, wantAddrWay, wantAddrRel bool, opts Options, cb Callbacks) error {
+func processOSMData(raw []byte, wantHighway, wantNode, wantAddrWay, wantAddrRel bool, opts Options, cb Callbacks) error {
 	ctx := blockCtx{
 		granularity: 100,
 		latOffset:   0,
@@ -371,12 +368,12 @@ func processOSMData(raw []byte, wantHighway, wantAddrNode, wantAddrWay, wantAddr
 	if ctx.st == nil || len(ctx.st) == 0 {
 		ctx.st = []string{""}
 	} else {
-		// Index 0 ist als delimiter reserviert.
+		// Index 0 is reserved as delimiter.
 		ctx.st[0] = ""
 	}
 
 	for _, g := range groups {
-		if err := processPrimitiveGroup(g, ctx, wantHighway, wantAddrNode, wantAddrWay, wantAddrRel, opts, cb); err != nil {
+		if err := processPrimitiveGroup(g, ctx, wantHighway, wantNode, wantAddrWay, wantAddrRel, opts, cb); err != nil {
 			return err
 		}
 	}
@@ -421,7 +418,7 @@ func parseStringTable(raw []byte) ([]string, error) {
 	return st, nil
 }
 
-func processPrimitiveGroup(raw []byte, ctx blockCtx, wantHighway, wantAddrNode, wantAddrWay, wantAddrRel bool, opts Options, cb Callbacks) error {
+func processPrimitiveGroup(raw []byte, ctx blockCtx, wantHighway, wantNode, wantAddrWay, wantAddrRel bool, opts Options, cb Callbacks) error {
 	i := 0
 	for i < len(raw) {
 		tag, err := readUvarint(raw, &i)
@@ -440,7 +437,7 @@ func processPrimitiveGroup(raw []byte, ctx blockCtx, wantHighway, wantAddrNode, 
 			if err != nil {
 				return err
 			}
-			if wantAddrNode {
+			if wantNode {
 				if err := processNode(msg, ctx, opts, cb); err != nil {
 					return err
 				}
@@ -454,7 +451,7 @@ func processPrimitiveGroup(raw []byte, ctx blockCtx, wantHighway, wantAddrNode, 
 			if err != nil {
 				return err
 			}
-			if wantAddrNode {
+			if wantNode {
 				if err := processDenseNodes(msg, ctx, opts, cb); err != nil {
 					return err
 				}
@@ -578,6 +575,8 @@ func processNode(raw []byte, ctx blockCtx, opts Options, cb Callbacks) error {
 	}
 
 	latDeg, lonDeg := decodeCoord(lat, lon, ctx)
+
+	// Node callback is independent of AddressNode.
 	if cb.Node != nil {
 		if err := cb.Node(id, latDeg, lonDeg); err != nil {
 			return err
@@ -702,7 +701,6 @@ func processDenseNodes(raw []byte, ctx blockCtx, opts Options, cb Callbacks) err
 		return fmt.Errorf("DenseNodes length mismatch: ids=%d lat=%d lon=%d", n, len(latDeltas), len(lonDeltas))
 	}
 
-	// Wenn keine keys_vals da sind, sind alle Nodes tagless.
 	kvIdx := 0
 	var idAcc, latAcc, lonAcc int64
 
@@ -712,6 +710,8 @@ func processDenseNodes(raw []byte, ctx blockCtx, opts Options, cb Callbacks) err
 		lonAcc += lonDeltas[idx]
 
 		latDeg, lonDeg := decodeCoord(latAcc, lonAcc, ctx)
+
+		// Node callback is independent of AddressNode.
 		if cb.Node != nil {
 			if err := cb.Node(idAcc, latDeg, lonDeg); err != nil {
 				return err
@@ -730,7 +730,6 @@ func processDenseNodes(raw []byte, ctx blockCtx, opts Options, cb Callbacks) err
 			continue
 		}
 
-		// parse tag pairs for this node
 		pairs := make([][2]int32, 0, 8)
 		isAddr := false
 
@@ -1050,7 +1049,6 @@ func processRelation(raw []byte, ctx blockCtx, opts Options, cb Callbacks) error
 			case 2:
 				mt = MemberRelation
 			default:
-				// unbekannt -> überspringen
 				continue
 			}
 
@@ -1072,7 +1070,6 @@ func processRelation(raw []byte, ctx blockCtx, opts Options, cb Callbacks) error
 // ---- Tag / Key helpers ----
 
 func scanKeys(keysSegs [][]byte, st []string, wantHighway, wantAddr bool) (bool, error) {
-	// returns: addrFound (if wantAddr) OR highwayFound (if wantHighway) ? -> wir nutzen scanWayKeys unten für beide.
 	_, addr, err := scanWayKeys(keysSegs, st, wantHighway, wantAddr)
 	return addr, err
 }
@@ -1289,12 +1286,8 @@ func skipField(wire int, b []byte, i *int) error {
 		*i += 8
 		return nil
 	case 2: // len-delimited
-		v, err := readBytes(b, i)
-		if err != nil {
-			return err
-		}
-		_ = v
-		return nil
+		_, err := readBytes(b, i)
+		return err
 	case 5: // 32-bit
 		if *i+4 > len(b) {
 			return io.ErrUnexpectedEOF

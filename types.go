@@ -1,7 +1,9 @@
 package osmmini
 
+// Tags represents OSM tags as a simple string map.
 type Tags map[string]string
 
+// Node represents a node with coordinates and tags.
 type Node struct {
 	ID   int64
 	Lat  float64
@@ -9,13 +11,15 @@ type Node struct {
 	Tags Tags
 }
 
+// Way represents a way with node references and tags.
 type Way struct {
 	ID      int64
-	NodeIDs []int64 // optional (Options.EmitWayNodeIDs)
+	NodeIDs []int64
 	Tags    Tags
 }
 
-type MemberType uint8
+// MemberType for relation members.
+type MemberType int
 
 const (
 	MemberNode MemberType = iota
@@ -23,38 +27,32 @@ const (
 	MemberRelation
 )
 
+// Member represents a relation member.
 type Member struct {
 	Type MemberType
 	ID   int64
 	Role string
 }
 
+// Relation represents an OSM relation with members and tags.
 type Relation struct {
 	ID      int64
-	Members []Member // optional (Options.EmitRelationMembers)
+	Members []Member
 	Tags    Tags
 }
 
+// Options configures Extract behaviour.
 type Options struct {
-	// Wenn nil: alle Tags behalten. Wird nur auf die OUTPUT-Tags angewandt (nicht auf die Filterlogik).
-	KeepTag func(key string) bool
-
-	// Wenn false: emitted Ways haben NodeIDs=nil (spart RAM/CPU).
-	EmitWayNodeIDs bool
-
-	// Wenn false: emitted Relations haben Members=nil.
+	KeepTag             func(string) bool
+	EmitWayNodeIDs      bool
 	EmitRelationMembers bool
 }
 
+// Callbacks passed to Extract to receive parsed entities.
 type Callbacks struct {
-	// Straßen: Ways mit key "highway"
-	HighwayWay func(w Way) error
-
-	// Adressen: Objekte mit mindestens einem key "addr:*"
+	Node            func(id int64, lat, lon float64) error
 	AddressNode     func(n Node) error
+	HighwayWay      func(w Way) error
 	AddressWay      func(w Way) error
 	AddressRelation func(r Relation) error
-
-	// Node wird für alle Knoten aufgerufen (optional, unabhängig von Adresstags).
-	Node func(id int64, lat, lon float64) error
 }

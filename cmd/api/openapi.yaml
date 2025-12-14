@@ -1,0 +1,285 @@
+openapi: 3.1.0
+info:
+  title: osmmini routerd API
+  version: "1.0.0"
+servers:
+  - url: /
+paths:
+  /api/v1/health:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+  /api/v1/status:
+    get:
+      summary: Status and graph stats
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+  /api/v1/settings:
+    get:
+      summary: Get settings
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Settings"
+    put:
+      summary: Update settings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Settings"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Settings"
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /api/v1/search:
+    get:
+      summary: Address and street search
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: { type: string }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 50, default: 10 }
+      responses:
+        "200":
+          description: Matches
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SearchResult"
+  /api/v1/route:
+    post:
+      summary: Route between two locations
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RouteRequest"
+      responses:
+        "200":
+          description: Route
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RouteResponse"
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /api/v1/trip/solve:
+    post:
+      summary: Solve a trip (multi-stop) optionally optimized (TSP) with dependencies
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TripSolveRequest"
+      responses:
+        "200":
+          description: Trip solution
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TripSolveResponse"
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /api/v1/openapi.yaml:
+    get:
+      summary: OpenAPI spec
+      responses:
+        "200":
+          description: YAML
+          content:
+            application/yaml:
+              schema:
+                type: string
+components:
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+    Tags:
+      type: object
+      additionalProperties: { type: string }
+    Coord:
+      type: object
+      required: [lat, lon]
+      properties:
+        lat: { type: number }
+        lon: { type: number }
+    Location:
+      type: object
+      properties:
+        query: { type: string }
+        lat: { type: number }
+        lon: { type: number }
+    ProWeights:
+      type: object
+      properties:
+        left_turn: { type: number }
+        right_turn: { type: number }
+        u_turn: { type: number }
+        crossing: { type: number }
+        max_speed_kph: { type: number }
+        vehicle_height_m: { type: number }
+        vehicle_weight_t: { type: number }
+    RouteOptions:
+      type: object
+      properties:
+        engine:
+          type: string
+          enum: [astar, dijkstra]
+        objective:
+          type: string
+          enum: [distance, duration, economy]
+        pro: { type: boolean }
+        weights:
+          $ref: "#/components/schemas/ProWeights"
+    RouteRequest:
+      type: object
+      required: [from, to]
+      properties:
+        from: { $ref: "#/components/schemas/Location" }
+        to: { $ref: "#/components/schemas/Location" }
+        options: { $ref: "#/components/schemas/RouteOptions" }
+    RoutePoint:
+      type: object
+      properties:
+        input: { type: string }
+        label: { type: string }
+        lat: { type: number }
+        lon: { type: number }
+        node: { type: integer }
+        snap_m: { type: number }
+    RouteResponse:
+      type: object
+      properties:
+        from: { $ref: "#/components/schemas/RoutePoint" }
+        to: { $ref: "#/components/schemas/RoutePoint" }
+        engine: { type: string }
+        objective: { type: string }
+        cost: { type: number }
+        distance_m: { type: number }
+        duration_s: { type: number }
+        path:
+          type: array
+          items: { $ref: "#/components/schemas/Coord" }
+        google_maps_url: { type: string }
+        apple_maps_url: { type: string }
+    SearchResult:
+      type: object
+      properties:
+        id: { type: integer }
+        kind: { type: string, enum: [address, street] }
+        label: { type: string }
+        lat: { type: number }
+        lon: { type: number }
+        tags: { $ref: "#/components/schemas/Tags" }
+    TripStop:
+      type: object
+      properties:
+        id: { type: string }
+        location: { $ref: "#/components/schemas/Location" }
+    Dependency:
+      type: object
+      properties:
+        before: { type: string }
+        after: { type: string }
+    TripPlan:
+      type: object
+      properties:
+        start: { $ref: "#/components/schemas/Location" }
+        end: { $ref: "#/components/schemas/Location" }
+        stops:
+          type: array
+          items: { $ref: "#/components/schemas/TripStop" }
+        dependencies:
+          type: array
+          items: { $ref: "#/components/schemas/Dependency" }
+        optimize: { type: boolean }
+        loop: { type: boolean }
+    TripSolveRequest:
+      type: object
+      properties:
+        plan: { $ref: "#/components/schemas/TripPlan" }
+        options: { $ref: "#/components/schemas/RouteOptions" }
+    TripStopResolved:
+      type: object
+      properties:
+        id: { type: string }
+        label: { type: string }
+        lat: { type: number }
+        lon: { type: number }
+        node: { type: integer }
+        snap_m: { type: number }
+    TripSolveResponse:
+      type: object
+      properties:
+        engine: { type: string }
+        objective: { type: string }
+        order:
+          type: array
+          items: { type: string }
+        stops:
+          type: array
+          items: { $ref: "#/components/schemas/TripStopResolved" }
+        distance_m: { type: number }
+        duration_s: { type: number }
+        cost: { type: number }
+        path:
+          type: array
+          items: { $ref: "#/components/schemas/Coord" }
+        legs:
+          type: array
+          items: { $ref: "#/components/schemas/RouteResponse" }
+        google_maps_url: { type: string }
+        apple_maps_url: { type: string }
+    Settings:
+      type: object
+      properties:
+        routing: { $ref: "#/components/schemas/RouteOptions" }
+        tiles:
+          type: object
+          properties:
+            cache_dir: { type: string }
+            upstream: { type: string }
+            user_agent: { type: string }

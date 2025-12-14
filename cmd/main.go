@@ -1,369 +1,1260 @@
 package main
 
 import (
+	"context"
+	"embed"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"html/template"
+	"io"
+	"io/fs"
 	"log"
+	"math"
 	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	osmmini "simonwaldherr.de/go/osmmini"
 )
 
-// Offline routing between two addresses using the local PBF and the osmmini package.
-func main() {
-	pbf := flag.String("pbf", "region.osm.pbf", "Pfad zur OSM-PBF-Datei")
-	from := flag.String("from", "Karl-Schmid-Straße 2, 94522 Wallersdorf", "Startadresse")
-	to := flag.String("to", "Marktpl. 19, 94522 Wallersdorf", "Zieladresse")
-	serve := flag.Bool("serve", false, "Weboberfläche mit HTTP-API starten")
-	listen := flag.String("listen", ":8080", "HTTP Listen-Address")
-	flag.Parse()
+//go:embed web/* docs/* api/openapi.yaml
+var embedded embed.FS
 
-	log.Printf("Lade PBF %s und baue Graph...", *pbf)
-	r, addrs, err := osmmini.BuildRouterWithAddresses(*pbf)
-	if err != nil {
-		log.Fatalf("Graph-Aufbau fehlgeschlagen: %v", err)
+const buildVersion = "dev"
+
+// ---- Settings ----
+
+type TileSettings struct {
+	CacheDir  string `json:"cache_dir"`
+	Upstream  string `json:"upstream"`
+	UserAgent string `json:"user_agent"`
+}
+
+type Settings struct {
+	Routing osmmini.RouteOptions `json:"routing"`
+	Tiles   TileSettings         `json:"tiles"`
+}
+
+func DefaultSettings(cacheDir, upstream string) Settings {
+	return Settings{
+		Routing: osmmini.RouteOptions{
+			Engine:    osmmini.EngineAStar,
+			Objective: osmmini.ObjectiveDistance,
+			Pro:       false,
+			Weights: osmmini.ProWeights{
+				LeftTurn:    0,
+				RightTurn:   0,
+				UTurn:       0,
+				Crossing:    0,
+				MaxSpeedKph: 130,
+			},
+		},
+		Tiles: TileSettings{
+			CacheDir:  cacheDir,
+			Upstream:  upstream,
+			UserAgent: "osmmini-routerd/1.0 (offline routing)",
+		},
 	}
-	log.Printf("Graph fertig: %d Knoten, %d Adressen", r.NodeCount(), len(addrs))
+}
 
-	if *serve {
-		startServer(r, addrs, *listen, *from, *to)
+type SettingsStore struct {
+	mu   sync.RWMutex
+	path string
+	v    Settings
+}
+
+func NewSettingsStore(path string, def Settings) *SettingsStore {
+	return &SettingsStore{path: path, v: def}
+}
+
+func (s *SettingsStore) Load() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	b, err := os.ReadFile(s.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return s.saveLocked()
+		}
+		return err
+	}
+	var v Settings
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	s.v = v
+	return nil
+}
+
+func (s *SettingsStore) Get() Settings {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.v
+}
+
+func (s *SettingsStore) Put(v Settings) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.v = v
+	return s.saveLocked()
+}
+
+func (s *SettingsStore) saveLocked() error {
+	tmp := s.path + ".tmp"
+	b, err := json.MarshalIndent(s.v, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.path)
+}
+
+// ---- Tile cache proxy ----
+
+type TileCache struct {
+	mu     sync.RWMutex
+	cfg    TileSettings
+	client *http.Client
+}
+
+func NewTileCache(cfg TileSettings) *TileCache {
+	return &TileCache{
+		cfg: cfg,
+		client: &http.Client{
+			Timeout: 25 * time.Second,
+		},
+	}
+}
+
+func (tc *TileCache) Update(cfg TileSettings) {
+	tc.mu.Lock()
+	tc.cfg = cfg
+	tc.mu.Unlock()
+}
+
+func (tc *TileCache) cfgCopy() TileSettings {
+	tc.mu.RLock()
+	defer tc.mu.RUnlock()
+	return tc.cfg
+}
+
+func (tc *TileCache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// /tiles/{z}/{x}/{y}.png
+	p := strings.TrimPrefix(r.URL.Path, "/tiles/")
+	parts := strings.Split(p, "/")
+	if len(parts) != 3 {
+		http.NotFound(w, r)
+		return
+	}
+	z, err1 := strconv.Atoi(parts[0])
+	x, err2 := strconv.Atoi(parts[1])
+	yPart := parts[2]
+	if err1 != nil || err2 != nil || z < 0 || z > 20 {
+		http.NotFound(w, r)
+		return
+	}
+	if !strings.HasSuffix(yPart, ".png") {
+		http.NotFound(w, r)
+		return
+	}
+	y, err3 := strconv.Atoi(strings.TrimSuffix(yPart, ".png"))
+	if err3 != nil || x < 0 || y < 0 {
+		http.NotFound(w, r)
 		return
 	}
 
-	res, err := planRoute(r, addrs, *from, *to)
-	if err != nil {
-		log.Fatalf("Routing fehlgeschlagen: %v", err)
+	cfg := tc.cfgCopy()
+	cachePath := filepath.Join(cfg.CacheDir, strconv.Itoa(z), strconv.Itoa(x), fmt.Sprintf("%d.png", y))
+	if b, ok := readFileIfExists(cachePath); ok {
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		_, _ = w.Write(b)
+		return
 	}
 
-	fmt.Printf("From: %s [%s] (%.6f, %.6f) -> graph node %d (snap %.1fm)\n",
-		res.FromInput, res.FromLabel, res.FromCoord.Lat, res.FromCoord.Lon, res.FromNode, res.FromSnapM)
-	fmt.Printf("To:   %s [%s] (%.6f, %.6f) -> graph node %d (snap %.1fm)\n",
-		res.ToInput, res.ToLabel, res.ToCoord.Lat, res.ToCoord.Lon, res.ToNode, res.ToSnapM)
-	fmt.Printf("Route: %.1f km (%d Knoten im Pfad)\n", res.DistanceM/1000, len(res.Path))
+	up := cfg.Upstream
+	up = strings.ReplaceAll(up, "{z}", strconv.Itoa(z))
+	up = strings.ReplaceAll(up, "{x}", strconv.Itoa(x))
+	up = strings.ReplaceAll(up, "{y}", strconv.Itoa(y))
+
+	req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, up, nil)
+	if cfg.UserAgent != "" {
+		req.Header.Set("User-Agent", cfg.UserAgent)
+	}
+	resp, err := tc.client.Do(req)
+	if err != nil {
+		http.Error(w, "tile upstream error", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		http.Error(w, "tile upstream non-200", http.StatusBadGateway)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil || len(body) == 0 {
+		http.Error(w, "tile read error", http.StatusBadGateway)
+		return
+	}
+
+	_ = os.MkdirAll(filepath.Dir(cachePath), 0o755)
+	_ = os.WriteFile(cachePath, body, 0o644)
+
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	_, _ = w.Write(body)
 }
 
-type routeResult struct {
-	FromInput string
-	ToInput   string
-
-	FromLabel string
-	ToLabel   string
-
-	FromCoord osmmini.Coord
-	ToCoord   osmmini.Coord
-
-	FromNode int64
-	ToNode   int64
-
-	FromSnapM float64
-	ToSnapM   float64
-
-	Path      []int64
-	PathCoord []osmmini.Coord
-	DistanceM float64
+func readFileIfExists(path string) ([]byte, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	return b, true
 }
 
-func planRoute(r *osmmini.Router, addrs []osmmini.AddressEntry, fromStr, toStr string) (routeResult, error) {
-	fromQuery := osmmini.ParseAddressGuess(fromStr)
-	toQuery := osmmini.ParseAddressGuess(toStr)
+// ---- API types ----
 
-	fromCoord, fromLabel, err := resolveCoord(r, addrs, fromQuery, fromStr)
-	if err != nil {
-		return routeResult{}, err
-	}
-	toCoord, toLabel, err := resolveCoord(r, addrs, toQuery, toStr)
-	if err != nil {
-		return routeResult{}, err
+type apiSearchResult struct {
+	ID    int64        `json:"id"`
+	Kind  string       `json:"kind"`
+	Label string       `json:"label"`
+	Lat   float64      `json:"lat"`
+	Lon   float64      `json:"lon"`
+	Tags  osmmini.Tags `json:"tags,omitempty"`
+}
+
+type Location struct {
+	Query string   `json:"query,omitempty"`
+	Lat   *float64 `json:"lat,omitempty"`
+	Lon   *float64 `json:"lon,omitempty"`
+}
+
+type RouteRequest struct {
+	From    Location              `json:"from"`
+	To      Location              `json:"to"`
+	Options *osmmini.RouteOptions `json:"options,omitempty"`
+}
+
+type RoutePoint struct {
+	Input string  `json:"input"`
+	Label string  `json:"label"`
+	Lat   float64 `json:"lat"`
+	Lon   float64 `json:"lon"`
+	Node  int64   `json:"node"`
+	SnapM float64 `json:"snap_m"`
+}
+
+type RouteResponse struct {
+	From          RoutePoint      `json:"from"`
+	To            RoutePoint      `json:"to"`
+	Engine        string          `json:"engine"`
+	Objective     string          `json:"objective"`
+	Cost          float64         `json:"cost"`
+	DistanceM     float64         `json:"distance_m"`
+	DurationS     float64         `json:"duration_s"`
+	Path          []osmmini.Coord `json:"path"`
+	GoogleMapsURL string          `json:"google_maps_url"`
+	AppleMapsURL  string          `json:"apple_maps_url"`
+}
+
+type TripStop struct {
+	ID       string   `json:"id"`
+	Location Location `json:"location"`
+}
+
+type Dependency struct {
+	Before string `json:"before"`
+	After  string `json:"after"`
+}
+
+type TripPlan struct {
+	Start        Location     `json:"start"`
+	End          *Location    `json:"end,omitempty"`
+	Stops        []TripStop   `json:"stops"`
+	Dependencies []Dependency `json:"dependencies,omitempty"`
+	Optimize     bool         `json:"optimize"`
+	Loop         bool         `json:"loop,omitempty"`
+}
+
+type TripSolveRequest struct {
+	Plan    TripPlan              `json:"plan"`
+	Options *osmmini.RouteOptions `json:"options,omitempty"`
+}
+
+type TripStopResolved struct {
+	ID    string  `json:"id"`
+	Label string  `json:"label"`
+	Lat   float64 `json:"lat"`
+	Lon   float64 `json:"lon"`
+	Node  int64   `json:"node"`
+	SnapM float64 `json:"snap_m"`
+}
+
+type TripSolveResponse struct {
+	Engine        string             `json:"engine"`
+	Objective     string             `json:"objective"`
+	Order         []string           `json:"order"`
+	Stops         []TripStopResolved `json:"stops"`
+	DistanceM     float64            `json:"distance_m"`
+	DurationS     float64            `json:"duration_s"`
+	Cost          float64            `json:"cost"`
+	Path          []osmmini.Coord    `json:"path"`
+	Legs          []RouteResponse    `json:"legs"`
+	GoogleMapsURL string             `json:"google_maps_url"`
+	AppleMapsURL  string             `json:"apple_maps_url"`
+}
+
+// ---- Server ----
+
+type server struct {
+	router        *osmmini.Router
+	addrs         []osmmini.AddressEntry
+	startedAt     time.Time
+	settings      *SettingsStore
+	tiles         *TileCache
+	window        *osmmini.CoordWindow
+	enforceWindow bool
+
+	indexTmpl *template.Template
+	openAPI   []byte
+}
+
+func main() {
+	pbf := flag.String("pbf", "region.osm.pbf", "Path to OSM PBF")
+	listen := flag.String("listen", ":8080", "HTTP listen address")
+	settingsPath := flag.String("settings", "settings.json", "Settings JSON file")
+	tilesDir := flag.String("tiles-dir", "tiles-cache", "Tile cache directory")
+	tileUpstream := flag.String("tile-upstream", "https://tile.openstreetmap.org/{z}/{x}/{y}.png", "Tile upstream template")
+
+	// Coord window support
+	windowStr := flag.String("window", "", "Coord window minLat,maxLat,minLon,maxLon (optional)")
+	windowBufferM := flag.Float64("window-buffer-m", 0, "Expand window by meters for import (optional)")
+	enforceWindow := flag.Bool("enforce-window", false, "Reject requests outside window (if window set)")
+
+	flag.Parse()
+
+	var win *osmmini.CoordWindow
+	if strings.TrimSpace(*windowStr) != "" {
+		w, err := parseWindow(*windowStr)
+		if err != nil {
+			log.Fatalf("invalid --window: %v", err)
+		}
+		win = &w
 	}
 
-	startID, startDist, ok := r.NearestNode(fromCoord.Lat, fromCoord.Lon)
+	log.Printf("Loading PBF %s and building router...", *pbf)
+	r, addrs, err := osmmini.BuildRouterWithAddressesOptions(*pbf, osmmini.BuildOptions{
+		Window:        win,
+		WindowBufferM: *windowBufferM,
+	})
+	if err != nil {
+		log.Fatalf("router build failed: %v", err)
+	}
+
+	if b, ok := r.Bounds(); ok {
+		log.Printf("Graph bounds: lat[%.6f..%.6f] lon[%.6f..%.6f]", b.MinLat, b.MaxLat, b.MinLon, b.MaxLon)
+	}
+	log.Printf("Graph ready: nodes=%d edges=%d addresses=%d", r.NodeCount(), r.EdgeCount(), len(addrs))
+
+	store := NewSettingsStore(*settingsPath, DefaultSettings(*tilesDir, *tileUpstream))
+	if err := store.Load(); err != nil {
+		log.Fatalf("settings load failed: %v", err)
+	}
+	tileCache := NewTileCache(store.Get().Tiles)
+
+	indexTmpl := template.Must(template.ParseFS(embedded, "web/index.html"))
+	openapiBytes, _ := embedded.ReadFile("api/openapi.yaml")
+
+	srv := &server{
+		router:        r,
+		addrs:         addrs,
+		startedAt:     time.Now(),
+		settings:      store,
+		tiles:         tileCache,
+		window:        win,
+		enforceWindow: *enforceWindow,
+		indexTmpl:     indexTmpl,
+		openAPI:       openapiBytes,
+	}
+
+	httpSrv := &http.Server{
+		Addr:              *listen,
+		Handler:           srv.routes(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       20 * time.Second,
+		WriteTimeout:      120 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
+
+	log.Printf("Listening on %s", *listen)
+	log.Fatal(httpSrv.ListenAndServe())
+}
+
+func (s *server) routes() http.Handler {
+	mux := http.NewServeMux()
+
+	// Static assets
+	webFS, _ := fs.Sub(embedded, "web")
+	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(webFS))))
+
+	docsFS, _ := fs.Sub(embedded, "docs")
+	mux.Handle("/docs/", http.StripPrefix("/docs/", http.FileServer(http.FS(docsFS))))
+	mux.HandleFunc("/docs", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/docs/", http.StatusFound)
+	})
+
+	// OpenAPI
+	mux.HandleFunc("/api/v1/openapi.yaml", s.handleOpenAPI)
+
+	// Tiles
+	mux.Handle("/tiles/", s.tiles)
+
+	// API
+	mux.HandleFunc("/api/v1/health", s.handleHealth)
+	mux.HandleFunc("/api/v1/status", s.handleStatus)
+	mux.HandleFunc("/api/v1/settings", s.handleSettings)
+	mux.HandleFunc("/api/v1/search", s.handleSearch)
+	mux.HandleFunc("/api/v1/route", s.handleRoute)
+	mux.HandleFunc("/api/v1/trip/solve", s.handleTripSolve)
+
+	// UI
+	mux.HandleFunc("/", s.handleIndex)
+
+	return withLogging(withCORS(mux))
+}
+
+func withLogging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t0 := time.Now()
+		next.ServeHTTP(w, r)
+		log.Printf("%s %s (%s)", r.Method, r.URL.Path, time.Since(t0))
+	})
+}
+
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(v)
+}
+
+func writeJSONError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+func readJSON(w http.ResponseWriter, r *http.Request, dst any, maxBytes int64) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+	defer r.Body.Close()
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return errors.New("unexpected extra json")
+	}
+	return nil
+}
+
+// ---- Handlers ----
+
+func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = s.indexTmpl.Execute(w, map[string]any{
+		"Version": buildVersion,
+	})
+}
+
+func (s *server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(s.openAPI)
+}
+
+func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	uptime := time.Since(s.startedAt).Seconds()
+	set := s.settings.Get()
+
+	out := map[string]any{
+		"uptime_s":  uptime,
+		"graph":     map[string]any{"nodes": s.router.NodeCount(), "edges": s.router.EdgeCount()},
+		"addresses": len(s.addrs),
+		"settings":  set,
+	}
+	if s.window != nil {
+		out["window"] = s.window
+		out["enforce_window"] = s.enforceWindow
+	}
+	if b, ok := s.router.Bounds(); ok {
+		out["graph_bounds"] = b
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *server) handleSettings(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, s.settings.Get())
+		return
+	case http.MethodPut:
+		var v Settings
+		if err := readJSON(w, r, &v, 1<<20); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+			return
+		}
+		if v.Tiles.CacheDir == "" {
+			writeJSONError(w, http.StatusBadRequest, "tiles.cache_dir required")
+			return
+		}
+		if v.Tiles.Upstream == "" {
+			writeJSONError(w, http.StatusBadRequest, "tiles.upstream required")
+			return
+		}
+		if err := s.settings.Put(v); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		s.tiles.Update(v.Tiles)
+		writeJSON(w, http.StatusOK, v)
+		return
+	default:
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+}
+
+func (s *server) handleSearch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	if q == "" {
+		writeJSON(w, http.StatusOK, []apiSearchResult{})
+		return
+	}
+	limit := parseLimit(r.URL.Query().Get("limit"), 10, 1, 50)
+	aq := osmmini.ParseAddressGuess(q)
+	addrMatches := osmmini.SearchAddresses(s.addrs, aq, limit)
+
+	out := make([]apiSearchResult, 0, limit)
+	for _, m := range addrMatches {
+		if s.window != nil && !s.window.Contains(m.Coord) {
+			continue
+		}
+		out = append(out, apiSearchResult{
+			ID:    m.ID,
+			Kind:  "address",
+			Label: formatAddressLabel(m.Tags),
+			Lat:   m.Coord.Lat,
+			Lon:   m.Coord.Lon,
+			Tags:  m.Tags,
+		})
+	}
+	remain := limit - len(out)
+	if remain > 0 {
+		streetMatches := s.router.SearchStreets(q, remain)
+		for _, st := range streetMatches {
+			if s.window != nil && !s.window.Contains(st.Coord) {
+				continue
+			}
+			out = append(out, apiSearchResult{
+				ID:    st.NodeID,
+				Kind:  "street",
+				Label: st.Name,
+				Lat:   st.Coord.Lat,
+				Lon:   st.Coord.Lon,
+				Tags:  osmmini.Tags{"street": st.Name},
+			})
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *server) handleRoute(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req RouteRequest
+	if err := readJSON(w, r, &req, 1<<20); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+
+	opt := s.settings.Get().Routing
+	if req.Options != nil {
+		opt = *req.Options
+	}
+
+	fromCoord, fromLabel, fromInput, err := s.resolveLocation(req.From)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "from: "+err.Error())
+		return
+	}
+	toCoord, toLabel, toInput, err := s.resolveLocation(req.To)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "to: "+err.Error())
+		return
+	}
+
+	startID, startDist, ok := s.router.NearestNode(fromCoord.Lat, fromCoord.Lon)
 	if !ok {
-		return routeResult{}, fmt.Errorf("kein Startknoten im Graph gefunden")
+		writeJSONError(w, http.StatusBadRequest, "no start node found")
+		return
 	}
-	endID, endDist, ok := r.NearestNode(toCoord.Lat, toCoord.Lon)
+	endID, endDist, ok := s.router.NearestNode(toCoord.Lat, toCoord.Lon)
 	if !ok {
-		return routeResult{}, fmt.Errorf("kein Zielknoten im Graph gefunden")
+		writeJSONError(w, http.StatusBadRequest, "no end node found")
+		return
 	}
 
-	path, meters, err := r.Route(startID, endID)
+	res, err := s.router.RouteWithOptions(r.Context(), startID, endID, opt)
 	if err != nil {
-		return routeResult{}, err
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(res.PathCoords) == 0 {
+		writeJSONError(w, http.StatusInternalServerError, "empty path")
+		return
 	}
 
-	return routeResult{
-		FromInput: fromStr,
-		ToInput:   toStr,
-		FromLabel: fromLabel,
-		ToLabel:   toLabel,
-		FromCoord: fromCoord,
-		ToCoord:   toCoord,
-		FromNode:  startID,
-		ToNode:    endID,
-		FromSnapM: startDist,
-		ToSnapM:   endDist,
-		Path:      path,
-		PathCoord: r.CoordsForPath(path),
-		DistanceM: meters,
+	gURL := buildGoogleMapsURL([]osmmini.Coord{fromCoord, toCoord}, 0)
+	aURL := buildAppleMapsURL([]osmmini.Coord{fromCoord, toCoord})
+
+	writeJSON(w, http.StatusOK, RouteResponse{
+		From: RoutePoint{
+			Input: fromInput,
+			Label: fromLabel,
+			Lat:   fromCoord.Lat,
+			Lon:   fromCoord.Lon,
+			Node:  startID,
+			SnapM: startDist,
+		},
+		To: RoutePoint{
+			Input: toInput,
+			Label: toLabel,
+			Lat:   toCoord.Lat,
+			Lon:   toCoord.Lon,
+			Node:  endID,
+			SnapM: endDist,
+		},
+		Engine:        string(res.Engine),
+		Objective:     string(res.Objective),
+		Cost:          res.Cost,
+		DistanceM:     res.DistanceM,
+		DurationS:     res.DurationS,
+		Path:          res.PathCoords,
+		GoogleMapsURL: gURL,
+		AppleMapsURL:  aURL,
+	})
+}
+
+func (s *server) handleTripSolve(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req TripSolveRequest
+	if err := readJSON(w, r, &req, 4<<20); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+
+	opt := s.settings.Get().Routing
+	if req.Options != nil {
+		opt = *req.Options
+	}
+
+	resp, err := s.solveTrip(r.Context(), req.Plan, opt)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// ---- Trip / TSP ----
+
+type stopR struct {
+	id    string
+	label string
+	coord osmmini.Coord
+	node  int64
+	snap  float64
+}
+
+func (s *server) solveTrip(ctx context.Context, plan TripPlan, opt osmmini.RouteOptions) (TripSolveResponse, error) {
+	startCoord, startLabel, _, err := s.resolveLocation(plan.Start)
+	if err != nil {
+		return TripSolveResponse{}, fmt.Errorf("start: %w", err)
+	}
+	startNode, startSnap, ok := s.router.NearestNode(startCoord.Lat, startCoord.Lon)
+	if !ok {
+		return TripSolveResponse{}, errors.New("start: no graph node found")
+	}
+
+	var endLoc Location
+	if plan.Loop || plan.End == nil {
+		endLoc = plan.Start
+	} else {
+		endLoc = *plan.End
+	}
+	endCoord, endLabel, _, err := s.resolveLocation(endLoc)
+	if err != nil {
+		return TripSolveResponse{}, fmt.Errorf("end: %w", err)
+	}
+	endNode, endSnap, ok := s.router.NearestNode(endCoord.Lat, endCoord.Lon)
+	if !ok {
+		return TripSolveResponse{}, errors.New("end: no graph node found")
+	}
+
+	if len(plan.Stops) > 60 {
+		return TripSolveResponse{}, errors.New("too many stops (max 60)")
+	}
+
+	stops := make([]stopR, 0, len(plan.Stops))
+	seen := map[string]bool{}
+	for i, st := range plan.Stops {
+		id := strings.TrimSpace(st.ID)
+		if id == "" {
+			id = fmt.Sprintf("S%d", i+1)
+		}
+		if seen[id] {
+			return TripSolveResponse{}, fmt.Errorf("duplicate stop id: %s", id)
+		}
+		seen[id] = true
+
+		c, lab, in, err := s.resolveLocation(st.Location)
+		if err != nil {
+			return TripSolveResponse{}, fmt.Errorf("stop %s: %w", id, err)
+		}
+		n, snap, ok := s.router.NearestNode(c.Lat, c.Lon)
+		if !ok {
+			return TripSolveResponse{}, fmt.Errorf("stop %s: no graph node found", id)
+		}
+		_ = in
+		stops = append(stops, stopR{id: id, label: lab, coord: c, node: n, snap: snap})
+	}
+
+	n := len(stops)
+	idToIdx := make(map[string]int, n)
+	for i := range stops {
+		idToIdx[stops[i].id] = i
+	}
+
+	pre := make([]uint64, n)
+	for _, d := range plan.Dependencies {
+		a := strings.TrimSpace(d.Before)
+		b := strings.TrimSpace(d.After)
+		ia, okA := idToIdx[a]
+		ib, okB := idToIdx[b]
+		if !okA || !okB {
+			return TripSolveResponse{}, fmt.Errorf("dependency refers to unknown id: %q -> %q", a, b)
+		}
+		pre[ib] |= (1 << uint64(ia))
+	}
+
+	var orderIdx []int
+	if n == 0 {
+		orderIdx = nil
+	} else if !plan.Optimize {
+		mask := uint64(0)
+		for _, st := range stops {
+			i := idToIdx[st.id]
+			if (mask & pre[i]) != pre[i] {
+				return TripSolveResponse{}, fmt.Errorf("dependency violated before visiting %s", st.id)
+			}
+			mask |= 1 << uint64(i)
+		}
+		orderIdx = make([]int, n)
+		for i := 0; i < n; i++ {
+			orderIdx[i] = i
+		}
+	} else {
+		if n <= 16 {
+			ord, err := s.tspExact(ctx, startNode, endNode, stops, pre, opt)
+			if err != nil {
+				return TripSolveResponse{}, err
+			}
+			orderIdx = ord
+		} else {
+			ord, err := s.tspGreedy(ctx, startNode, endNode, stops, pre, opt)
+			if err != nil {
+				return TripSolveResponse{}, err
+			}
+			orderIdx = ord
+		}
+	}
+
+	points := make([]stopR, 0, n+2)
+	points = append(points, stopR{id: "START", label: startLabel, coord: startCoord, node: startNode, snap: startSnap})
+	for _, i := range orderIdx {
+		points = append(points, stops[i])
+	}
+	points = append(points, stopR{id: "END", label: endLabel, coord: endCoord, node: endNode, snap: endSnap})
+
+	totalDist, totalDur, totalCost := 0.0, 0.0, 0.0
+	legs := make([]RouteResponse, 0, len(points)-1)
+	combined := make([]osmmini.Coord, 0, 4096)
+
+	for i := 0; i < len(points)-1; i++ {
+		a := points[i]
+		b := points[i+1]
+		rr, err := s.router.RouteWithOptions(ctx, a.node, b.node, opt)
+		if err != nil {
+			return TripSolveResponse{}, fmt.Errorf("leg %s->%s: %w", a.id, b.id, err)
+		}
+		if len(rr.PathCoords) == 0 {
+			return TripSolveResponse{}, fmt.Errorf("leg %s->%s: empty path", a.id, b.id)
+		}
+
+		legs = append(legs, RouteResponse{
+			From:          RoutePoint{Input: a.id, Label: a.label, Lat: a.coord.Lat, Lon: a.coord.Lon, Node: a.node, SnapM: a.snap},
+			To:            RoutePoint{Input: b.id, Label: b.label, Lat: b.coord.Lat, Lon: b.coord.Lon, Node: b.node, SnapM: b.snap},
+			Engine:        string(rr.Engine),
+			Objective:     string(rr.Objective),
+			Cost:          rr.Cost,
+			DistanceM:     rr.DistanceM,
+			DurationS:     rr.DurationS,
+			Path:          rr.PathCoords,
+			GoogleMapsURL: buildGoogleMapsURL([]osmmini.Coord{a.coord, b.coord}, 0),
+			AppleMapsURL:  buildAppleMapsURL([]osmmini.Coord{a.coord, b.coord}),
+		})
+
+		totalDist += rr.DistanceM
+		totalDur += rr.DurationS
+		totalCost += rr.Cost
+
+		if i == 0 {
+			combined = append(combined, rr.PathCoords...)
+		} else {
+			combined = append(combined, rr.PathCoords[1:]...)
+		}
+	}
+
+	orderIDs := make([]string, 0, len(orderIdx))
+	resStops := make([]TripStopResolved, 0, len(orderIdx))
+	for _, i := range orderIdx {
+		orderIDs = append(orderIDs, stops[i].id)
+		resStops = append(resStops, TripStopResolved{
+			ID:    stops[i].id,
+			Label: stops[i].label,
+			Lat:   stops[i].coord.Lat,
+			Lon:   stops[i].coord.Lon,
+			Node:  stops[i].node,
+			SnapM: stops[i].snap,
+		})
+	}
+
+	tripCoords := make([]osmmini.Coord, 0, len(points))
+	for _, p := range points {
+		tripCoords = append(tripCoords, p.coord)
+	}
+
+	return TripSolveResponse{
+		Engine:        string(opt.Engine),
+		Objective:     string(opt.Objective),
+		Order:         orderIDs,
+		Stops:         resStops,
+		DistanceM:     totalDist,
+		DurationS:     totalDur,
+		Cost:          totalCost,
+		Path:          combined,
+		Legs:          legs,
+		GoogleMapsURL: buildGoogleMapsURL(tripCoords, 9),
+		AppleMapsURL:  buildAppleMapsURL(tripCoords),
 	}, nil
 }
 
-func resolveCoord(r *osmmini.Router, addrs []osmmini.AddressEntry, q osmmini.AddressQuery, raw string) (osmmini.Coord, string, error) {
-	addr, ok := osmmini.FindBestAddress(addrs, q)
-	if ok {
-		return addr.Coord, fmt.Sprintf("Adresse %s", addr.Tags["addr:street"]), nil
+func (s *server) tspExact(ctx context.Context, startNode, endNode int64, stops []stopR, pre []uint64, opt osmmini.RouteOptions) ([]int, error) {
+	n := len(stops)
+	if n == 0 {
+		return nil, nil
 	}
-	if nodeID, okStreet := r.StreetNode(q.Street); okStreet {
-		c, _ := r.Coord(nodeID)
-		return c, fmt.Sprintf("Straßensnapshot %s", q.Street), nil
-	}
-	return osmmini.Coord{}, "", fmt.Errorf("Adresse nicht gefunden: %s", raw)
-}
 
-func startServer(r *osmmini.Router, addrs []osmmini.AddressEntry, listen, defaultFrom, defaultTo string) {
-	// search endpoint (registered once)
-	http.HandleFunc("/search", func(w http.ResponseWriter, req *http.Request) {
-		q := strings.TrimSpace(req.URL.Query().Get("q"))
-		if q == "" {
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode([]interface{}{})
-			return
+	inf := math.MaxFloat64 / 4
+
+	costStart := make([]float64, n)
+	costEnd := make([]float64, n)
+	costBetween := make([][]float64, n)
+	for i := 0; i < n; i++ {
+		costBetween[i] = make([]float64, n)
+	}
+
+	for i := 0; i < n; i++ {
+		c, err := s.router.RouteCostWithOptions(ctx, startNode, stops[i].node, opt)
+		if err != nil {
+			costStart[i] = inf
+		} else {
+			costStart[i] = c
 		}
-		limit := 10
-		if l := req.URL.Query().Get("limit"); l != "" {
-			// ignore parse errors and keep default
+		c2, err := s.router.RouteCostWithOptions(ctx, stops[i].node, endNode, opt)
+		if err != nil {
+			costEnd[i] = inf
+		} else {
+			costEnd[i] = c2
 		}
-		aq := osmmini.ParseAddressGuess(q)
-		matches := osmmini.SearchAddresses(addrs, aq, limit)
-		out := make([]map[string]interface{}, 0, len(matches))
-		for _, m := range matches {
-			out = append(out, map[string]interface{}{
-				"id": m.ID,
-				"label": func() string {
-					if s := m.Tags["addr:street"]; s != "" {
-						return s
-					}
-					return m.Tags["name"]
-				}(),
-				"lat":  m.Coord.Lat,
-				"lon":  m.Coord.Lon,
-				"tags": m.Tags,
-			})
-		}
-		// If no address matches found, also try matching street names from the graph
-		if len(out) == 0 {
-			streetMatches := r.SearchStreets(q, limit)
-			for _, s := range streetMatches {
-				out = append(out, map[string]interface{}{
-					"id": s.NodeID,
-					"label": func() string {
-						// display a human-friendly name by un-normalizing if possible
-						return s.Name
-					}(),
-					"lat":  s.Coord.Lat,
-					"lon":  s.Coord.Lon,
-					"tags": map[string]string{"street": s.Name},
-				})
+	}
+
+	for i := 0; i < n; i++ {
+		for j := 0; j < n; j++ {
+			if i == j {
+				costBetween[i][j] = inf
+				continue
+			}
+			c, err := s.router.RouteCostWithOptions(ctx, stops[i].node, stops[j].node, opt)
+			if err != nil {
+				costBetween[i][j] = inf
+			} else {
+				costBetween[i][j] = c
 			}
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(out)
-	})
+	}
 
-	http.HandleFunc("/route", func(w http.ResponseWriter, req *http.Request) {
-		from := strings.TrimSpace(req.URL.Query().Get("from"))
-		to := strings.TrimSpace(req.URL.Query().Get("to"))
-		if from == "" {
-			from = defaultFrom
+	size := 1 << uint(n)
+	dp := make([][]float64, size)
+	par := make([][]int16, size)
+	for m := 0; m < size; m++ {
+		dp[m] = make([]float64, n)
+		par[m] = make([]int16, n)
+		for i := 0; i < n; i++ {
+			dp[m][i] = inf
+			par[m][i] = -1
 		}
-		if to == "" {
-			to = defaultTo
+	}
+
+	for i := 0; i < n; i++ {
+		if pre[i] == 0 && costStart[i] < inf {
+			m := 1 << uint(i)
+			dp[m][i] = costStart[i]
+			par[m][i] = -1
 		}
+	}
 
-		res, err := planRoute(r, addrs, from, to)
-		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-			return
+	for m := 0; m < size; m++ {
+		for last := 0; last < n; last++ {
+			if dp[m][last] >= inf {
+				continue
+			}
+			for nxt := 0; nxt < n; nxt++ {
+				if (m & (1 << uint(nxt))) != 0 {
+					continue
+				}
+				if (uint64(m) & pre[nxt]) != pre[nxt] {
+					continue
+				}
+				nm := m | (1 << uint(nxt))
+				c := dp[m][last] + costBetween[last][nxt]
+				if c < dp[nm][nxt] {
+					dp[nm][nxt] = c
+					par[nm][nxt] = int16(last)
+				}
+			}
 		}
+	}
 
-		w.Header().Set("Content-Type", "application/json")
-		// Build path with lowercase keys for JS convenience
-		if len(res.PathCoord) == 0 {
-			w.WriteHeader(http.StatusInternalServerError)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "empty path"})
-			return
+	all := size - 1
+	best := inf
+	bestLast := -1
+	for last := 0; last < n; last++ {
+		if dp[all][last] >= inf || costEnd[last] >= inf {
+			continue
 		}
-		path := make([]map[string]float64, 0, len(res.PathCoord))
-		for _, c := range res.PathCoord {
-			path = append(path, map[string]float64{"lat": c.Lat, "lon": c.Lon})
+		c := dp[all][last] + costEnd[last]
+		if c < best {
+			best = c
+			bestLast = last
 		}
+	}
+	if bestLast == -1 {
+		return nil, errors.New("tsp: no feasible order (unreachable legs or dependency cycle)")
+	}
 
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"from": map[string]interface{}{
-				"input":  res.FromInput,
-				"label":  res.FromLabel,
-				"lat":    res.FromCoord.Lat,
-				"lon":    res.FromCoord.Lon,
-				"node":   res.FromNode,
-				"snap_m": res.FromSnapM,
-			},
-			"to": map[string]interface{}{
-				"input":  res.ToInput,
-				"label":  res.ToLabel,
-				"lat":    res.ToCoord.Lat,
-				"lon":    res.ToCoord.Lon,
-				"node":   res.ToNode,
-				"snap_m": res.ToSnapM,
-			},
-			"distance_m": res.DistanceM,
-			"path":       path,
-		})
-	})
-
-	http.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write([]byte(indexHTML))
-	})
-
-	log.Printf("Webserver läuft auf %s (GET / für UI, GET /route?from=...&to=... für API)", listen)
-	log.Fatal(http.ListenAndServe(listen, nil))
+	order := make([]int, 0, n)
+	m := all
+	cur := bestLast
+	for cur >= 0 {
+		order = append(order, cur)
+		p := par[m][cur]
+		m = m &^ (1 << uint(cur))
+		if p < 0 {
+			break
+		}
+		cur = int(p)
+	}
+	for i, j := 0, len(order)-1; i < j; i, j = i+1, j-1 {
+		order[i], order[j] = order[j], order[i]
+	}
+	return order, nil
 }
 
-const indexHTML = `<!doctype html>
-<html lang="de">
-<head>
-  <meta charset="utf-8" />
-  <title>OSM Offline Routing</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-	<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-  <style>
-    body { margin: 0; font-family: system-ui, sans-serif; background: #0b1021; color: #e8ecf8; }
-    header { padding: 12px 16px; background: linear-gradient(120deg, #122347, #0b1021); box-shadow: 0 2px 10px rgba(0,0,0,0.35); position: sticky; top: 0; z-index: 10; }
-    h1 { margin: 0; font-size: 18px; letter-spacing: 0.3px; }
-    form { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; margin-top: 10px; }
-    input { padding: 10px; border-radius: 8px; border: 1px solid #2c3a5d; background: #0f1934; color: #e8ecf8; }
-    button { padding: 10px 16px; border-radius: 8px; border: none; background: #4da3ff; color: #0b1021; font-weight: 700; cursor: pointer; }
-    button:hover { background: #76b8ff; }
-    #map { height: calc(100vh - 130px); width: 100%; }
-    #info { padding: 10px 16px; background: #0f1934; border-top: 1px solid #1f2c4b; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
-    .pill { padding: 6px 10px; border-radius: 999px; background: #152650; border: 1px solid #27407a; }
-    a { color: #9cd0ff; }
-		.suggest { position: absolute; left: 0; right: 0; top: 44px; background: #071029; border: 1px solid #1f2c4b; z-index: 20; max-height: 220px; overflow: auto; display: none; }
-		.suggest .item { padding: 8px 10px; cursor: pointer; border-bottom: 1px solid rgba(255,255,255,0.02); }
-		.suggest .item:hover { background: rgba(77,163,255,0.08); }
-  </style>
-</head>
-<body>
-  <header>
-    <h1>Offline OSM Routing</h1>
-		<form id="route-form">
-			<div style="position:relative">
-				<input id="from" name="from" placeholder="Von" value="Klöpfstraße 2 94522 Wallersdorf" autocomplete="off" />
-				<div id="from-suggest" class="suggest"></div>
-			</div>
-			<div style="position:relative">
-				<input id="to" name="to" placeholder="Nach" value="Kaplan-Strohmeier-Straße Leiblfing" autocomplete="off" />
-				<div id="to-suggest" class="suggest"></div>
-			</div>
-			<button type="submit">Route berechnen</button>
-		</form>
-  </header>
-  <div id="map"></div>
-  <div id="info">
-    <div class="pill" id="status">Bereit</div>
-    <div class="pill" id="distance"></div>
-  </div>
+func (s *server) tspGreedy(ctx context.Context, startNode, endNode int64, stops []stopR, pre []uint64, opt osmmini.RouteOptions) ([]int, error) {
+	n := len(stops)
+	if n == 0 {
+		return nil, nil
+	}
+	visited := uint64(0)
+	order := make([]int, 0, n)
+	curNode := startNode
 
-	<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script>
-    const map = L.map('map').setView([48.7, 12.7], 10);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom: 19,
-      attribution: '&copy; OpenStreetMap contributors'
-    }).addTo(map);
-
-    let line, startM, endM;
-
-    async function fetchRoute(from, to) {
-      const params = new URLSearchParams({from, to});
-      const res = await fetch('/route?' + params.toString());
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.error || res.statusText);
-      }
-      return res.json();
-    }
-
-    function render(data) {
-      const coords = data.path.map(p => [p.lat, p.lon]);
-      if (line) line.remove();
-      if (startM) startM.remove();
-      if (endM) endM.remove();
-      line = L.polyline(coords, {color: '#4da3ff', weight: 5}).addTo(map);
-      startM = L.circleMarker(coords[0], {radius: 6, color: '#7cf29c', fillColor: '#7cf29c', fillOpacity: 0.9}).addTo(map);
-      endM = L.circleMarker(coords[coords.length-1], {radius: 6, color: '#ffb347', fillColor: '#ffb347', fillOpacity: 0.9}).addTo(map);
-      map.fitBounds(line.getBounds(), {padding: [30, 30]});
-
-	document.getElementById('status').textContent = 'OK: ' + data.from.label + ' \u2192 ' + data.to.label;
-	document.getElementById('distance').textContent = (data.distance_m/1000).toFixed(1) + ' km | ' + data.path.length + ' Punkte';
-    }
-
-    document.getElementById('route-form').addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const from = document.getElementById('from').value.trim();
-      const to = document.getElementById('to').value.trim();
-      document.getElementById('status').textContent = 'Berechne...';
-      try {
-        const data = await fetchRoute(from, to);
-        render(data);
-      } catch (err) {
-        document.getElementById('status').textContent = 'Fehler: ' + err.message;
-      }
-    });
-
-    // initial route
-    fetchRoute(document.getElementById('from').value, document.getElementById('to').value)
-      .then(render)
-      .catch(err => document.getElementById('status').textContent = 'Fehler: ' + err.message);
-
-		// autocomplete helpers
-		function makeSuggest(containerId, inputId) {
-			const container = document.getElementById(containerId);
-			const input = document.getElementById(inputId);
-			let timeout = null;
-			input.addEventListener('input', () => {
-				const q = input.value.trim();
-				if (timeout) clearTimeout(timeout);
-				if (q.length < 2) { container.style.display = 'none'; return; }
-				timeout = setTimeout(async () => {
-					try {
-						const res = await fetch('/search?q=' + encodeURIComponent(q));
-						if (!res.ok) return;
-						const data = await res.json();
-						container.innerHTML = '';
-						if (!Array.isArray(data) || data.length === 0) { container.style.display = 'none'; return; }
-						data.slice(0,10).forEach(item => {
-							const el = document.createElement('div');
-							el.className = 'item';
-							const name = (item.label || (item.tags && item.tags['addr:street']) || (item.tags && item.tags.name) || '');
-							const city = (item.tags && (item.tags['addr:city'] || item.tags['addr:place'])) || '';
-							el.textContent = name + (city ? ' — ' + city : '');
-							el.addEventListener('click', () => { input.value = name; container.style.display = 'none'; });
-							container.appendChild(el);
-						});
-						container.style.display = 'block';
-					} catch (err) {
-						container.style.display = 'none';
-					}
-				}, 240);
-			});
-			document.addEventListener('click', (ev) => { if (!container.contains(ev.target) && ev.target !== input) container.style.display = 'none'; });
+	for len(order) < n {
+		best := math.MaxFloat64
+		bestIdx := -1
+		for i := 0; i < n; i++ {
+			bit := uint64(1) << uint64(i)
+			if (visited & bit) != 0 {
+				continue
+			}
+			if (visited & pre[i]) != pre[i] {
+				continue
+			}
+			c, err := s.router.RouteCostWithOptions(ctx, curNode, stops[i].node, opt)
+			if err != nil {
+				continue
+			}
+			if c < best {
+				best = c
+				bestIdx = i
+			}
 		}
+		if bestIdx == -1 {
+			return nil, errors.New("tsp: no eligible next stop (dependency cycle or unreachable stop)")
+		}
+		order = append(order, bestIdx)
+		visited |= uint64(1) << uint64(bestIdx)
+		curNode = stops[bestIdx].node
+	}
+	_ = endNode
+	return order, nil
+}
 
-		makeSuggest('from-suggest','from');
-		makeSuggest('to-suggest','to');
-  </script>
-</body>
-</html>`
+// ---- Location resolve + window enforcement ----
+
+func (s *server) resolveLocation(loc Location) (osmmini.Coord, string, string, error) {
+	if loc.Lat != nil && loc.Lon != nil {
+		lat, lon := *loc.Lat, *loc.Lon
+		if lat < -90 || lat > 90 || lon < -180 || lon > 180 {
+			return osmmini.Coord{}, "", "", errors.New("invalid lat/lon")
+		}
+		c := osmmini.Coord{Lat: lat, Lon: lon}
+		if s.enforceWindow && s.window != nil && !s.window.Contains(c) {
+			return osmmini.Coord{}, "", "", errors.New("outside configured window")
+		}
+		return c, "Koordinate", fmt.Sprintf("%.6f %.6f", lat, lon), nil
+	}
+
+	raw := strings.TrimSpace(loc.Query)
+	if raw == "" {
+		return osmmini.Coord{}, "", "", errors.New("missing query or lat/lon")
+	}
+	if c, ok := parseLatLon(raw); ok {
+		if s.enforceWindow && s.window != nil && !s.window.Contains(c) {
+			return osmmini.Coord{}, "", "", errors.New("outside configured window")
+		}
+		return c, "Koordinate", raw, nil
+	}
+
+	q := osmmini.ParseAddressGuess(raw)
+	if addr, ok := osmmini.FindBestAddress(s.addrs, q); ok {
+		if s.enforceWindow && s.window != nil && !s.window.Contains(addr.Coord) {
+			return osmmini.Coord{}, "", "", errors.New("outside configured window")
+		}
+		return addr.Coord, formatAddressLabel(addr.Tags), raw, nil
+	}
+	if q.Street != "" {
+		if nodeID, okStreet := s.router.StreetNode(q.Street); okStreet {
+			c, _ := s.router.Coord(nodeID)
+			if s.enforceWindow && s.window != nil && !s.window.Contains(c) {
+				return osmmini.Coord{}, "", "", errors.New("outside configured window")
+			}
+			return c, q.Street, raw, nil
+		}
+	}
+	return osmmini.Coord{}, "", "", fmt.Errorf("not found: %s", raw)
+}
+
+func parseLatLon(raw string) (osmmini.Coord, bool) {
+	s := strings.TrimSpace(raw)
+	s = strings.ReplaceAll(s, ",", " ")
+	fields := strings.Fields(s)
+	if len(fields) != 2 {
+		return osmmini.Coord{}, false
+	}
+	lat, err1 := strconv.ParseFloat(fields[0], 64)
+	lon, err2 := strconv.ParseFloat(fields[1], 64)
+	if err1 != nil || err2 != nil {
+		return osmmini.Coord{}, false
+	}
+	if lat < -90 || lat > 90 || lon < -180 || lon > 180 {
+		return osmmini.Coord{}, false
+	}
+	return osmmini.Coord{Lat: lat, Lon: lon}, true
+}
+
+func formatAddressLabel(tags osmmini.Tags) string {
+	street := tags["addr:street"]
+	hn := tags["addr:housenumber"]
+	post := tags["addr:postcode"]
+	city := tags["addr:city"]
+	if city == "" {
+		city = tags["addr:place"]
+	}
+	name := tags["name"]
+
+	line1 := ""
+	switch {
+	case street != "" && hn != "":
+		line1 = street + " " + hn
+	case street != "":
+		line1 = street
+	case name != "":
+		line1 = name
+	default:
+		line1 = "Adresse"
+	}
+
+	line2 := strings.TrimSpace(strings.Join([]string{post, city}, " "))
+	if line2 != "" {
+		return line1 + ", " + line2
+	}
+	return line1
+}
+
+func parseLimit(raw string, def, min, max int) int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return def
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return def
+	}
+	if n < min {
+		return min
+	}
+	if n > max {
+		return max
+	}
+	return n
+}
+
+func parseWindow(s string) (osmmini.CoordWindow, error) {
+	parts := strings.Split(s, ",")
+	if len(parts) != 4 {
+		return osmmini.CoordWindow{}, errors.New("expected minLat,maxLat,minLon,maxLon")
+	}
+	vals := make([]float64, 4)
+	for i := range parts {
+		f, err := strconv.ParseFloat(strings.TrimSpace(parts[i]), 64)
+		if err != nil {
+			return osmmini.CoordWindow{}, err
+		}
+		vals[i] = f
+	}
+	w := osmmini.CoordWindow{MinLat: vals[0], MaxLat: vals[1], MinLon: vals[2], MaxLon: vals[3]}
+	if !w.Valid() {
+		return osmmini.CoordWindow{}, errors.New("invalid window bounds")
+	}
+	return w, nil
+}
+
+// ---- Maps links ----
+
+func buildGoogleMapsURL(points []osmmini.Coord, maxWaypoints int) string {
+	if len(points) < 2 {
+		return ""
+	}
+	if maxWaypoints <= 0 {
+		maxWaypoints = 9
+	}
+	origin := fmt.Sprintf("%f,%f", points[0].Lat, points[0].Lon)
+	destination := fmt.Sprintf("%f,%f", points[len(points)-1].Lat, points[len(points)-1].Lon)
+
+	waypoints := []string{}
+	for i := 1; i < len(points)-1 && len(waypoints) < maxWaypoints; i++ {
+		waypoints = append(waypoints, fmt.Sprintf("%f,%f", points[i].Lat, points[i].Lon))
+	}
+
+	q := url.Values{}
+	q.Set("api", "1")
+	q.Set("origin", origin)
+	q.Set("destination", destination)
+	if len(waypoints) > 0 {
+		q.Set("waypoints", strings.Join(waypoints, "|"))
+	}
+	q.Set("travelmode", "driving")
+	return "https://www.google.com/maps/dir/?" + q.Encode()
+}
+
+func buildAppleMapsURL(points []osmmini.Coord) string {
+	if len(points) < 2 {
+		return ""
+	}
+	saddr := fmt.Sprintf("%f,%f", points[0].Lat, points[0].Lon)
+
+	dparts := make([]string, 0, len(points)-1)
+	for i := 1; i < len(points); i++ {
+		ll := fmt.Sprintf("%f,%f", points[i].Lat, points[i].Lon)
+		if i == 1 {
+			dparts = append(dparts, ll)
+		} else {
+			dparts = append(dparts, "to:"+ll)
+		}
+	}
+
+	q := url.Values{}
+	q.Set("saddr", saddr)
+	q.Set("daddr", strings.Join(dparts, "+"))
+	q.Set("dirflg", "d")
+	return "https://maps.apple.com/?" + q.Encode()
+}

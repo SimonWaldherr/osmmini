@@ -1,476 +1,1296 @@
 package osmmini
 
 import (
-    "container/heap"
-    "errors"
-    "math"
-    "sort"
-    "strings"
+	"container/heap"
+	"context"
+	"errors"
+	"math"
+	"sort"
+	"strconv"
+	"strings"
 )
 
 // Coord holds WGS84 coordinates.
 type Coord struct {
-    Lat float64
-    Lon float64
+	Lat float64 `json:"lat"`
+	Lon float64 `json:"lon"`
 }
 
-type edge struct {
-    to int64
-    w  float64 // meters
+type RouteEngine string
+
+const (
+	EngineAStar    RouteEngine = "astar"
+	EngineDijkstra RouteEngine = "dijkstra" // A* with h=0
+)
+
+type Objective string
+
+const (
+	ObjectiveDistance Objective = "distance"
+	ObjectiveDuration Objective = "duration"
+	ObjectiveEconomy  Objective = "economy"
+)
+
+type ProWeights struct {
+	LeftTurn       float64 `json:"left_turn"`
+	RightTurn      float64 `json:"right_turn"`
+	UTurn          float64 `json:"u_turn"`
+	Crossing       float64 `json:"crossing"`
+	MaxSpeedKph    float64 `json:"max_speed_kph"`
+	VehicleHeightM float64 `json:"vehicle_height_m"`
+	VehicleWeightT float64 `json:"vehicle_weight_t"`
+}
+
+type RouteOptions struct {
+	Engine    RouteEngine `json:"engine,omitempty"`
+	Objective Objective   `json:"objective"`
+	Pro       bool        `json:"pro"`
+	Weights   ProWeights  `json:"weights"`
+}
+
+func (o RouteOptions) withDefaults() RouteOptions {
+	if o.Engine == "" {
+		o.Engine = EngineAStar
+	}
+	if o.Engine != EngineAStar && o.Engine != EngineDijkstra {
+		o.Engine = EngineAStar
+	}
+	if o.Objective == "" {
+		o.Objective = ObjectiveDistance
+	}
+	if o.Weights.MaxSpeedKph <= 0 {
+		o.Weights.MaxSpeedKph = 130
+	}
+	if o.Weights.MaxSpeedKph < 5 {
+		o.Weights.MaxSpeedKph = 5
+	}
+	return o
+}
+
+type Edge struct {
+	To         int64
+	DistM      float64
+	SpeedKph   float64
+	MaxHeightM float64
+	MaxWeightT float64
 }
 
 type Graph struct {
-    coords map[int64]Coord
-    adj    map[int64][]edge
+	coords map[int64]Coord
+	adj    map[int64][]Edge
 }
 
 // Router wraps a road graph built from OSM highways.
 type Router struct {
-    g Graph
-    streetNodes map[string][]int64
+	g       Graph
+	streets map[string]streetEntry // normalized -> display + sample nodes
+	idx     *spatialIndex
+	bounds  *CoordWindow
 }
 
-// NodeCount returns number of nodes in the graph.
-func (r *Router) NodeCount() int { return len(r.g.coords) }
-
-// Coord returns the coordinate for a given node ID, if present.
-func (r *Router) Coord(id int64) (Coord, bool) {
-    c, ok := r.g.coords[id]
-    return c, ok
+type streetEntry struct {
+	Display string
+	NodeIDs []int64
 }
 
-// CoordsForPath returns the coordinates for each node id in the path.
-func (r *Router) CoordsForPath(path []int64) []Coord {
-    coords := make([]Coord, 0, len(path))
-    for _, id := range path {
-        if c, ok := r.g.coords[id]; ok {
-            coords = append(coords, c)
-        }
-    }
-    return coords
+// BuildOptions controls router graph extraction.
+type BuildOptions struct {
+	Window        *CoordWindow
+	WindowBufferM float64
 }
-
-// StreetNode returns any node that belongs to a highway with the given street name.
-func (r *Router) StreetNode(street string) (int64, bool) {
-    ids := r.streetNodes[normalize(street)]
-    for _, id := range ids {
-        if _, ok := r.g.coords[id]; ok {
-            return id, true
-        }
-    }
-    return 0, false
-}
-
-// AddressEntry stores an addressable point extracted from addr:* nodes.
-type AddressEntry struct {
-    ID    int64
-    Coord Coord
-    Tags  Tags
-}
-
-// BuildRouterWithAddresses parses a PBF, builds a highway graph and collects address nodes.
-// It keeps all nodes for routing, but only ways tagged as highway become edges.
 
 func BuildRouterWithAddresses(path string) (*Router, []AddressEntry, error) {
-    coords := make(map[int64]Coord, 1<<20)
-    ways := make([][]int64, 0, 1<<18)
-    addrs := make([]AddressEntry, 0, 1<<16)
-    streetNodes := make(map[string][]int64)
-
-    opts := Options{
-        EmitWayNodeIDs:      true,
-        EmitRelationMembers: false,
-    }
-
-    cb := Callbacks{
-        Node: func(id int64, lat, lon float64) error {
-            coords[id] = Coord{Lat: lat, Lon: lon}
-            return nil
-        },
-        AddressNode: func(n Node) error {
-            addrs = append(addrs, AddressEntry{ID: n.ID, Coord: Coord{Lat: n.Lat, Lon: n.Lon}, Tags: n.Tags})
-            return nil
-        },
-        HighwayWay: func(w Way) error {
-            if len(w.NodeIDs) >= 2 {
-                // copy to detach from reused buffers
-                ids := make([]int64, len(w.NodeIDs))
-                copy(ids, w.NodeIDs)
-                ways = append(ways, ids)
-            }
-            if name := w.Tags["name"]; name != "" {
-                key := normalize(name)
-                if len(w.NodeIDs) > 0 {
-                    streetNodes[key] = append(streetNodes[key], w.NodeIDs...)
-                }
-            }
-            return nil
-        },
-    }
-
-    if err := ExtractFile(path, opts, cb); err != nil {
-        return nil, nil, err
-    }
-
-    adj := make(map[int64][]edge, len(coords))
-    for _, ids := range ways {
-        for i := 0; i < len(ids)-1; i++ {
-            aID := ids[i]
-            bID := ids[i+1]
-            a, okA := coords[aID]
-            b, okB := coords[bID]
-            if !okA || !okB {
-                continue
-            }
-            d := haversineMeters(a.Lat, a.Lon, b.Lat, b.Lon)
-            if d <= 0 || math.IsNaN(d) || math.IsInf(d, 0) {
-                continue
-            }
-            adj[aID] = append(adj[aID], edge{to: bID, w: d})
-            adj[bID] = append(adj[bID], edge{to: aID, w: d})
-        }
-    }
-
-    return &Router{g: Graph{coords: coords, adj: adj}, streetNodes: streetNodes}, addrs, nil
+	return BuildRouterWithAddressesOptions(path, BuildOptions{})
 }
 
-// NearestNode returns the closest graph node to the given coordinate.
-func (r *Router) NearestNode(lat, lon float64) (int64, float64, bool) {
-    var bestID int64
-    best := math.MaxFloat64
-    for id, c := range r.g.coords {
-        if len(r.g.adj[id]) == 0 {
-            continue // skip isolated nodes not in the road graph
-        }
-        d := haversineMeters(lat, lon, c.Lat, c.Lon)
-        if d < best {
-            best = d
-            bestID = id
-        }
-    }
-    if best == math.MaxFloat64 {
-        return 0, 0, false
-    }
-    return bestID, best, true
+// BuildRouterWithAddressesOptions parses a PBF, builds a highway graph and collects address nodes.
+// If Window is set, nodes/addresses are filtered to Window expanded by WindowBufferM.
+func BuildRouterWithAddressesOptions(path string, bo BuildOptions) (*Router, []AddressEntry, error) {
+	var filterWin *CoordWindow
+	if bo.Window != nil && bo.Window.Valid() {
+		w := *bo.Window
+		if bo.WindowBufferM > 0 {
+			w = w.ExpandMeters(bo.WindowBufferM)
+		}
+		filterWin = &w
+	}
+
+	coordsAll := make(map[int64]Coord, 1<<20)
+	addrs := make([]AddressEntry, 0, 1<<16)
+	highways := make([]highwayWay, 0, 1<<18)
+	streets := make(map[string]streetEntry, 1<<18)
+
+	opts := Options{
+		EmitWayNodeIDs:      true,
+		EmitRelationMembers: false,
+		KeepTag: func(k string) bool {
+			switch {
+			case k == "highway", k == "name", k == "maxspeed", k == "oneway", k == "junction":
+				return true
+			case k == "maxheight", k == "maxweight":
+				return true
+			case k == "access", k == "vehicle", k == "motor_vehicle", k == "hgv":
+				return true
+			case strings.HasPrefix(k, "addr:"):
+				return true
+			default:
+				return false
+			}
+		},
+	}
+
+	cb := Callbacks{
+		Node: func(id int64, lat, lon float64) error {
+			c := Coord{Lat: lat, Lon: lon}
+			if filterWin != nil && !filterWin.Contains(c) {
+				return nil
+			}
+			coordsAll[id] = c
+			return nil
+		},
+		AddressNode: func(n Node) error {
+			c := Coord{Lat: n.Lat, Lon: n.Lon}
+			if filterWin != nil && !filterWin.Contains(c) {
+				return nil
+			}
+			addrs = append(addrs, AddressEntry{ID: n.ID, Coord: c, Tags: n.Tags})
+			return nil
+		},
+		HighwayWay: func(w Way) error {
+			hwy := w.Tags["highway"]
+			if !isDriveableHighway(hwy, w.Tags) {
+				return nil
+			}
+			if isAccessDenied(w.Tags) {
+				return nil
+			}
+			if len(w.NodeIDs) < 2 {
+				return nil
+			}
+
+			speed := parseMaxSpeedKph(w.Tags["maxspeed"])
+			if speed <= 0 {
+				speed = defaultSpeedForHighway(hwy)
+			}
+			if speed <= 0 {
+				speed = 50
+			}
+
+			mh := parseMeters(w.Tags["maxheight"])
+			mw := parseTons(w.Tags["maxweight"])
+
+			oneway := parseOneway(w.Tags["oneway"])
+			if oneway == 0 && strings.EqualFold(w.Tags["junction"], "roundabout") {
+				oneway = 1
+			}
+
+			ids := make([]int64, len(w.NodeIDs))
+			copy(ids, w.NodeIDs)
+			highways = append(highways, highwayWay{
+				nodes:      ids,
+				speedKph:   speed,
+				maxHeightM: mh,
+				maxWeightT: mw,
+				oneway:     oneway,
+			})
+
+			if name := w.Tags["name"]; name != "" {
+				key := normalize(name)
+				se := streets[key]
+				if se.Display == "" || len(name) > len(se.Display) {
+					se.Display = name
+				}
+				se.NodeIDs = appendUniqueLimited(se.NodeIDs, sampleWayNodeIDs(ids), 16)
+				streets[key] = se
+			}
+			return nil
+		},
+	}
+
+	if err := ExtractFile(path, opts, cb); err != nil {
+		return nil, nil, err
+	}
+
+	adj := make(map[int64][]Edge, 1<<20)
+	addEdge := func(from, to int64, dist float64, hw highwayWay) {
+		adj[from] = append(adj[from], Edge{
+			To:         to,
+			DistM:      dist,
+			SpeedKph:   hw.speedKph,
+			MaxHeightM: hw.maxHeightM,
+			MaxWeightT: hw.maxWeightT,
+		})
+	}
+
+	for _, hw := range highways {
+		ids := hw.nodes
+		for i := 0; i < len(ids)-1; i++ {
+			aID := ids[i]
+			bID := ids[i+1]
+			a, okA := coordsAll[aID]
+			b, okB := coordsAll[bID]
+			if !okA || !okB {
+				continue
+			}
+			d := haversineMeters(a.Lat, a.Lon, b.Lat, b.Lon)
+			if d <= 0 || math.IsNaN(d) || math.IsInf(d, 0) {
+				continue
+			}
+			switch hw.oneway {
+			case 1:
+				addEdge(aID, bID, d, hw)
+			case -1:
+				addEdge(bID, aID, d, hw)
+			default:
+				addEdge(aID, bID, d, hw)
+				addEdge(bID, aID, d, hw)
+			}
+		}
+	}
+
+	// prune coords to nodes that actually have edges
+	coords := make(map[int64]Coord, len(adj))
+	for id := range adj {
+		if c, ok := coordsAll[id]; ok && len(adj[id]) > 0 {
+			coords[id] = c
+		}
+	}
+
+	// prune streets samples
+	for k, se := range streets {
+		pruned := se.NodeIDs[:0]
+		for _, id := range se.NodeIDs {
+			if _, ok := coords[id]; ok {
+				pruned = append(pruned, id)
+			}
+		}
+		se.NodeIDs = pruned
+		if len(se.NodeIDs) == 0 {
+			delete(streets, k)
+			continue
+		}
+		streets[k] = se
+	}
+
+	idx := buildSpatialIndex(coords)
+
+	var bounds *CoordWindow
+	if b, ok := computeBounds(coords); ok {
+		bounds = &b
+	}
+
+	return &Router{
+		g:       Graph{coords: coords, adj: adj},
+		streets: streets,
+		idx:     idx,
+		bounds:  bounds,
+	}, addrs, nil
 }
 
-// Route computes the shortest path (meters) using A* between two graph nodes.
-func (r *Router) Route(from, to int64) ([]int64, float64, error) {
-    if from == to {
-        return []int64{from}, 0, nil
-    }
-    if _, ok := r.g.coords[from]; !ok {
-        return nil, 0, errors.New("start node missing in graph")
-    }
-    if _, ok := r.g.coords[to]; !ok {
-        return nil, 0, errors.New("target node missing in graph")
-    }
-
-    pq := priorityQueue{}
-    start := &pqItem{id: from, f: 0, g: 0}
-    heap.Push(&pq, start)
-
-    came := make(map[int64]int64)
-    gScore := map[int64]float64{from: 0}
-
-    goalCoord := r.g.coords[to]
-
-    for pq.Len() > 0 {
-        cur := heap.Pop(&pq).(*pqItem)
-        if cur.id == to {
-            path := reconstructPath(came, to)
-            return path, cur.g, nil
-        }
-
-        for _, e := range r.g.adj[cur.id] {
-            tentative := cur.g + e.w
-            if old, ok := gScore[e.to]; ok && tentative >= old {
-                continue
-            }
-            gScore[e.to] = tentative
-            h := haversineMeters(r.g.coords[e.to].Lat, r.g.coords[e.to].Lon, goalCoord.Lat, goalCoord.Lon)
-            heap.Push(&pq, &pqItem{id: e.to, g: tentative, f: tentative + h})
-            came[e.to] = cur.id
-        }
-    }
-
-    return nil, 0, errors.New("no path found")
+func computeBounds(coords map[int64]Coord) (CoordWindow, bool) {
+	if len(coords) == 0 {
+		return CoordWindow{}, false
+	}
+	minLat := math.MaxFloat64
+	maxLat := -math.MaxFloat64
+	minLon := math.MaxFloat64
+	maxLon := -math.MaxFloat64
+	for _, c := range coords {
+		if c.Lat < minLat {
+			minLat = c.Lat
+		}
+		if c.Lat > maxLat {
+			maxLat = c.Lat
+		}
+		if c.Lon < minLon {
+			minLon = c.Lon
+		}
+		if c.Lon > maxLon {
+			maxLon = c.Lon
+		}
+	}
+	w := CoordWindow{MinLat: minLat, MaxLat: maxLat, MinLon: minLon, MaxLon: maxLon}
+	return w, w.Valid()
 }
 
-func reconstructPath(came map[int64]int64, goal int64) []int64 {
-    path := []int64{goal}
-    for {
-        prev, ok := came[goal]
-        if !ok {
-            break
-        }
-        path = append(path, prev)
-        goal = prev
-    }
-    // reverse
-    for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
-        path[i], path[j] = path[j], path[i]
-    }
-    return path
+func (r *Router) Bounds() (CoordWindow, bool) {
+	if r.bounds == nil {
+		return CoordWindow{}, false
+	}
+	return *r.bounds, true
 }
 
-// AddressQuery represents a loose address request parsed from user input.
+func (r *Router) NodeCount() int { return len(r.g.coords) }
+
+func (r *Router) EdgeCount() int {
+	n := 0
+	for _, es := range r.g.adj {
+		n += len(es)
+	}
+	return n
+}
+
+func (r *Router) Coord(id int64) (Coord, bool) {
+	c, ok := r.g.coords[id]
+	return c, ok
+}
+
+func (r *Router) CoordsForPath(path []int64) []Coord {
+	coords := make([]Coord, 0, len(path))
+	for _, id := range path {
+		if c, ok := r.g.coords[id]; ok {
+			coords = append(coords, c)
+		}
+	}
+	return coords
+}
+
+func (r *Router) StreetNode(street string) (int64, bool) {
+	key := normalize(street)
+	if key == "" {
+		return 0, false
+	}
+	if se, ok := r.streets[key]; ok {
+		for _, id := range se.NodeIDs {
+			if _, ok := r.g.coords[id]; ok {
+				return id, true
+			}
+		}
+	}
+	ms := r.SearchStreets(street, 1)
+	if len(ms) == 1 {
+		return ms[0].NodeID, true
+	}
+	return 0, false
+}
+
+type StreetMatch struct {
+	Name   string `json:"name"`
+	NodeID int64  `json:"node_id"`
+	Coord  Coord  `json:"coord"`
+}
+
+func (r *Router) SearchStreets(q string, limit int) []StreetMatch {
+	nq := normalize(q)
+	if nq == "" {
+		return nil
+	}
+
+	type scored struct {
+		key   string
+		e     streetEntry
+		score int
+	}
+	sc := make([]scored, 0, 32)
+	for key, e := range r.streets {
+		s := streetScore(key, nq)
+		if s == 0 {
+			continue
+		}
+		sc = append(sc, scored{key: key, e: e, score: s})
+	}
+	sort.Slice(sc, func(i, j int) bool {
+		if sc[i].score == sc[j].score {
+			return sc[i].e.Display < sc[j].e.Display
+		}
+		return sc[i].score > sc[j].score
+	})
+	if limit > 0 && limit < len(sc) {
+		sc = sc[:limit]
+	}
+
+	out := make([]StreetMatch, 0, len(sc))
+	for _, m := range sc {
+		for _, id := range m.e.NodeIDs {
+			if c, ok := r.g.coords[id]; ok {
+				out = append(out, StreetMatch{Name: m.e.Display, NodeID: id, Coord: c})
+				break
+			}
+		}
+	}
+	return out
+}
+
+func streetScore(nameKey, queryKey string) int {
+	if nameKey == queryKey {
+		return 3
+	}
+	if strings.HasPrefix(nameKey, queryKey) {
+		return 2
+	}
+	if strings.Contains(nameKey, queryKey) {
+		return 1
+	}
+	return 0
+}
+
+// ---- Address support ----
+
+type AddressEntry struct {
+	ID    int64
+	Coord Coord
+	Tags  Tags
+}
+
 type AddressQuery struct {
-    Street      string
-    Housenumber string
-    Postcode    string
-    City        string
-    Raw         string
+	Street      string
+	Housenumber string
+	Postcode    string
+	City        string
+	Raw         string
 }
 
-// ParseAddressGuess does a very light parse of a freeform string.
 func ParseAddressGuess(raw string) AddressQuery {
-    q := AddressQuery{Raw: raw}
-    fields := strings.Fields(raw)
-    for _, f := range fields {
-        if len(f) == 5 && allDigits(f) {
-            q.Postcode = f
-            continue
-        }
-        if hasDigit(f) && q.Housenumber == "" {
-            q.Housenumber = f
-            continue
-        }
-        // collect potential city later; for now treat as street or city
-    }
+	q := AddressQuery{Raw: raw}
+	fields := strings.Fields(raw)
+	for _, f := range fields {
+		if len(f) == 5 && allDigits(f) {
+			q.Postcode = f
+			continue
+		}
+		if hasDigit(f) && q.Housenumber == "" {
+			q.Housenumber = f
+			continue
+		}
+	}
 
-    // crude split: everything before postcode treated as street/city; if housenumber present, attach to street side
-    streetParts := []string{}
-    cityParts := []string{}
-    seenPostcode := false
-    for _, f := range fields {
-        switch {
-        case len(f) == 5 && allDigits(f):
-            seenPostcode = true
-        case !seenPostcode:
-            streetParts = append(streetParts, f)
-        default:
-            cityParts = append(cityParts, f)
-        }
-    }
+	streetParts := []string{}
+	cityParts := []string{}
+	seenPostcode := false
+	for _, f := range fields {
+		switch {
+		case len(f) == 5 && allDigits(f):
+			seenPostcode = true
+		case !seenPostcode:
+			streetParts = append(streetParts, f)
+		default:
+			cityParts = append(cityParts, f)
+		}
+	}
 
-    // Remove housenumber token from streetParts
-    cleanedStreet := []string{}
-    for _, f := range streetParts {
-        if q.Housenumber != "" && f == q.Housenumber {
-            continue
-        }
-        cleanedStreet = append(cleanedStreet, f)
-    }
+	cleanedStreet := []string{}
+	for _, f := range streetParts {
+		if q.Housenumber != "" && f == q.Housenumber {
+			continue
+		}
+		cleanedStreet = append(cleanedStreet, f)
+	}
 
-    // If keine Postleitzahl angegeben und keine Stadt erkannt, nimm letztes Wort als Stadt.
-    if q.City == "" && len(cityParts) == 0 && len(cleanedStreet) > 1 {
-        q.City = cleanedStreet[len(cleanedStreet)-1]
-        cleanedStreet = cleanedStreet[:len(cleanedStreet)-1]
-    }
+	if q.City == "" && len(cityParts) == 0 && len(cleanedStreet) > 1 {
+		q.City = cleanedStreet[len(cleanedStreet)-1]
+		cleanedStreet = cleanedStreet[:len(cleanedStreet)-1]
+	}
 
-    q.Street = strings.TrimSpace(strings.Join(cleanedStreet, " "))
-    q.City = strings.TrimSpace(strings.Join(cityParts, " "))
-    return q
+	q.Street = strings.TrimSpace(strings.Join(cleanedStreet, " "))
+	q.City = strings.TrimSpace(strings.Join(cityParts, " "))
+	return q
 }
 
-// FindBestAddress picks the highest-scoring address entry for the query.
 func FindBestAddress(entries []AddressEntry, q AddressQuery) (AddressEntry, bool) {
-    var best AddressEntry
-    bestScore := -1
-    for _, e := range entries {
-        score := matchScore(e, q)
-        if score > bestScore {
-            bestScore = score
-            best = e
-        }
-    }
-    if bestScore <= 0 {
-        return AddressEntry{}, false
-    }
-    return best, true
+	var best AddressEntry
+	bestScore := -1
+	for _, e := range entries {
+		score := matchScore(e, q)
+		if score > bestScore {
+			bestScore = score
+			best = e
+		}
+	}
+	if bestScore <= 0 {
+		return AddressEntry{}, false
+	}
+	return best, true
 }
 
 func matchScore(e AddressEntry, q AddressQuery) int {
-    score := 0
-    street := e.Tags["addr:street"]
-    if q.Street != "" && equalNorm(street, q.Street) {
-        score += 3
-    }
-    if q.Housenumber != "" && equalNorm(e.Tags["addr:housenumber"], q.Housenumber) {
-        score += 4
-    }
-    if q.Postcode != "" && equalNorm(e.Tags["addr:postcode"], q.Postcode) {
-        score += 2
-    }
-    if q.City != "" {
-        if equalNorm(e.Tags["addr:city"], q.City) || equalNorm(e.Tags["addr:place"], q.City) {
-            score += 1
-        }
-    }
-    // small bonus if street contains query even when not exact (handles variants like str/straße)
-    if score == 0 && q.Street != "" && containsNorm(street, q.Street) {
-        score += 1
-    }
-    return score
+	score := 0
+	street := e.Tags["addr:street"]
+	if q.Street != "" && equalNorm(street, q.Street) {
+		score += 3
+	}
+	if q.Housenumber != "" && equalNorm(e.Tags["addr:housenumber"], q.Housenumber) {
+		score += 4
+	}
+	if q.Postcode != "" && equalNorm(e.Tags["addr:postcode"], q.Postcode) {
+		score += 2
+	}
+	if q.City != "" {
+		if equalNorm(e.Tags["addr:city"], q.City) || equalNorm(e.Tags["addr:place"], q.City) {
+			score += 1
+		}
+	}
+	if score == 0 && q.Street != "" && containsNorm(street, q.Street) {
+		score += 1
+	}
+	return score
 }
 
 func equalNorm(a, b string) bool { return normalize(a) == normalize(b) }
 
 func containsNorm(haystack, needle string) bool {
-    h := normalize(haystack)
-    n := normalize(needle)
-    return h != "" && n != "" && strings.Contains(h, n)
+	h := normalize(haystack)
+	n := normalize(needle)
+	return h != "" && n != "" && strings.Contains(h, n)
+}
+
+func SearchAddresses(entries []AddressEntry, q AddressQuery, limit int) []AddressEntry {
+	type scored struct {
+		e AddressEntry
+		s int
+	}
+	sc := make([]scored, 0, len(entries))
+	for _, e := range entries {
+		s := matchScore(e, q)
+		if s <= 0 {
+			continue
+		}
+		sc = append(sc, scored{e: e, s: s})
+	}
+	sort.Slice(sc, func(i, j int) bool {
+		if sc[i].s == sc[j].s {
+			return sc[i].e.ID < sc[j].e.ID
+		}
+		return sc[i].s > sc[j].s
+	})
+	if limit <= 0 || limit > len(sc) {
+		limit = len(sc)
+	}
+	res := make([]AddressEntry, 0, limit)
+	for i := 0; i < limit; i++ {
+		res = append(res, sc[i].e)
+	}
+	return res
+}
+
+// ---- Routing ----
+
+type RouteResult struct {
+	Path       []int64     `json:"-"`
+	PathCoords []Coord     `json:"path"`
+	DistanceM  float64     `json:"distance_m"`
+	DurationS  float64     `json:"duration_s"`
+	Cost       float64     `json:"cost"`
+	Objective  Objective   `json:"objective"`
+	Engine     RouteEngine `json:"engine"`
+}
+
+func (r *Router) Route(from, to int64) ([]int64, float64, error) {
+	res, err := r.RouteWithOptions(context.Background(), from, to, RouteOptions{Objective: ObjectiveDistance})
+	if err != nil {
+		return nil, 0, err
+	}
+	return res.Path, res.DistanceM, nil
+}
+
+func (r *Router) RouteCostWithOptions(ctx context.Context, from, to int64, opt RouteOptions) (float64, error) {
+	_, cost, _, err := r.astar(ctx, from, to, opt.withDefaults(), false)
+	return cost, err
+}
+
+func (r *Router) RouteWithOptions(ctx context.Context, from, to int64, opt RouteOptions) (RouteResult, error) {
+	opt = opt.withDefaults()
+	goalState, cost, came, err := r.astar(ctx, from, to, opt, true)
+	if err != nil {
+		return RouteResult{}, err
+	}
+	path := reconstructPathTurnState(goalState, came)
+	coords := r.CoordsForPath(path)
+	distM, durS := r.computeMetrics(path, opt)
+	return RouteResult{
+		Path:       path,
+		PathCoords: coords,
+		DistanceM:  distM,
+		DurationS:  durS,
+		Cost:       cost,
+		Objective:  opt.Objective,
+		Engine:     opt.Engine,
+	}, nil
+}
+
+func (r *Router) computeMetrics(path []int64, opt RouteOptions) (distM, durS float64) {
+	if len(path) < 2 {
+		return 0, 0
+	}
+	for i := 0; i < len(path)-1; i++ {
+		e, ok := r.edgeBetween(path[i], path[i+1])
+		if !ok {
+			continue
+		}
+		distM += e.DistM
+		durS += edgeTimeSeconds(e, opt)
+	}
+	return distM, durS
+}
+
+func (r *Router) edgeBetween(from, to int64) (Edge, bool) {
+	es := r.g.adj[from]
+	best := Edge{}
+	found := false
+	bestD := math.MaxFloat64
+	for _, e := range es {
+		if e.To != to {
+			continue
+		}
+		if e.DistM < bestD {
+			bestD = e.DistM
+			best = e
+			found = true
+		}
+	}
+	return best, found
+}
+
+// ---- A* with turn state (prev,cur) ----
+
+type turnState struct {
+	prev int64
+	cur  int64
+}
+
+type pqItem struct {
+	s   turnState
+	f   float64
+	g   float64
+	idx int
+}
+
+type priorityQueue []*pqItem
+
+func (pq priorityQueue) Len() int           { return len(pq) }
+func (pq priorityQueue) Less(i, j int) bool { return pq[i].f < pq[j].f }
+func (pq priorityQueue) Swap(i, j int) {
+	pq[i], pq[j] = pq[j], pq[i]
+	pq[i].idx = i
+	pq[j].idx = j
+}
+func (pq *priorityQueue) Push(x interface{}) {
+	it := x.(*pqItem)
+	it.idx = len(*pq)
+	*pq = append(*pq, it)
+}
+func (pq *priorityQueue) Pop() interface{} {
+	old := *pq
+	n := len(old)
+	it := old[n-1]
+	*pq = old[:n-1]
+	return it
+}
+
+func (r *Router) astar(ctx context.Context, from, to int64, opt RouteOptions, wantPath bool) (goal turnState, goalCost float64, came map[turnState]turnState, err error) {
+	if from == to {
+		if wantPath {
+			came = map[turnState]turnState{}
+		}
+		return turnState{prev: 0, cur: from}, 0, came, nil
+	}
+	if _, ok := r.g.coords[from]; !ok {
+		return turnState{}, 0, nil, errors.New("start node missing in graph")
+	}
+	if _, ok := r.g.coords[to]; !ok {
+		return turnState{}, 0, nil, errors.New("target node missing in graph")
+	}
+	if len(r.g.adj[from]) == 0 {
+		return turnState{}, 0, nil, errors.New("start node has no edges")
+	}
+	if len(r.g.adj[to]) == 0 {
+		return turnState{}, 0, nil, errors.New("target node has no edges")
+	}
+
+	if wantPath {
+		came = make(map[turnState]turnState, 1<<16)
+	}
+
+	start := turnState{prev: 0, cur: from}
+	gScore := map[turnState]float64{start: 0}
+
+	pq := priorityQueue{}
+	heap.Push(&pq, &pqItem{s: start, g: 0, f: r.heuristic(from, to, opt)})
+
+	pops := 0
+	for pq.Len() > 0 {
+		pops++
+		if ctx != nil && pops%1024 == 0 {
+			select {
+			case <-ctx.Done():
+				return turnState{}, 0, nil, ctx.Err()
+			default:
+			}
+		}
+
+		curIt := heap.Pop(&pq).(*pqItem)
+		curS := curIt.s
+
+		if best, ok := gScore[curS]; ok && curIt.g > best {
+			continue // stale
+		}
+
+		if curS.cur == to {
+			return curS, curIt.g, came, nil
+		}
+
+		for _, e := range r.g.adj[curS.cur] {
+			if !edgeAllowed(e, opt) {
+				continue
+			}
+			next := e.To
+			base := r.edgeCost(e, opt)
+			pen := r.transitionPenalty(curS.prev, curS.cur, next, opt)
+			tent := curIt.g + base + pen
+
+			nextS := turnState{prev: curS.cur, cur: next}
+			if old, ok := gScore[nextS]; ok && tent >= old {
+				continue
+			}
+
+			gScore[nextS] = tent
+			if wantPath {
+				came[nextS] = curS
+			}
+
+			h := r.heuristic(next, to, opt)
+			heap.Push(&pq, &pqItem{s: nextS, g: tent, f: tent + h})
+		}
+	}
+
+	return turnState{}, 0, nil, errors.New("no path found")
+}
+
+func reconstructPathTurnState(goal turnState, came map[turnState]turnState) []int64 {
+	path := make([]int64, 0, 256)
+	s := goal
+	for {
+		path = append(path, s.cur)
+		prev, ok := came[s]
+		if !ok {
+			break
+		}
+		s = prev
+	}
+	for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
+		path[i], path[j] = path[j], path[i]
+	}
+	return path
+}
+
+func (r *Router) heuristic(from, to int64, opt RouteOptions) float64 {
+	if opt.Engine == EngineDijkstra {
+		return 0
+	}
+	a := r.g.coords[from]
+	b := r.g.coords[to]
+	d := haversineMeters(a.Lat, a.Lon, b.Lat, b.Lon)
+
+	switch opt.Objective {
+	case ObjectiveDuration:
+		return d * 3.6 / opt.Weights.MaxSpeedKph
+	case ObjectiveEconomy:
+		return d / 1000
+	default:
+		return d
+	}
+}
+
+func (r *Router) edgeCost(e Edge, opt RouteOptions) float64 {
+	switch opt.Objective {
+	case ObjectiveDuration:
+		return edgeTimeSeconds(e, opt)
+	case ObjectiveEconomy:
+		km := e.DistM / 1000
+		v := effectiveSpeedKph(e, opt)
+		f := 1.0 + 0.7*math.Pow(v/100.0, 2)
+		return km * f
+	default:
+		return e.DistM
+	}
+}
+
+func (r *Router) transitionPenalty(prev, cur, next int64, opt RouteOptions) float64 {
+	if prev == 0 {
+		return 0
+	}
+	pen := 0.0
+	if opt.Weights.Crossing > 0 && len(r.g.adj[cur]) > 2 {
+		pen += opt.Weights.Crossing
+	}
+	tt := r.turnType(prev, cur, next)
+	switch tt {
+	case turnLeft:
+		pen += opt.Weights.LeftTurn
+	case turnRight:
+		pen += opt.Weights.RightTurn
+	case turnUTurn:
+		pen += opt.Weights.UTurn
+	}
+	return pen
+}
+
+type turnKind uint8
+
+const (
+	turnStraight turnKind = iota
+	turnLeft
+	turnRight
+	turnUTurn
+)
+
+func (r *Router) turnType(prev, cur, next int64) turnKind {
+	p, ok1 := r.g.coords[prev]
+	c, ok2 := r.g.coords[cur]
+	n, ok3 := r.g.coords[next]
+	if !ok1 || !ok2 || !ok3 {
+		return turnStraight
+	}
+	b1 := bearingDeg(p.Lat, p.Lon, c.Lat, c.Lon)
+	b2 := bearingDeg(c.Lat, c.Lon, n.Lat, n.Lon)
+	diff := angleDiffDeg(b2, b1)
+	ad := math.Abs(diff)
+	if ad > 160 {
+		return turnUTurn
+	}
+	if diff > 30 {
+		return turnRight
+	}
+	if diff < -30 {
+		return turnLeft
+	}
+	return turnStraight
+}
+
+func angleDiffDeg(a, b float64) float64 {
+	return math.Mod(a-b+540, 360) - 180
+}
+
+func bearingDeg(lat1, lon1, lat2, lon2 float64) float64 {
+	φ1 := deg2rad(lat1)
+	φ2 := deg2rad(lat2)
+	Δλ := deg2rad(lon2 - lon1)
+	y := math.Sin(Δλ) * math.Cos(φ2)
+	x := math.Cos(φ1)*math.Sin(φ2) - math.Sin(φ1)*math.Cos(φ2)*math.Cos(Δλ)
+	θ := math.Atan2(y, x)
+	return math.Mod(rad2deg(θ)+360, 360)
+}
+
+func rad2deg(r float64) float64 { return r * 180 / math.Pi }
+
+func effectiveSpeedKph(e Edge, opt RouteOptions) float64 {
+	v := e.SpeedKph
+	if v <= 0 {
+		v = 50
+	}
+	if opt.Weights.MaxSpeedKph > 0 && v > opt.Weights.MaxSpeedKph {
+		v = opt.Weights.MaxSpeedKph
+	}
+	if v < 5 {
+		v = 5
+	}
+	return v
+}
+
+func edgeTimeSeconds(e Edge, opt RouteOptions) float64 {
+	v := effectiveSpeedKph(e, opt)
+	return e.DistM * 3.6 / v
+}
+
+func edgeAllowed(e Edge, opt RouteOptions) bool {
+	if opt.Weights.VehicleHeightM > 0 && e.MaxHeightM > 0 && opt.Weights.VehicleHeightM > e.MaxHeightM {
+		return false
+	}
+	if opt.Weights.VehicleWeightT > 0 && e.MaxWeightT > 0 && opt.Weights.VehicleWeightT > e.MaxWeightT {
+		return false
+	}
+	return true
+}
+
+// ---- Nearest node (spatial index) ----
+
+type spatialIndex struct {
+	cellSize float64
+	minLat   float64
+	minLon   float64
+	maxX     int32
+	maxY     int32
+	cells    map[int64][]int64
+}
+
+func buildSpatialIndex(coords map[int64]Coord) *spatialIndex {
+	if len(coords) == 0 {
+		return nil
+	}
+	minLat := math.MaxFloat64
+	minLon := math.MaxFloat64
+	for _, c := range coords {
+		if c.Lat < minLat {
+			minLat = c.Lat
+		}
+		if c.Lon < minLon {
+			minLon = c.Lon
+		}
+	}
+	const cellSize = 0.01
+	idx := &spatialIndex{
+		cellSize: cellSize,
+		minLat:   minLat,
+		minLon:   minLon,
+		cells:    make(map[int64][]int64, len(coords)/16),
+	}
+
+	var maxX, maxY int32
+	for id, c := range coords {
+		ix, iy := idx.cell(c.Lat, c.Lon)
+		if ix > maxX {
+			maxX = ix
+		}
+		if iy > maxY {
+			maxY = iy
+		}
+		k := cellKey(ix, iy)
+		idx.cells[k] = append(idx.cells[k], id)
+	}
+	idx.maxX = maxX
+	idx.maxY = maxY
+	return idx
+}
+
+func (idx *spatialIndex) cell(lat, lon float64) (int32, int32) {
+	ix := int32(math.Floor((lat - idx.minLat) / idx.cellSize))
+	iy := int32(math.Floor((lon - idx.minLon) / idx.cellSize))
+	return ix, iy
+}
+
+func cellKey(ix, iy int32) int64 {
+	return (int64(ix) << 32) | int64(uint32(iy))
+}
+
+func (r *Router) NearestNode(lat, lon float64) (int64, float64, bool) {
+	if r.idx == nil {
+		return r.nearestNodeBrute(lat, lon)
+	}
+
+	ix0, iy0 := r.idx.cell(lat, lon)
+	if ix0 < 0 {
+		ix0 = 0
+	} else if ix0 > r.idx.maxX {
+		ix0 = r.idx.maxX
+	}
+	if iy0 < 0 {
+		iy0 = 0
+	} else if iy0 > r.idx.maxY {
+		iy0 = r.idx.maxY
+	}
+
+	bestID := int64(0)
+	best := math.MaxFloat64
+
+	scanCell := func(ix, iy int32) {
+		ids := r.idx.cells[cellKey(ix, iy)]
+		for _, id := range ids {
+			c := r.g.coords[id]
+			d := haversineMeters(lat, lon, c.Lat, c.Lon)
+			if d < best {
+				best = d
+				bestID = id
+			}
+		}
+	}
+
+	const maxScanRadius = int32(256)
+	for radius := int32(0); radius <= maxScanRadius; radius++ {
+		if radius == 0 {
+			scanCell(ix0, iy0)
+		} else {
+			minX, maxX := ix0-radius, ix0+radius
+			minY, maxY := iy0-radius, iy0+radius
+			for x := minX; x <= maxX; x++ {
+				scanCell(x, minY)
+				scanCell(x, maxY)
+			}
+			for y := minY + 1; y <= maxY-1; y++ {
+				scanCell(minX, y)
+				scanCell(maxX, y)
+			}
+		}
+		if bestID != 0 {
+			metersPerDeg := 111320.0 * math.Abs(math.Cos(deg2rad(lat)))
+			if metersPerDeg > 0 {
+				minPossible := float64(radius+1) * r.idx.cellSize * metersPerDeg
+				if minPossible > best {
+					break
+				}
+			} else if radius >= 8 {
+				break
+			}
+		}
+	}
+
+	if bestID != 0 {
+		return bestID, best, true
+	}
+	return r.nearestNodeBrute(lat, lon)
+}
+
+func (r *Router) nearestNodeBrute(lat, lon float64) (int64, float64, bool) {
+	var bestID int64
+	best := math.MaxFloat64
+	for id, c := range r.g.coords {
+		if len(r.g.adj[id]) == 0 {
+			continue
+		}
+		d := haversineMeters(lat, lon, c.Lat, c.Lon)
+		if d < best {
+			best = d
+			bestID = id
+		}
+	}
+	if best == math.MaxFloat64 {
+		return 0, 0, false
+	}
+	return bestID, best, true
+}
+
+// ---- Highway parsing helpers ----
+
+type highwayWay struct {
+	nodes      []int64
+	speedKph   float64
+	maxHeightM float64
+	maxWeightT float64
+	oneway     int8 // 0=both, 1=forward, -1=reverse
+}
+
+func isDriveableHighway(hwy string, tags Tags) bool {
+	h := strings.ToLower(strings.TrimSpace(hwy))
+	switch h {
+	case "motorway", "trunk", "primary", "secondary", "tertiary",
+		"unclassified", "residential", "living_street", "service", "road":
+		return true
+	case "track":
+		return true
+	default:
+		return false
+	}
+}
+
+func isAccessDenied(tags Tags) bool {
+	deny := func(v string) bool {
+		v = strings.ToLower(strings.TrimSpace(v))
+		return v == "no" || v == "private"
+	}
+	if deny(tags["access"]) {
+		return true
+	}
+	if deny(tags["vehicle"]) || deny(tags["motor_vehicle"]) || deny(tags["hgv"]) {
+		return true
+	}
+	return false
+}
+
+func defaultSpeedForHighway(hwy string) float64 {
+	switch strings.ToLower(strings.TrimSpace(hwy)) {
+	case "motorway":
+		return 110
+	case "trunk":
+		return 100
+	case "primary":
+		return 80
+	case "secondary":
+		return 70
+	case "tertiary":
+		return 60
+	case "unclassified":
+		return 50
+	case "residential":
+		return 30
+	case "living_street":
+		return 10
+	case "service":
+		return 20
+	case "track":
+		return 25
+	default:
+		return 50
+	}
+}
+
+func parseOneway(v string) int8 {
+	v = strings.ToLower(strings.TrimSpace(v))
+	switch v {
+	case "yes", "true", "1":
+		return 1
+	case "-1", "reverse":
+		return -1
+	default:
+		return 0
+	}
+}
+
+func parseMaxSpeedKph(s string) float64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	low := strings.ToLower(s)
+	switch low {
+	case "de:urban":
+		return 50
+	case "de:rural":
+		return 100
+	case "de:motorway":
+		return 130
+	}
+	v, ok := firstFloat(s)
+	if !ok {
+		return 0
+	}
+	if strings.Contains(low, "mph") {
+		return v * 1.60934
+	}
+	return v
+}
+
+func parseMeters(s string) float64 {
+	v, ok := firstFloat(s)
+	if !ok {
+		return 0
+	}
+	return v
+}
+
+func parseTons(s string) float64 {
+	v, ok := firstFloat(s)
+	if !ok {
+		return 0
+	}
+	return v
+}
+
+func firstFloat(s string) (float64, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, false
+	}
+	start := -1
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= '0' && c <= '9') || c == '.' || c == ',' {
+			start = i
+			break
+		}
+	}
+	if start == -1 {
+		return 0, false
+	}
+	end := start
+	for end < len(s) {
+		c := s[end]
+		if (c >= '0' && c <= '9') || c == '.' || c == ',' {
+			end++
+			continue
+		}
+		break
+	}
+	num := strings.ReplaceAll(s[start:end], ",", ".")
+	v, err := strconv.ParseFloat(num, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// ---- misc helpers ----
+
+func appendUniqueLimited(dst []int64, src []int64, limit int) []int64 {
+	for _, v := range src {
+		if limit > 0 && len(dst) >= limit {
+			break
+		}
+		seen := false
+		for _, d := range dst {
+			if d == v {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			dst = append(dst, v)
+		}
+	}
+	return dst
+}
+
+func sampleWayNodeIDs(ids []int64) []int64 {
+	n := len(ids)
+	if n == 0 {
+		return nil
+	}
+	if n <= 3 {
+		out := make([]int64, 0, n)
+		for _, id := range ids {
+			if len(out) == 0 || out[len(out)-1] != id {
+				out = append(out, id)
+			}
+		}
+		return out
+	}
+	out := make([]int64, 0, 3)
+	out = append(out, ids[0])
+	mid := ids[n/2]
+	if mid != ids[0] && mid != ids[n-1] {
+		out = append(out, mid)
+	}
+	last := ids[n-1]
+	if last != ids[0] && last != mid {
+		out = append(out, last)
+	}
+	return out
 }
 
 func normalize(s string) string {
-    if s == "" {
-        return ""
-    }
-    lower := strings.ToLower(s)
-    // transliterate a few common German characters for matching
-    replacer := strings.NewReplacer(
-        "ß", "ss",
-        "ä", "ae",
-        "ö", "oe",
-        "ü", "ue",
-    )
-    cleaned := replacer.Replace(lower)
-    out := make([]rune, 0, len(cleaned))
-    for _, r := range cleaned {
-        switch r {
-        case ' ', '-', ',', '.', ';', ':':
-            continue
-        default:
-            out = append(out, r)
-        }
-    }
-    return string(out)
+	if s == "" {
+		return ""
+	}
+	lower := strings.ToLower(s)
+	replacer := strings.NewReplacer("ß", "ss", "ä", "ae", "ö", "oe", "ü", "ue")
+	cleaned := replacer.Replace(lower)
+
+	out := make([]rune, 0, len(cleaned))
+	for _, r := range cleaned {
+		switch r {
+		case ' ', '-', ',', '.', ';', ':':
+			continue
+		default:
+			out = append(out, r)
+		}
+	}
+	return string(out)
 }
 
 func allDigits(s string) bool {
-    for i := 0; i < len(s); i++ {
-        if s[i] < '0' || s[i] > '9' {
-            return false
-        }
-    }
-    return len(s) > 0
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return len(s) > 0
 }
 
 func hasDigit(s string) bool {
-    for i := 0; i < len(s); i++ {
-        if s[i] >= '0' && s[i] <= '9' {
-            return true
-        }
-    }
-    return false
-}
-
-// SearchAddresses returns up to `limit` address entries matching the query, ordered by score.
-// If limit <= 0, all matches are returned.
-func SearchAddresses(entries []AddressEntry, q AddressQuery, limit int) []AddressEntry {
-    type scored struct {
-        e AddressEntry
-        s int
-    }
-    sc := make([]scored, 0, len(entries))
-    for _, e := range entries {
-        s := matchScore(e, q)
-        if s <= 0 {
-            continue
-        }
-        sc = append(sc, scored{e: e, s: s})
-    }
-    sort.Slice(sc, func(i, j int) bool {
-        if sc[i].s == sc[j].s {
-            return sc[i].e.ID < sc[j].e.ID
-        }
-        return sc[i].s > sc[j].s
-    })
-    if limit <= 0 || limit > len(sc) {
-        limit = len(sc)
-    }
-    res := make([]AddressEntry, 0, limit)
-    for i := 0; i < limit; i++ {
-        res = append(res, sc[i].e)
-    }
-    return res
-}
-
-// StreetMatch represents a highway/street found in the graph.
-type StreetMatch struct {
-    Name   string
-    NodeID int64
-    Coord  Coord
-}
-
-// SearchStreets returns up to `limit` streets whose normalized name contains the query.
-func (r *Router) SearchStreets(q string, limit int) []StreetMatch {
-    nq := normalize(q)
-    if nq == "" {
-        return nil
-    }
-    matches := make([]StreetMatch, 0, 8)
-    for nameKey, ids := range r.streetNodes {
-        if !strings.Contains(nameKey, nq) {
-            continue
-        }
-        // pick first id that has coordinates
-        for _, id := range ids {
-            if c, ok := r.g.coords[id]; ok {
-                matches = append(matches, StreetMatch{Name: nameKey, NodeID: id, Coord: c})
-                break
-            }
-        }
-        if limit > 0 && len(matches) >= limit {
-            break
-        }
-    }
-    return matches
-}
-
-// priority queue for A*
-type priorityQueue []*pqItem
-
-type pqItem struct {
-    id  int64
-    f   float64
-    g   float64
-    idx int
-}
-
-func (pq priorityQueue) Len() int { return len(pq) }
-
-func (pq priorityQueue) Less(i, j int) bool { return pq[i].f < pq[j].f }
-
-func (pq priorityQueue) Swap(i, j int) {
-    pq[i], pq[j] = pq[j], pq[i]
-    pq[i].idx = i
-    pq[j].idx = j
-}
-
-func (pq *priorityQueue) Push(x interface{}) {
-    iw := x.(*pqItem)
-    iw.idx = len(*pq)
-    *pq = append(*pq, iw)
-}
-
-func (pq *priorityQueue) Pop() interface{} {
-    old := *pq
-    n := len(old)
-    iw := old[n-1]
-    *pq = old[0 : n-1]
-    return iw
+	for i := 0; i < len(s); i++ {
+		if s[i] >= '0' && s[i] <= '9' {
+			return true
+		}
+	}
+	return false
 }
 
 // haversineMeters returns the great-circle distance in meters.
 func haversineMeters(lat1, lon1, lat2, lon2 float64) float64 {
-    const R = 6371000.0 // Earth radius in meters
-    dLat := deg2rad(lat2 - lat1)
-    dLon := deg2rad(lon2 - lon1)
-    a := math.Sin(dLat/2)*math.Sin(dLat/2) + math.Cos(deg2rad(lat1))*math.Cos(deg2rad(lat2))*math.Sin(dLon/2)*math.Sin(dLon/2)
-    c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
-    return R * c
+	const R = 6371000.0
+	dLat := deg2rad(lat2 - lat1)
+	dLon := deg2rad(lon2 - lon1)
+	a := math.Sin(dLat/2)*math.Sin(dLat/2) +
+		math.Cos(deg2rad(lat1))*math.Cos(deg2rad(lat2))*math.Sin(dLon/2)*math.Sin(dLon/2)
+	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+	return R * c
 }
 
 func deg2rad(d float64) float64 { return d * math.Pi / 180 }
