@@ -5,11 +5,26 @@
     <title>OSMmini — modern UI</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="app-version" content="{{.Version}}">
+    <meta name="theme-color" content="#050d1f">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <link rel="dns-prefetch" href="https://unpkg.com">
+    <link rel="preconnect" href="https://unpkg.com">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <link rel="stylesheet" href="/static/style.css?v={{.Version}}" />
+    <script id="initialSettings" type="application/json">{{.Settings}}</script>
+    <style>
+      /* Critical CSS for instant rendering */
+      body { margin: 0; background: #050d1f; }
+      .spinner-page { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); 
+        width: 48px; height: 48px; border: 4px solid rgba(77,163,255,0.2); 
+        border-top-color: #4da3ff; border-radius: 50%; 
+        animation: spin 1s linear infinite; z-index: 9999; }
+      @keyframes spin { to { transform: translate(-50%, -50%) rotate(360deg); } }
+    </style>
   </head>
   <body>
-    <div class="app">
+    <div id="pageSpinner" class="spinner-page"></div>
+    <div class="app" style="opacity:0;transition:opacity 0.3s ease;">
       <aside class="sidebar">
         <div class="header">
           <div class="header-top">
@@ -45,48 +60,106 @@
 
         <section class="card settings-card collapsed" id="settingsCard">
           <div class="card-header">
-            <h2>Einstellungen</h2>
+            <h2>⚙️ Einstellungen</h2>
             <button id="settingsToggle" class="btn btn-sm btn-outline" aria-expanded="false">›</button>
           </div>
           <div class="card-body" id="settingsBody" style="display:none">
-            <div class="row small">
-              <select id="engine">
-                <option value="astar">A* (default)</option>
-                <option value="dijkstra">Dijkstra</option>
-                  <option value="dijkstra-node">Dijkstra (node)</option>
-                  <option value="ch">Contraction Hierarchies (CH)</option>
-              </select>
-              <select id="objective">
-                <option value="distance">Distanz</option>
-                <option value="duration">Dauer</option>
-                <option value="economy">Ökonomie</option>
-              </select>
+            
+            <!-- Routing Configuration -->
+            <div class="settings-section">
+              <div class="section-header">
+                <span class="section-icon">🚗</span>
+                <h3>Routing</h3>
+              </div>
+              <div class="settings-grid">
+                <div class="setting-item">
+                  <label class="setting-label" title="Algorithmus für Pfadfindung">
+                    Engine
+                    <span class="info-icon" title="A* ist schnell und optimal, CH ist sehr schnell bei großen Graphen">ⓘ</span>
+                  </label>
+                  <select id="engine" class="setting-select">
+                    <option value="astar">⚡ A* (schnell)</option>
+                    <option value="dijkstra">🔍 Dijkstra (exakt)</option>
+                    <option value="dijkstra-node">📊 Dijkstra Node</option>
+                    <option value="ch">🚀 CH (sehr schnell)</option>
+                  </select>
+                </div>
+                <div class="setting-item">
+                  <label class="setting-label" title="Optimierungsziel">
+                    Ziel
+                    <span class="info-icon" title="Distanz = kürzeste Strecke, Dauer = schnellste Route">ⓘ</span>
+                  </label>
+                  <select id="objective" class="setting-select">
+                    <option value="distance">📏 Distanz</option>
+                    <option value="duration">⏱️ Dauer</option>
+                    <option value="economy">⛽ Ökonomie</option>
+                  </select>
+                </div>
+              </div>
             </div>
-            <label class="checkbox switch"><input id="optimize" type="checkbox" checked role="switch" aria-checked="true"/> Reihenfolge optimieren</label>
-            <label class="checkbox switch"><input id="pro" type="checkbox" role="switch" aria-checked="false"/> Erweiterte Gewichte</label>
 
-            <div id="weights" class="weights hidden">
-              <label>Linksabbiegen <input id="w_left" type="number" step="0.1"/></label>
-              <label>Rechtsabbiegen <input id="w_right" type="number" step="0.1"/></label>
+            <!-- Trip Options -->
+            <div class="settings-section">
+              <div class="section-header">
+                <span class="section-icon">🗺️</span>
+                <h3>Trip-Optionen</h3>
+              </div>
+              <label class="checkbox switch" title="Stopps automatisch in optimaler Reihenfolge anordnen">
+                <input id="optimize" type="checkbox" checked role="switch" aria-checked="true"/>
+                <span>Reihenfolge optimieren</span>
+              </label>
+              <label class="checkbox switch" title="Erweiterte Gewichtung für Abbiegemanöver">
+                <input id="pro" type="checkbox" role="switch" aria-checked="false"/>
+                <span>Erweiterte Gewichte</span>
+              </label>
             </div>
 
-            <div class="section">
-              <h3 style="margin-top:12px; margin-bottom:8px; font-size:13px;">Erlaubte Straßen</h3>
-              <div id="allowedHighways" class="allowed-highways" style="display:flex;flex-wrap:wrap;gap:6px">
+            <!-- Pro Weights -->
+            <div id="weights" class="settings-section weights hidden">
+              <div class="section-header">
+                <span class="section-icon">⚖️</span>
+                <h3>Abbiegegewichte</h3>
+              </div>
+              <div class="settings-grid">
+                <div class="setting-item">
+                  <label class="setting-label">Linksabbiegen (s)</label>
+                  <input id="w_left" type="number" step="0.5" min="0" max="60" class="setting-input"/>
+                </div>
+                <div class="setting-item">
+                  <label class="setting-label">Rechtsabbiegen (s)</label>
+                  <input id="w_right" type="number" step="0.5" min="0" max="60" class="setting-input"/>
+                </div>
+              </div>
+            </div>
+
+            <!-- Highway Types -->
+            <div class="settings-section collapsible" id="highwaySection">
+              <div class="section-header clickable" id="highwayHeader">
+                <span class="section-icon">🛣️</span>
+                <h3>Erlaubte Straßentypen</h3>
+                <span class="collapse-indicator">›</span>
+              </div>
+              <div id="allowedHighways" class="allowed-highways" style="display:none">
                 <!-- checkboxes inserted by JS -->
               </div>
             </div>
 
-            <div class="section">
-              <h3 style="margin-top:12px; margin-bottom:8px; font-size:13px;">Default Geschwindigkeiten (kph)</h3>
-              <div id="speedDefaults" style="display:flex;flex-direction:column;gap:6px">
+            <!-- Speed Defaults -->
+            <div class="settings-section collapsible" id="speedSection">
+              <div class="section-header clickable" id="speedHeader">
+                <span class="section-icon">🚦</span>
+                <h3>Standardgeschwindigkeiten</h3>
+                <span class="collapse-indicator">›</span>
+              </div>
+              <div id="speedDefaults" class="speed-defaults" style="display:none">
                 <!-- inputs inserted by JS -->
               </div>
             </div>
 
-            <div style="margin-top:12px; display:flex; gap:8px;">
-              <button id="save" class="btn btn-outline">Speichern</button>
-              <button id="resetSettings" class="btn btn-secondary">Zurücksetzen</button>
+            <!-- Action Buttons -->
+            <div class="settings-actions">
+              <button id="save" class="btn btn-primary">💾 Speichern</button>
+              <button id="resetSettings" class="btn btn-secondary">🔄 Zurücksetzen</button>
             </div>
           </div>
         </section>
@@ -97,19 +170,106 @@
             <div id="status" role="status" aria-live="polite">Bereit</div>
             <div id="spinner" class="spinner" aria-hidden="true" title="Loading" style="display:none"></div>
             <div id="distance"></div>
+            <div id="routeDetails" class="route-details" style="display:none">
+              <div class="detail-row"><span class="detail-label">Distanz:</span><span id="detailDistance"></span></div>
+              <div class="detail-row"><span class="detail-label">Dauer:</span><span id="detailDuration"></span></div>
+              <div class="detail-row"><span class="detail-label">ETA:</span><span id="detailETA"></span></div>
+              <div class="detail-row"><span class="detail-label">Engine:</span><span id="detailEngine"></span></div>
+            </div>
+            <div class="route-actions" id="routeActions" style="display:none">
+              <button id="zoomToRoute" class="btn btn-sm btn-outline" title="Route einpassen">🔍 Zoom</button>
+              <button id="clearRoute" class="btn btn-sm btn-outline" title="Route löschen">✕ Route</button>
+              <button id="exportRoute" class="btn btn-sm btn-outline" title="Route exportieren">💾 Export</button>
+            </div>
             <div class="external-links">
-                <a id="gmaps" class="link" href="#" target="_blank" style="display:none">Google Maps</a>
-                <a id="amaps" class="link" href="#" target="_blank" style="display:none">Apple Maps</a>
+                <a id="gmaps" class="link" href="#" target="_blank" style="display:none">📍 Google Maps</a>
+                <a id="amaps" class="link" href="#" target="_blank" style="display:none">🗺️ Apple Maps</a>
             </div>
           </div>
           <div id="stopList" class="stop-list"></div>
+        </section>
+        
+        <section class="card help-card collapsed" id="helpCard">
+          <div class="card-header">
+            <h2>⌨️ Shortcuts</h2>
+            <button id="helpToggle" class="btn btn-sm btn-outline" aria-expanded="false">›</button>
+          </div>
+          <div class="card-body" id="helpBody" style="display:none">
+            <div class="shortcut-list">
+              <div class="shortcut-item"><kbd>Cmd/Ctrl + Enter</kbd> <span>Route berechnen</span></div>
+              <div class="shortcut-item"><kbd>Esc</kbd> <span>Suche schließen</span></div>
+              <div class="shortcut-item"><kbd>↑ ↓</kbd> <span>Suche navigieren</span></div>
+              <div class="shortcut-item"><kbd>Rechtsklick</kbd> <span>Marker löschen</span></div>
+            </div>
+          </div>
         </section>
       </aside>
 
       <main id="map" class="map"></main>
     </div>
 
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-    <script src="/static/app.js?v={{.Version}}"></script>
+    <script>
+      (function(){
+        const localCss = '/static/leaflet/leaflet.css';
+        const cdnCss = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+        const localJs = '/static/leaflet/leaflet.js';
+        const cdnJs = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+
+        function loadCss(href){
+          return new Promise((resolve,reject)=>{
+            const l = document.createElement('link');
+            l.rel = 'stylesheet'; l.href = href;
+            l.onload = ()=>resolve(href);
+            l.onerror = ()=>reject(href);
+            document.head.appendChild(l);
+          });
+        }
+
+        function loadScript(src){
+          return new Promise((resolve,reject)=>{
+            const s = document.createElement('script');
+            s.src = src; s.defer = true;
+            s.onload = ()=>resolve(src);
+            s.onerror = ()=>reject(src);
+            document.head.appendChild(s);
+          });
+        }
+
+        // Try local CSS first, then CDN
+        loadCss(localCss).catch(()=>loadCss(cdnCss)).catch(()=>{});
+
+        // Load Leaflet (local preferred) then app.js
+        loadScript(localJs).catch(()=>loadScript(cdnJs)).then(() => {
+          const app = document.createElement('script');
+          app.src = '/static/app.js?v={{.Version}}';
+          app.defer = true;
+          document.head.appendChild(app);
+        }).catch(() => {
+          // if both leaflet loads fail, still load app.js so it can show errors
+          const app = document.createElement('script');
+          app.src = '/static/app.js?v={{.Version}}';
+          app.defer = true;
+          document.head.appendChild(app);
+        });
+      })();
+
+      // Initialize immediately when DOM is ready and hide spinner when ready
+      document.addEventListener('DOMContentLoaded', () => {
+        const spinner = document.getElementById('pageSpinner');
+        const app = document.querySelector('.app');
+        const checkReady = setInterval(() => {
+          if (window.L && window.initializeApp) {
+            clearInterval(checkReady);
+            if (spinner) spinner.style.display = 'none';
+            if (app) app.style.opacity = '1';
+          }
+        }, 50);
+        // Fallback to hide spinner after 5s
+        setTimeout(() => {
+          if (spinner) spinner.style.display = 'none';
+          if (app) app.style.opacity = '1';
+        }, 5000);
+      });
+    </script>
   </body>
 </html>

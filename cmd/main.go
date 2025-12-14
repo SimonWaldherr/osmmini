@@ -565,8 +565,14 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	
+	// Load current settings to pass to frontend
+	settings := s.settings.Load()
+	settingsJSON, _ := json.Marshal(settings)
+	
 	_ = s.indexTmpl.Execute(w, map[string]any{
-		"Version": buildVersion,
+		"Version":  buildVersion,
+		"Settings": string(settingsJSON),
 	})
 }
 

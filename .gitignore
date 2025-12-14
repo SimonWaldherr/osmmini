@@ -2,3 +2,6 @@ tiles-cache
 region.osm.pbf
 osmmini.wasm
 wasm_exec.js
+leaflet.css
+leaflet.js
+osmmini-server

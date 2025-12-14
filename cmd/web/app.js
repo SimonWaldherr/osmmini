@@ -1,6 +1,53 @@
-// Optimized App JS
+// Optimized App JS with preloaded settings
+
+// Load settings from inline script (server-rendered)
+let preloadedSettings = null;
+try {
+  const settingsEl = document.getElementById('initialSettings');
+  if (settingsEl) {
+    preloadedSettings = JSON.parse(settingsEl.textContent);
+  }
+} catch (e) {
+  console.warn('Failed to load preloaded settings:', e);
+}
+
 const map = L.map('map').setView([48.7, 12.7], 10);
-L.tileLayer('/tiles/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+L.tileLayer('/tiles/{z}/{x}/{y}.png', { 
+  maxZoom: 19,
+  attribution: '',
+  updateWhenIdle: true,
+  updateWhenZooming: false,
+  keepBuffer: 2
+}).addTo(map);
+
+// Toast notification system
+function showToast(message, type = 'info', duration = 3000) {
+  const toast = document.createElement('div');
+  toast.className = `toast ${type}`;
+  const icon = type === 'success' ? '✅' : type === 'error' ? '❌' : 'ℹ️';
+  toast.innerHTML = `<span style="font-size:18px;">${icon}</span><span>${message}</span>`;
+  document.body.appendChild(toast);
+  setTimeout(() => {
+    toast.style.animation = 'toastSlide 0.3s ease reverse';
+    setTimeout(() => toast.remove(), 300);
+  }, duration);
+}
+
+// Debounce helper for performance (defined early so UI code can reference it)
+function debounce(func, wait) {
+  let timeout;
+  return function executedFunction(...args) {
+    const later = () => {
+      clearTimeout(timeout);
+      func(...args);
+    };
+    clearTimeout(timeout);
+    timeout = setTimeout(later, wait);
+  };
+}
+
+// debounced wrapper used by inputs (compute is hoisted)
+const debouncedCompute = debounce(function(){ try{ compute(); } catch(e){} }, 300);
 
 let polyline = null;
 let startMarker = null, endMarker = null;
@@ -96,23 +143,30 @@ function pinIcon(label){
 function syncStopIcons(orderIds) {
   const idToRank = new Map();
   orderIds.forEach((id, i) => idToRank.set(id, i+1));
-  stops.forEach((s, idx) => {
-    const n = idToRank.get(s.id) || (idx+1);
-    s.marker.setIcon(pinIcon(n));
+  
+  // Batch icon updates using requestAnimationFrame for better performance
+  requestAnimationFrame(() => {
+    stops.forEach((s, idx) => {
+      const n = idToRank.get(s.id) || (idx+1);
+      s.marker.setIcon(pinIcon(n));
+    });
   });
 }
 
 function renderStopList(orderIds) {
   const el = document.getElementById('stopList');
-  el.innerHTML = '';
   const order = (orderIds && orderIds.length) ? orderIds : stops.map(s => s.id);
   
-  if (order.length === 0) {
-    el.innerHTML = '<div style="padding:10px; color:#8aaedc; font-style:italic; font-size:12px;">Keine Stops auf der Karte</div>';
-    return;
-  }
+  // Use requestAnimationFrame for smooth rendering
+  requestAnimationFrame(() => {
+    el.innerHTML = '';
+    
+    if (order.length === 0) {
+      el.innerHTML = '<div style="padding:10px; color:#8aaedc; font-style:italic; font-size:12px;">Keine Stops auf der Karte</div>';
+      return;
+    }
 
-  order.forEach(id => {
+    order.forEach(id => {
     const s = stops.find(x => x.id === id);
     if (!s) return;
     const item = document.createElement('div');
@@ -122,6 +176,7 @@ function renderStopList(orderIds) {
     item.style.cursor = 'pointer';
     item.onclick = () => map.panTo([s.lat, s.lon]);
     el.appendChild(item);
+    });
   });
 }
 
@@ -144,10 +199,30 @@ function routeOptionsFromUI(){
   };
 }
 
+// Cache for API responses
+const apiCache = new Map();
+const CACHE_TTL = 30000; // 30 seconds
+
+function getCachedOrFetch(key, fetchFn) {
+  const cached = apiCache.get(key);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+    return Promise.resolve(cached.data);
+  }
+  return fetchFn().then(data => {
+    apiCache.set(key, { data, timestamp: Date.now() });
+    return data;
+  });
+}
+
 async function apiGetSettings() {
-  const res = await fetch('/api/v1/settings');
-  if (!res.ok) throw new Error('settings fetch failed');
-  return res.json();
+  return getCachedOrFetch('settings', async () => {
+    const res = await fetch('/api/v1/settings', {
+      headers: { 'Accept': 'application/json' },
+      cache: 'default'
+    });
+    if (!res.ok) throw new Error('settings fetch failed');
+    return res.json();
+  });
 }
 
 async function apiPutSettings(settings) {
@@ -182,14 +257,33 @@ function renderPath(path, meta){
   if(polyline) polyline.remove();
   if(startMarker) startMarker.remove(); if(endMarker) endMarker.remove();
   if(coords.length===0) return;
-  polyline = L.polyline(coords,{color:'#3a8eef', weight:5}).addTo(map);
-  startMarker = L.circleMarker(coords[0],{radius:6, color:'#6ef2a0'}).addTo(map);
-  endMarker = L.circleMarker(coords[coords.length-1],{radius:6, color:'#ffcc66'}).addTo(map);
+  polyline = L.polyline(coords,{color:'#3a8eef', weight:5, opacity: 0.8}).addTo(map);
+  startMarker = L.circleMarker(coords[0],{radius:7, color:'#6ef2a0', fillColor:'#6ef2a0', fillOpacity:0.8}).addTo(map);
+  endMarker = L.circleMarker(coords[coords.length-1],{radius:7, color:'#ffcc66', fillColor:'#ffcc66', fillOpacity:0.8}).addTo(map);
   map.fitBounds(polyline.getBounds(),{padding:[40,40]});
   
   const distKm = (meta.distance_m / 1000).toFixed(2);
   const durMin = Math.round(meta.duration_s / 60);
-  document.getElementById('distance').innerHTML = `<strong>${distKm} km</strong> • ${durMin} min`;
+  const durHours = Math.floor(durMin / 60);
+  const durMins = durMin % 60;
+  const durationText = durHours > 0 ? `${durHours}h ${durMins}min` : `${durMin} min`;
+  
+  document.getElementById('distance').innerHTML = `<strong>${distKm} km</strong> • ${durationText}`;
+  
+  // Show detailed route info
+  const detailsEl = document.getElementById('routeDetails');
+  if (detailsEl) {
+    detailsEl.style.display = 'block';
+    document.getElementById('detailDistance').textContent = `${distKm} km`;
+    document.getElementById('detailDuration').textContent = durationText;
+    const eta = new Date(Date.now() + meta.duration_s * 1000);
+    document.getElementById('detailETA').textContent = eta.toLocaleTimeString('de-DE', {hour: '2-digit', minute: '2-digit'});
+    document.getElementById('detailEngine').textContent = meta.engine || 'astar';
+  }
+  
+  // Show route actions
+  const actionsEl = document.getElementById('routeActions');
+  if (actionsEl) actionsEl.style.display = 'flex';
 }
 
 async function compute() {
@@ -200,6 +294,12 @@ async function compute() {
   setMapsLinks('', '');
   showSpinner(true);
   setComputeDisabled(true);
+  
+  // Hide route details while computing
+  const detailsEl = document.getElementById('routeDetails');
+  const actionsEl = document.getElementById('routeActions');
+  if (detailsEl) detailsEl.style.display = 'none';
+  if (actionsEl) actionsEl.style.display = 'none';
 
   try {
     const hasWaypoints = waypoints.some(wp => wp.input.value.trim() !== '');
@@ -207,7 +307,8 @@ async function compute() {
     
     if (!hasWaypoints && !hasStops) {
       if (!from || !to) {
-        document.getElementById('status').textContent = 'Bereit (Start/Ziel eingeben)';
+        document.getElementById('status').textContent = 'Bereit';
+        showToast('Bitte Start und Ziel eingeben', 'info');
         return;
       }
       const data = await apiRoute(from, to, options);
@@ -215,6 +316,7 @@ async function compute() {
       document.getElementById('status').textContent = '✅ Route gefunden';
       renderStopList([]);
       setMapsLinks(data.google_maps_url, data.apple_maps_url);
+      showToast(`Route berechnet: ${(data.distance_m/1000).toFixed(1)} km`, 'success', 2000);
     } else {
       const data = await apiTripSolve(from, to, options);
       renderPath(data.path, data);
@@ -223,9 +325,11 @@ async function compute() {
       syncStopIcons(data.order || []);
       renderStopList(data.order || []);
       setMapsLinks(data.google_maps_url, data.apple_maps_url);
+      showToast(`Trip berechnet mit ${stops.length + waypoints.filter(w=>w.input.value.trim()).length} Stops`, 'success', 2000);
     }
   } catch (e) {
-    document.getElementById('status').textContent = '❌ ' + e.message;
+    document.getElementById('status').textContent = '❌ Fehler';
+    showToast(e.message || 'Fehler bei der Routenberechnung', 'error', 4000);
     console.error(e);
   }
   finally {
@@ -244,6 +348,64 @@ document.getElementById('clear').addEventListener('click', () => {
   if(endMarker) endMarker.remove();
   document.getElementById('status').textContent = 'Bereit';
   document.getElementById('distance').textContent = '';
+  const detailsEl = document.getElementById('routeDetails');
+  const actionsEl = document.getElementById('routeActions');
+  if (detailsEl) detailsEl.style.display = 'none';
+  if (actionsEl) actionsEl.style.display = 'none';
+  setMapsLinks('', '');
+  showToast('Karte zurückgesetzt', 'info', 1500);
+});
+
+// Route control buttons
+document.getElementById('zoomToRoute')?.addEventListener('click', () => {
+  if (polyline) {
+    map.fitBounds(polyline.getBounds(), {padding: [40, 40]});
+    showToast('Route zentriert', 'info', 1500);
+  }
+});
+
+document.getElementById('clearRoute')?.addEventListener('click', () => {
+  if(polyline) polyline.remove();
+  if(startMarker) startMarker.remove();
+  if(endMarker) endMarker.remove();
+  const detailsEl = document.getElementById('routeDetails');
+  const actionsEl = document.getElementById('routeActions');
+  if (detailsEl) detailsEl.style.display = 'none';
+  if (actionsEl) actionsEl.style.display = 'none';
+  document.getElementById('status').textContent = 'Bereit';
+  document.getElementById('distance').textContent = '';
+  setMapsLinks('', '');
+  showToast('Route gelöscht', 'info', 1500);
+});
+
+document.getElementById('exportRoute')?.addEventListener('click', () => {
+  if (!polyline) {
+    showToast('Keine Route zum Exportieren', 'error', 2000);
+    return;
+  }
+  const coords = polyline.getLatLngs();
+  const geojson = {
+    type: 'Feature',
+    geometry: {
+      type: 'LineString',
+      coordinates: coords.map(c => [c.lng, c.lat])
+    },
+    properties: {
+      name: 'OSMmini Route',
+      distance_m: document.getElementById('detailDistance')?.textContent || '',
+      duration: document.getElementById('detailDuration')?.textContent || '',
+      engine: document.getElementById('detailEngine')?.textContent || '',
+      timestamp: new Date().toISOString()
+    }
+  };
+  const blob = new Blob([JSON.stringify(geojson, null, 2)], {type: 'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `osmmini-route-${Date.now()}.geojson`;
+  a.click();
+  URL.revokeObjectURL(url);
+  showToast('Route als GeoJSON exportiert', 'success', 2000);
 });
 
 map.on('click', ev=>{
@@ -251,8 +413,21 @@ map.on('click', ev=>{
   const marker = L.marker(ev.latlng,{draggable:true, icon: pinIcon(id)}).addTo(map);
   const s = {id, marker, lat:ev.latlng.lat, lon:ev.latlng.lng};
   stops.push(s); renderStopList();
-  marker.on('dragend', ()=>{ const ll=marker.getLatLng(); s.lat=ll.lat; s.lon=ll.lng; renderStopList(); });
-  marker.on('contextmenu', ()=>{ marker.remove(); const i=stops.findIndex(x=>x.id===id); if(i>=0) stops.splice(i,1); renderStopList(); });
+  marker.on('dragend', ()=>{ 
+    const ll=marker.getLatLng(); 
+    s.lat=ll.lat; 
+    s.lon=ll.lng; 
+    renderStopList(); 
+    showToast(`Marker ${id} verschoben`, 'info', 1500);
+  });
+  marker.on('contextmenu', ()=>{ 
+    marker.remove(); 
+    const i=stops.findIndex(x=>x.id===id); 
+    if(i>=0) stops.splice(i,1); 
+    renderStopList(); 
+    showToast(`Marker ${id} gelöscht`, 'info', 1500);
+  });
+  showToast(`Marker ${id} hinzugefügt`, 'success', 1500);
 });
 
 makeSuggest('from-suggest','from'); 
@@ -298,7 +473,15 @@ function addWaypoint() {
   waypoints.push({id, input, wrapper});
   makeSuggest(id + '-suggest', input);
   
-  input.addEventListener('change', compute);
+  input.addEventListener('change', debouncedCompute);
+  
+  // Also trigger on Enter key for immediate compute
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      compute();
+    }
+  });
 }
 
 function removeWaypoint(id) {
@@ -323,11 +506,14 @@ function makeSuggest(containerId, inputOrId) {
   function hide() { container.style.display = 'none'; }
   function show() { if (container.innerHTML.trim()) container.style.display = 'block'; }
 
+  let lastQuery = '';
   input.addEventListener('input', () => {
     const q = input.value.trim();
     if (timeout) clearTimeout(timeout);
     if (ctrl) ctrl.abort();
     if (q.length < 2) { hide(); return; }
+    if (q === lastQuery) return; // Skip duplicate queries
+    lastQuery = q;
 
     timeout = setTimeout(async () => {
       const mySeq = ++seq;
@@ -418,18 +604,26 @@ function escapeHtml(s){
   return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
 }
 
+// (debounce already defined earlier)
+// const debouncedCompute is defined near the top to avoid TDZ
+
 document.getElementById('addWaypoint').onclick = addWaypoint;
 
 const pro = document.getElementById('pro');
 const weights = document.getElementById('weights');
 pro.addEventListener('change', () => {
-  weights.style.display = pro.checked ? 'block' : 'none'; // Changed to block as per CSS
-  if (!pro.checked) weights.classList.add('hidden');
-  else weights.classList.remove('hidden');
+  if (pro.checked) {
+    weights.classList.remove('hidden');
+    setTimeout(() => weights.style.display = 'block', 10);
+  } else {
+    weights.style.display = 'none';
+    setTimeout(() => weights.classList.add('hidden'), 300);
+  }
   // update ARIA state for switch
   try { pro.setAttribute('aria-checked', pro.checked ? 'true' : 'false'); } catch (e) {}
   compute();
 });
+
 document.getElementById('engine').addEventListener('change', compute);
 document.getElementById('objective').addEventListener('change', compute);
 const optimizeEl = document.getElementById('optimize');
@@ -438,10 +632,9 @@ optimizeEl.addEventListener('change', (ev) => {
   compute();
 });
 
-// Load settings
-(async () => {
-  try {
-    const s = await apiGetSettings();
+// Initialize settings UI
+function initializeSettingsUI(s) {
+  if (!s) return;
     if(s.routing) {
         document.getElementById('engine').value = (s.routing.engine || 'astar');
         document.getElementById('objective').value = s.routing.objective || 'duration';
@@ -453,17 +646,32 @@ optimizeEl.addEventListener('change', (ev) => {
         document.getElementById('w_right').value = w.right_turn || 0;
     }
     // populate allowed highways UI
-    const common = ["motorway","trunk","primary","secondary","tertiary","unclassified","residential","living_street","service","track","motorway_link","trunk_link"];
-    const allowed = (s.default_highway_speeds && s.allowed_highway_types) ? s.allowed_highway_types : (s.allowed_highway_types || common);
+    const highwayTypes = [
+      {type: "motorway", icon: "🛣️", label: "Autobahn"},
+      {type: "trunk", icon: "🚗", label: "Schnellstraße"},
+      {type: "primary", icon: "🛣️", label: "Bundesstraße"},
+      {type: "secondary", icon: "🛣️", label: "Landstraße"},
+      {type: "tertiary", icon: "🛣️", label: "Kreisstraße"},
+      {type: "unclassified", icon: "🛣️", label: "Nebenstraße"},
+      {type: "residential", icon: "🏠", label: "Wohnstraße"},
+      {type: "living_street", icon: "🚶", label: "Spielstraße"},
+      {type: "service", icon: "🏪", label: "Zufahrt"},
+      {type: "track", icon: "🚜", label: "Feldweg"},
+      {type: "motorway_link", icon: "🔀", label: "Autobahnauffahrt"},
+      {type: "trunk_link", icon: "🔀", label: "Auffahrt"}
+    ];
     const allowedContainer = document.getElementById('allowedHighways');
     allowedContainer.innerHTML = '';
-    common.forEach(t => {
-      const id = 'ah_'+t;
+    highwayTypes.forEach(hw => {
+      const id = 'ah_'+hw.type;
       const lbl = document.createElement('label'); lbl.className='checkbox';
-      const cb = document.createElement('input'); cb.type='checkbox'; cb.className='allowed-highway'; cb.dataset.type = t; cb.id = id;
-      if (s.allowed_highway_types && s.allowed_highway_types.indexOf(t) !== -1) cb.checked = true;
+      const cb = document.createElement('input'); cb.type='checkbox'; cb.className='allowed-highway'; cb.dataset.type = hw.type; cb.id = id;
+      if (s.allowed_highway_types && s.allowed_highway_types.indexOf(hw.type) !== -1) cb.checked = true;
       lbl.appendChild(cb);
-      const span = document.createElement('span'); span.textContent = t; span.style.marginLeft='6px'; lbl.appendChild(span);
+      const span = document.createElement('span'); 
+      span.innerHTML = `${hw.icon} <small style="opacity:0.8">${hw.label}</small>`;
+      span.style.marginLeft='6px'; 
+      lbl.appendChild(span);
       allowedContainer.appendChild(lbl);
     });
 
@@ -471,17 +679,59 @@ optimizeEl.addEventListener('change', (ev) => {
     const speedContainer = document.getElementById('speedDefaults');
     speedContainer.innerHTML = '';
     const speeds = s.default_highway_speeds || {"motorway":150};
-    const keys = Array.from(new Set(Object.keys(speeds).concat(["motorway","trunk","primary","secondary","tertiary","residential","service","track"])));
-    keys.forEach(k => {
-      const row = document.createElement('div'); row.style.display='flex'; row.style.gap='8px'; row.style.alignItems='center';
-      const lab = document.createElement('div'); lab.style.width='140px'; lab.textContent = k;
-      const inp = document.createElement('input'); inp.type='number'; inp.className='speed-input'; inp.dataset.type=k; inp.value = speeds[k] || '';
-      inp.style.width='80px'; row.appendChild(lab); row.appendChild(inp); speedContainer.appendChild(row);
+    const speedTypes = [
+      {type: "motorway", label: "Autobahn", icon: "🚗"},
+      {type: "trunk", label: "Schnellstraße", icon: "🚗"},
+      {type: "primary", label: "Bundesstraße", icon: "🛣️"},
+      {type: "secondary", label: "Landstraße", icon: "🛣️"},
+      {type: "tertiary", label: "Kreisstraße", icon: "🛣️"},
+      {type: "residential", label: "Wohnstraße", icon: "🏠"},
+      {type: "service", label: "Zufahrt", icon: "🏪"},
+      {type: "track", label: "Feldweg", icon: "🚜"}
+    ];
+    speedTypes.forEach(st => {
+      const row = document.createElement('div');
+      row.className = 'speed-input-row';
+      const lab = document.createElement('label');
+      lab.innerHTML = `${st.icon} ${st.label}`;
+      const inp = document.createElement('input');
+      inp.type = 'number';
+      inp.className = 'speed-input';
+      inp.dataset.type = st.type;
+      inp.value = speeds[st.type] || '';
+      inp.placeholder = 'km/h';
+      inp.min = '5';
+      inp.max = '300';
+      inp.step = '5';
+      row.appendChild(lab);
+      row.appendChild(inp);
+      speedContainer.appendChild(row);
     });
-  } catch (e) {}
+}
+
+// Load settings (use preloaded or fetch)
+(async () => {
+  try {
+    let s = preloadedSettings;
+    if (!s) {
+      // Fallback to API if preload failed
+      s = await apiGetSettings();
+    }
+    initializeSettingsUI(s);
+  } catch (e) {
+    console.error('Failed to load settings:', e);
+  }
 })();
 
+// Mark app as initialized for page spinner
+window.initializeApp = true;
+
 document.getElementById('save').onclick = async () => {
+  const btn = document.getElementById('save');
+  const origText = btn.innerHTML;
+  btn.innerHTML = '⏳ Speichern...';
+  btn.disabled = true;
+  
   try {
     const cur = await apiGetSettings();
     cur.routing = routeOptionsFromUI();
@@ -493,10 +743,14 @@ document.getElementById('save').onclick = async () => {
     cur.default_highway_speeds = cur.default_highway_speeds || {};
     speedInputs.forEach(si => { const k=si.dataset.type; const v=parseFloat(si.value); if(!isNaN(v)) cur.default_highway_speeds[k]=v; });
     await apiPutSettings(cur);
-    document.getElementById('status').textContent = '💾 Gespeichert';
-    setTimeout(() => document.getElementById('status').textContent = 'Bereit', 2000);
+    apiCache.delete('settings'); // Invalidate cache
+    btn.innerHTML = '✅ Gespeichert';
+    showToast('Einstellungen erfolgreich gespeichert', 'success', 2000);
+    setTimeout(() => { btn.innerHTML = origText; btn.disabled = false; }, 1500);
   } catch (e) {
-    document.getElementById('status').textContent = '❌ Fehler';
+    btn.innerHTML = '❌ Fehler';
+    showToast('Fehler beim Speichern der Einstellungen', 'error', 3000);
+    setTimeout(() => { btn.innerHTML = origText; btn.disabled = false; }, 2000);
   }
 };
 
@@ -515,8 +769,67 @@ settingsToggle.addEventListener('click', ()=>{ setSettingsOpen(settingsBody.styl
 // default collapsed
 if(localStorage.getItem('settingsOpen') === null) setSettingsOpen(false); else setSettingsOpen(localStorage.getItem('settingsOpen')==='1');
 
+// help card collapse/expand
+const helpToggle = document.getElementById('helpToggle');
+const helpBody = document.getElementById('helpBody');
+const helpCard = document.getElementById('helpCard');
+if (helpToggle) {
+  function setHelpOpen(open){
+    helpBody.style.display = open ? 'block' : 'none';
+    helpCard.classList.toggle('collapsed', !open);
+    helpToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    helpToggle.textContent = open ? '‹' : '›';
+    localStorage.setItem('helpOpen', open ? '1' : '0');
+  }
+  helpToggle.addEventListener('click', ()=>{ setHelpOpen(helpBody.style.display==='none'); });
+  if(localStorage.getItem('helpOpen') === null) setHelpOpen(false); else setHelpOpen(localStorage.getItem('helpOpen')==='1');
+}
+
+// Collapsible settings sections
+function setupCollapsibleSection(headerId, contentId, storageKey) {
+  const header = document.getElementById(headerId);
+  const content = document.getElementById(contentId);
+  const section = header?.closest('.settings-section');
+  if (!header || !content) return;
+  
+  function setOpen(open) {
+    content.style.display = open ? 'grid' : 'none';
+    section?.classList.toggle('expanded', open);
+    localStorage.setItem(storageKey, open ? '1' : '0');
+  }
+  
+  header.addEventListener('click', () => {
+    setOpen(content.style.display === 'none');
+  });
+  
+  // Default collapsed
+  const saved = localStorage.getItem(storageKey);
+  setOpen(saved === '1');
+}
+
+setupCollapsibleSection('highwayHeader', 'allowedHighways', 'highwaysOpen');
+setupCollapsibleSection('speedHeader', 'speedDefaults', 'speedsOpen');
+
+// Intersection Observer for lazy rendering of collapsed sections
+if ('IntersectionObserver' in window) {
+  const lazyObserver = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        entry.target.classList.add('visible');
+        lazyObserver.unobserve(entry.target);
+      }
+    });
+  }, { rootMargin: '50px' });
+  
+  document.querySelectorAll('.settings-section').forEach(section => {
+    lazyObserver.observe(section);
+  });
+}
+
 document.getElementById('resetSettings').addEventListener('click', async ()=>{
-  try{ const def = await apiGetSettings(); /* reload from server (it holds persisted settings) */ window.location.reload(); } catch(e) { window.location.reload(); }
+  if (!confirm('Einstellungen zurücksetzen? Die Seite wird neu geladen.')) return;
+  showToast('Einstellungen werden zurückgesetzt...', 'info', 1500);
+  setTimeout(() => window.location.reload(), 500);
 });
 
 // UI helpers
@@ -542,9 +855,28 @@ function highlight(text, q) {
   } catch(e) { return escapeHtml(text); }
 }
 
-// keyboard shortcut: Ctrl/Cmd + Enter to compute
+// keyboard shortcuts
 document.addEventListener('keydown', (ev) => {
+  // Cmd/Ctrl + Enter to compute
   if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter') {
-    ev.preventDefault(); compute();
+    ev.preventDefault(); 
+    compute();
   }
+  // Cmd/Ctrl + K to focus start input
+  if ((ev.ctrlKey || ev.metaKey) && ev.key === 'k') {
+    ev.preventDefault();
+    document.getElementById('from')?.focus();
+  }
+  // Escape to blur active input
+  if (ev.key === 'Escape') {
+    document.activeElement?.blur();
+  }
+});
+
+// Visual feedback on button clicks
+document.querySelectorAll('.btn').forEach(btn => {
+  btn.addEventListener('click', function() {
+    this.style.transform = 'scale(0.95)';
+    setTimeout(() => this.style.transform = '', 100);
+  });
 });
