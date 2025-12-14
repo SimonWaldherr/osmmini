@@ -43,35 +43,57 @@
           </div>
         </section>
 
-        <section class="card settings-card">
+        <section class="card settings-card collapsed" id="settingsCard">
           <div class="card-header">
             <h2>Einstellungen</h2>
+            <button id="settingsToggle" class="btn btn-sm btn-outline" aria-expanded="false">›</button>
           </div>
-          <div class="row small">
-            <select id="engine">
-              <option value="astar">A* (default)</option>
-              <option value="dijkstra">Dijkstra</option>
-            </select>
-            <select id="objective">
-              <option value="distance">Distanz</option>
-              <option value="duration">Dauer</option>
-              <option value="economy">Ökonomie</option>
-            </select>
-          </div>
-          <label class="checkbox"><input id="optimize" type="checkbox" checked/> Reihenfolge optimieren</label>
-          <label class="checkbox"><input id="pro" type="checkbox"/> Erweiterte Gewichte</label>
+          <div class="card-body" id="settingsBody" style="display:none">
+            <div class="row small">
+              <select id="engine">
+                <option value="astar">A* (default)</option>
+                <option value="dijkstra">Dijkstra</option>
+              </select>
+              <select id="objective">
+                <option value="distance">Distanz</option>
+                <option value="duration">Dauer</option>
+                <option value="economy">Ökonomie</option>
+              </select>
+            </div>
+            <label class="checkbox switch"><input id="optimize" type="checkbox" checked role="switch" aria-checked="true"/> Reihenfolge optimieren</label>
+            <label class="checkbox switch"><input id="pro" type="checkbox" role="switch" aria-checked="false"/> Erweiterte Gewichte</label>
 
-          <div id="weights" class="weights hidden">
-            <label>Linksabbiegen <input id="w_left" type="number" step="0.1"/></label>
-            <label>Rechtsabbiegen <input id="w_right" type="number" step="0.1"/></label>
-            <button id="save" class="btn btn-outline">Speichern</button>
+            <div id="weights" class="weights hidden">
+              <label>Linksabbiegen <input id="w_left" type="number" step="0.1"/></label>
+              <label>Rechtsabbiegen <input id="w_right" type="number" step="0.1"/></label>
+            </div>
+
+            <div class="section">
+              <h3 style="margin-top:12px; margin-bottom:8px; font-size:13px;">Erlaubte Straßen</h3>
+              <div id="allowedHighways" class="allowed-highways" style="display:flex;flex-wrap:wrap;gap:6px">
+                <!-- checkboxes inserted by JS -->
+              </div>
+            </div>
+
+            <div class="section">
+              <h3 style="margin-top:12px; margin-bottom:8px; font-size:13px;">Default Geschwindigkeiten (kph)</h3>
+              <div id="speedDefaults" style="display:flex;flex-direction:column;gap:6px">
+                <!-- inputs inserted by JS -->
+              </div>
+            </div>
+
+            <div style="margin-top:12px; display:flex; gap:8px;">
+              <button id="save" class="btn btn-outline">Speichern</button>
+              <button id="resetSettings" class="btn btn-secondary">Zurücksetzen</button>
+            </div>
           </div>
         </section>
 
         <section class="card stops-card">
           <h2>Ergebnis</h2>
           <div id="info" class="info">
-            <div id="status">Bereit</div>
+            <div id="status" role="status" aria-live="polite">Bereit</div>
+            <div id="spinner" class="spinner" aria-hidden="true" title="Loading" style="display:none"></div>
             <div id="distance"></div>
             <div class="external-links">
                 <a id="gmaps" class="link" href="#" target="_blank" style="display:none">Google Maps</a>

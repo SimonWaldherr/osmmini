@@ -11,11 +11,15 @@ import (
 )
 
 // Coord holds WGS84 coordinates.
+// Used throughout the router to represent node and waypoint positions.
 type Coord struct {
 	Lat float64 `json:"lat"`
 	Lon float64 `json:"lon"`
 }
 
+// RouteEngine selects the pathfinding engine implementation.
+// - "astar": A* with admissible heuristic
+// - "dijkstra": A* with h=0 (equivalent to Dijkstra)
 type RouteEngine string
 
 const (
@@ -23,6 +27,10 @@ const (
 	EngineDijkstra RouteEngine = "dijkstra" // A* with h=0
 )
 
+// Objective controls the routing objective used for scoring edges:
+// - distance: minimize length in meters
+// - duration: minimize travel time (seconds)
+// - economy: minimize an economy cost proxy
 type Objective string
 
 const (
@@ -31,6 +39,9 @@ const (
 	ObjectiveEconomy  Objective = "economy"
 )
 
+// ProWeights contains optional advanced routing weights and vehicle constraints.
+// Values influence penalties (turns, crossings) and maximum assumed speed
+// used by heuristics and cost calculations.
 type ProWeights struct {
 	LeftTurn       float64 `json:"left_turn"`
 	RightTurn      float64 `json:"right_turn"`
@@ -41,6 +52,8 @@ type ProWeights struct {
 	VehicleWeightT float64 `json:"vehicle_weight_t"`
 }
 
+// RouteOptions are supplied to routing calls to control engine, objective
+// and pro-level weights/constraints.
 type RouteOptions struct {
 	Engine    RouteEngine `json:"engine,omitempty"`
 	Objective Objective   `json:"objective"`
@@ -56,6 +69,7 @@ func (o RouteOptions) withDefaults() RouteOptions {
 		o.Engine = EngineAStar
 	}
 	if o.Objective == "" {
+		// default objective falls back to distance when not set
 		o.Objective = ObjectiveDistance
 	}
 	if o.Weights.MaxSpeedKph <= 0 {
@@ -81,6 +95,8 @@ type Graph struct {
 }
 
 // Router wraps a road graph built from OSM highways.
+// Router wraps a road graph built from OSM highways and provides
+// nearest-node lookup, street search and pathfinding (A*/Dijkstra).
 type Router struct {
 	g       Graph
 	streets map[string]streetEntry // normalized -> display + sample nodes
@@ -519,8 +535,30 @@ func matchScore(e AddressEntry, q AddressQuery) int {
 			score += 1
 		}
 	}
-	if score == 0 && q.Street != "" && containsNorm(street, q.Street) {
-		score += 1
+	// If street/address matching didn't produce a high score, also try matching
+	// common POI/company tags so users can search by firm/shop names.
+	if q.Street != "" {
+		// exact name match (high relevance)
+		if equalNorm(e.Tags["name"], q.Street) {
+			score += 5
+		} else if containsNorm(e.Tags["name"], q.Street) {
+			score += 2
+		}
+		// other common business tags
+		if equalNorm(e.Tags["brand"], q.Street) || equalNorm(e.Tags["operator"], q.Street) {
+			score += 3
+		} else if containsNorm(e.Tags["brand"], q.Street) || containsNorm(e.Tags["operator"], q.Street) {
+			score += 1
+		}
+		if equalNorm(e.Tags["shop"], q.Street) || equalNorm(e.Tags["office"], q.Street) || equalNorm(e.Tags["amenity"], q.Street) {
+			score += 2
+		} else if containsNorm(e.Tags["shop"], q.Street) || containsNorm(e.Tags["office"], q.Street) || containsNorm(e.Tags["amenity"], q.Street) {
+			score += 1
+		}
+		// fallback: partial street match as before
+		if score == 0 && containsNorm(street, q.Street) {
+			score += 1
+		}
 	}
 	return score
 }
@@ -575,7 +613,8 @@ type RouteResult struct {
 }
 
 func (r *Router) Route(from, to int64) ([]int64, float64, error) {
-	res, err := r.RouteWithOptions(context.Background(), from, to, RouteOptions{Objective: ObjectiveDistance})
+	// Default to duration-based routing (prefer faster roads like motorways)
+	res, err := r.RouteWithOptions(context.Background(), from, to, RouteOptions{Objective: ObjectiveDuration})
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1057,8 +1096,44 @@ type highwayWay struct {
 	oneway     int8 // 0=both, 1=forward, -1=reverse
 }
 
+// DefaultHighwaySpeeds can be overridden by the caller (e.g. server settings)
+// to control the fallback speed used when a way has no maxspeed tag.
+var DefaultHighwaySpeeds = map[string]float64{
+	"motorway":      110,
+	"trunk":         100,
+	"primary":       80,
+	"secondary":     70,
+	"tertiary":      60,
+	"unclassified":  50,
+	"residential":   30,
+	"living_street": 10,
+	"service":       20,
+	"track":         25,
+}
+
+// AllowedHighwayTypesMap, if non-empty, restricts which highway types are treated as driveable.
+var AllowedHighwayTypesMap map[string]bool
+
 func isDriveableHighway(hwy string, tags Tags) bool {
 	h := strings.ToLower(strings.TrimSpace(hwy))
+	// If caller supplied an allowed-types map, only accept listed keys (and their _link variants).
+	if AllowedHighwayTypesMap != nil && len(AllowedHighwayTypesMap) > 0 {
+		if AllowedHighwayTypesMap[h] {
+			return true
+		}
+		// allow e.g. motorway_link when motorway present
+		if strings.HasSuffix(h, "_link") {
+			base := strings.TrimSuffix(h, "_link")
+			if AllowedHighwayTypesMap[base] {
+				return true
+			}
+		}
+		return false
+	}
+	// accept common highway types and any *_link (ramps/entrances/exits)
+	if strings.HasSuffix(h, "_link") {
+		return true
+	}
 	switch h {
 	case "motorway", "trunk", "primary", "secondary", "tertiary",
 		"unclassified", "residential", "living_street", "service", "road":
@@ -1085,30 +1160,11 @@ func isAccessDenied(tags Tags) bool {
 }
 
 func defaultSpeedForHighway(hwy string) float64 {
-	switch strings.ToLower(strings.TrimSpace(hwy)) {
-	case "motorway":
-		return 110
-	case "trunk":
-		return 100
-	case "primary":
-		return 80
-	case "secondary":
-		return 70
-	case "tertiary":
-		return 60
-	case "unclassified":
-		return 50
-	case "residential":
-		return 30
-	case "living_street":
-		return 10
-	case "service":
-		return 20
-	case "track":
-		return 25
-	default:
-		return 50
+	key := strings.ToLower(strings.TrimSpace(hwy))
+	if v, ok := DefaultHighwaySpeeds[key]; ok {
+		return v
 	}
+	return 50
 }
 
 func parseOneway(v string) int8 {

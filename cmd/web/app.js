@@ -198,6 +198,8 @@ async function compute() {
   const options = routeOptionsFromUI();
   document.getElementById('status').textContent = 'Berechne...';
   setMapsLinks('', '');
+  showSpinner(true);
+  setComputeDisabled(true);
 
   try {
     const hasWaypoints = waypoints.some(wp => wp.input.value.trim() !== '');
@@ -225,6 +227,10 @@ async function compute() {
   } catch (e) {
     document.getElementById('status').textContent = '❌ ' + e.message;
     console.error(e);
+  }
+  finally {
+    showSpinner(false);
+    setComputeDisabled(false);
   }
 }
 
@@ -312,6 +318,7 @@ function makeSuggest(containerId, inputOrId) {
   let timeout = null;
   let seq = 0;
   let ctrl = null;
+  let selectedIndex = -1;
 
   function hide() { container.style.display = 'none'; }
   function show() { if (container.innerHTML.trim()) container.style.display = 'block'; }
@@ -330,17 +337,37 @@ function makeSuggest(containerId, inputOrId) {
         if (!res.ok) return;
         const data = await res.json();
         if (mySeq !== seq) return;
-
         container.innerHTML = '';
+        selectedIndex = -1;
         if (!Array.isArray(data) || data.length === 0) { hide(); return; }
 
-        data.slice(0,5).forEach(item => {
+        data.slice(0,5).forEach((item, i) => {
           const el = document.createElement('div');
           el.className = 'item';
-          el.textContent = item.label || '';
-          el.onclick = () => { input.value = item.label || ''; hide(); compute(); };
+          el.dataset.index = String(i);
+          // build rich label: prefer POI/company name, then street label
+          const tags = item.tags || {};
+          const primary = tags.name || item.label || tags.brand || tags.operator || '';
+          const secondaryParts = [];
+          if (tags.shop) secondaryParts.push(tags.shop);
+          if (tags.amenity) secondaryParts.push(tags.amenity);
+          if (tags['addr:street']) secondaryParts.push(tags['addr:street']);
+          if (tags['addr:city']) secondaryParts.push(tags['addr:city']);
+          const secondary = secondaryParts.join(' • ');
+
+          // highlight matches and show primary + secondary
+          const q = input.value.trim();
+          const primHtml = q ? highlight(primary || item.label || '', q) : escapeHtml(primary || item.label || '');
+          const secHtml = q ? highlight(secondary, q) : escapeHtml(secondary);
+          el.innerHTML = `<div style="display:flex;flex-direction:column;">
+                            <div style="font-weight:600;">${primHtml}</div>
+                            <div style="font-size:12px; color:rgba(200,220,255,0.6); margin-top:4px;">${secHtml}</div>
+                          </div>`;
+          el.addEventListener('mouseover', () => { selectedIndex = i; updateActive(); });
+          el.onclick = () => { input.value = primary || item.label || ''; hide(); compute(); input.focus(); };
           container.appendChild(el);
         });
+        updateActive();
         show();
       } catch (err) {
         if (err && err.name === 'AbortError') return;
@@ -349,9 +376,46 @@ function makeSuggest(containerId, inputOrId) {
     }, 220);
   });
 
+  // keyboard navigation for suggestions
+  input.addEventListener('keydown', (ev) => {
+    const items = Array.from(container.querySelectorAll('.item'));
+    if (!items.length) return;
+    if (ev.key === 'ArrowDown') {
+      ev.preventDefault();
+      selectedIndex = Math.min(selectedIndex + 1, items.length - 1);
+      updateActive();
+    } else if (ev.key === 'ArrowUp') {
+      ev.preventDefault();
+      selectedIndex = Math.max(selectedIndex - 1, 0);
+      updateActive();
+    } else if (ev.key === 'Enter') {
+      if (selectedIndex >= 0 && items[selectedIndex]) {
+        ev.preventDefault(); items[selectedIndex].click();
+      }
+    } else if (ev.key === 'Escape') {
+      hide();
+    }
+  });
+
+  function updateActive() {
+    const items = Array.from(container.querySelectorAll('.item'));
+    items.forEach((it, idx) => {
+      if (idx === selectedIndex) it.classList.add('active'); else it.classList.remove('active');
+    });
+    // ensure active item is visible
+    const active = container.querySelector('.item.active');
+    if (active) active.scrollIntoView({block: 'nearest'});
+  }
+
   document.addEventListener('click', (ev) => {
     if (!container.contains(ev.target) && ev.target !== input) hide();
   });
+}
+
+// simple HTML escaper for suggestion labels
+function escapeHtml(s){
+  if(!s) return '';
+  return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
 }
 
 document.getElementById('addWaypoint').onclick = addWaypoint;
@@ -362,11 +426,17 @@ pro.addEventListener('change', () => {
   weights.style.display = pro.checked ? 'block' : 'none'; // Changed to block as per CSS
   if (!pro.checked) weights.classList.add('hidden');
   else weights.classList.remove('hidden');
+  // update ARIA state for switch
+  try { pro.setAttribute('aria-checked', pro.checked ? 'true' : 'false'); } catch (e) {}
   compute();
 });
 document.getElementById('engine').addEventListener('change', compute);
 document.getElementById('objective').addEventListener('change', compute);
-document.getElementById('optimize').addEventListener('change', compute);
+const optimizeEl = document.getElementById('optimize');
+optimizeEl.addEventListener('change', (ev) => {
+  try { optimizeEl.setAttribute('aria-checked', optimizeEl.checked ? 'true' : 'false'); } catch (e) {}
+  compute();
+});
 
 // Load settings
 (async () => {
@@ -374,7 +444,7 @@ document.getElementById('optimize').addEventListener('change', compute);
     const s = await apiGetSettings();
     if(s.routing) {
         document.getElementById('engine').value = (s.routing.engine || 'astar');
-        document.getElementById('objective').value = s.routing.objective || 'distance';
+        document.getElementById('objective').value = s.routing.objective || 'duration';
         document.getElementById('pro').checked = !!s.routing.pro;
         if(s.routing.pro) weights.classList.remove('hidden');
         
@@ -382,6 +452,32 @@ document.getElementById('optimize').addEventListener('change', compute);
         document.getElementById('w_left').value = w.left_turn || 0;
         document.getElementById('w_right').value = w.right_turn || 0;
     }
+    // populate allowed highways UI
+    const common = ["motorway","trunk","primary","secondary","tertiary","unclassified","residential","living_street","service","track","motorway_link","trunk_link"];
+    const allowed = (s.default_highway_speeds && s.allowed_highway_types) ? s.allowed_highway_types : (s.allowed_highway_types || common);
+    const allowedContainer = document.getElementById('allowedHighways');
+    allowedContainer.innerHTML = '';
+    common.forEach(t => {
+      const id = 'ah_'+t;
+      const lbl = document.createElement('label'); lbl.className='checkbox';
+      const cb = document.createElement('input'); cb.type='checkbox'; cb.className='allowed-highway'; cb.dataset.type = t; cb.id = id;
+      if (s.allowed_highway_types && s.allowed_highway_types.indexOf(t) !== -1) cb.checked = true;
+      lbl.appendChild(cb);
+      const span = document.createElement('span'); span.textContent = t; span.style.marginLeft='6px'; lbl.appendChild(span);
+      allowedContainer.appendChild(lbl);
+    });
+
+    // populate speed defaults UI
+    const speedContainer = document.getElementById('speedDefaults');
+    speedContainer.innerHTML = '';
+    const speeds = s.default_highway_speeds || {"motorway":150};
+    const keys = Array.from(new Set(Object.keys(speeds).concat(["motorway","trunk","primary","secondary","tertiary","residential","service","track"])));
+    keys.forEach(k => {
+      const row = document.createElement('div'); row.style.display='flex'; row.style.gap='8px'; row.style.alignItems='center';
+      const lab = document.createElement('div'); lab.style.width='140px'; lab.textContent = k;
+      const inp = document.createElement('input'); inp.type='number'; inp.className='speed-input'; inp.dataset.type=k; inp.value = speeds[k] || '';
+      inp.style.width='80px'; row.appendChild(lab); row.appendChild(inp); speedContainer.appendChild(row);
+    });
   } catch (e) {}
 })();
 
@@ -389,6 +485,13 @@ document.getElementById('save').onclick = async () => {
   try {
     const cur = await apiGetSettings();
     cur.routing = routeOptionsFromUI();
+    // collect allowed highways
+    const allowed = Array.from(document.querySelectorAll('.allowed-highway')).filter(x=>x.checked).map(x=>x.dataset.type);
+    cur.allowed_highway_types = allowed;
+    // collect speed defaults
+    const speedInputs = Array.from(document.querySelectorAll('.speed-input'));
+    cur.default_highway_speeds = cur.default_highway_speeds || {};
+    speedInputs.forEach(si => { const k=si.dataset.type; const v=parseFloat(si.value); if(!isNaN(v)) cur.default_highway_speeds[k]=v; });
     await apiPutSettings(cur);
     document.getElementById('status').textContent = '💾 Gespeichert';
     setTimeout(() => document.getElementById('status').textContent = 'Bereit', 2000);
@@ -396,3 +499,52 @@ document.getElementById('save').onclick = async () => {
     document.getElementById('status').textContent = '❌ Fehler';
   }
 };
+
+// settings collapse/expand
+const settingsToggle = document.getElementById('settingsToggle');
+const settingsBody = document.getElementById('settingsBody');
+const settingsCard = document.getElementById('settingsCard');
+function setSettingsOpen(open){
+  settingsBody.style.display = open ? 'block' : 'none';
+  settingsCard.classList.toggle('collapsed', !open);
+  settingsToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+  settingsToggle.textContent = open ? '‹' : '›';
+  localStorage.setItem('settingsOpen', open ? '1' : '0');
+}
+settingsToggle.addEventListener('click', ()=>{ setSettingsOpen(settingsBody.style.display==='none'); });
+// default collapsed
+if(localStorage.getItem('settingsOpen') === null) setSettingsOpen(false); else setSettingsOpen(localStorage.getItem('settingsOpen')==='1');
+
+document.getElementById('resetSettings').addEventListener('click', async ()=>{
+  try{ const def = await apiGetSettings(); /* reload from server (it holds persisted settings) */ window.location.reload(); } catch(e) { window.location.reload(); }
+});
+
+// UI helpers
+function showSpinner(on) {
+  const s = document.getElementById('spinner');
+  if (!s) return; s.style.display = on ? 'inline-block' : 'none';
+  s.setAttribute('aria-hidden', on ? 'false' : 'true');
+}
+
+function setComputeDisabled(dis) {
+  const btn = document.getElementById('go');
+  if (!btn) return;
+  if (dis) { btn.setAttribute('disabled','disabled'); btn.setAttribute('aria-disabled','true'); }
+  else { btn.removeAttribute('disabled'); btn.setAttribute('aria-disabled','false'); }
+}
+
+// highlight occurrences of q in text (case-insensitive)
+function highlight(text, q) {
+  if(!text || !q) return escapeHtml(text || '');
+  try{
+    const re = new RegExp('(' + q.replace(/[-/\\^$*+?.()|[\]{}]/g,'\\$&') + ')','ig');
+    return escapeHtml(text).replace(re, '<mark>$1</mark>');
+  } catch(e) { return escapeHtml(text); }
+}
+
+// keyboard shortcut: Ctrl/Cmd + Enter to compute
+document.addEventListener('keydown', (ev) => {
+  if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter') {
+    ev.preventDefault(); compute();
+  }
+});

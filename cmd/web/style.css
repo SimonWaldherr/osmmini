@@ -133,6 +133,11 @@ h1, h2, h3 { margin: 0; font-weight: 600; }
   border-color: rgba(77, 163, 255, 0.3);
 }
 
+/* Collapsible card */
+.card.collapsed .card-body { display: none; }
+.card-header { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+.card-header h2 { margin: 0; }
+
 .card h2 { 
   font-size: 14px; 
   text-transform: uppercase; 
@@ -179,6 +184,8 @@ label {
   border-bottom: 1px solid rgba(255,255,255,0.03); 
 }
 .suggest .item:hover { background: rgba(77, 163, 255, 0.1); color: white; }
+
+.suggest .item.active { background: linear-gradient(90deg, var(--primary), var(--primary-hover)); color: white; }
 
 input, select { 
   width: 100%; 
@@ -272,6 +279,15 @@ input::placeholder { color: rgba(138, 174, 220, 0.4); }
 
 .btn-sm { padding: 6px 12px; font-size: 12px; }
 
+/* Disabled buttons */
+.btn[disabled], button[disabled] { opacity: 0.6; cursor: not-allowed; transform: none; box-shadow: none; }
+
+/* Spinner */
+.spinner { width:18px; height:18px; border-radius:50%; border:3px solid rgba(255,255,255,0.12); border-top-color: var(--primary); animation: spin 1s linear infinite; display:inline-block; vertical-align:middle; margin-left:8px; }
+@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+.suggest .item mark { background: rgba(255,255,255,0.12); color: inherit; padding:0 2px; border-radius:2px; }
+
 .actions { 
   display: grid; 
   grid-template-columns: 1fr auto; 
@@ -308,7 +324,23 @@ input::placeholder { color: rgba(138, 174, 220, 0.4); }
   color: var(--text-main);
   padding: 6px 0;
 }
-.checkbox input { width: 16px; height: 16px; margin: 0; accent-color: var(--primary); }
+.checkbox input { width: 18px; height: 18px; margin: 0; accent-color: var(--primary); cursor: pointer; }
+
+/* nicer toggle look for modern browsers */
+.checkbox.switch { --w:42px; --h:24px; }
+.checkbox.switch input { appearance: none; -webkit-appearance: none; width: var(--w); height: var(--h); border-radius: 999px; background: rgba(255,255,255,0.08); position: relative; padding: 2px; }
+.checkbox.switch input:before { content: ''; position: absolute; left: 3px; top: 3px; width: calc(var(--h) - 6px); height: calc(var(--h) - 6px); background: white; border-radius: 50%; transition: transform 0.18s ease, background 0.18s ease; transform: translateX(0); }
+.checkbox.switch input:checked { background: linear-gradient(90deg, var(--primary), var(--primary-hover)); }
+.checkbox.switch input:checked:before { transform: translateX(calc(var(--w) - var(--h))); background: white; }
+
+/* clearer checked state for checkbox labels */
+.checkbox input:checked { box-shadow: 0 0 0 3px rgba(77,163,255,0.08); border-radius: 4px; }
+.checkbox input:focus { outline: none; box-shadow: 0 0 0 4px rgba(77,163,255,0.12); }
+.checkbox input:checked + span { color: var(--primary); font-weight: 700; }
+
+/* make the clickable label area show active background */
+.checkbox:hover { background: rgba(255,255,255,0.01); border-radius: 6px; }
+.checkbox input:checked ~ span { color: var(--primary); }
 
 .weights { 
   margin-top: 12px; 

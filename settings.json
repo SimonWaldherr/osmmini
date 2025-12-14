@@ -1,14 +1,14 @@
 {
   "routing": {
     "engine": "dijkstra",
-    "objective": "distance",
+    "objective": "duration",
     "pro": true,
     "weights": {
       "left_turn": 2.4,
       "right_turn": 0,
       "u_turn": 0,
       "crossing": 0,
-      "max_speed_kph": 0,
+      "max_speed_kph": 150,
       "vehicle_height_m": 0,
       "vehicle_weight_t": 0
     }
@@ -17,5 +17,9 @@
     "cache_dir": "tiles-cache",
     "upstream": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
     "user_agent": "osmmini-routerd/1.0 (offline routing)"
+  }
+  ,
+  "default_highway_speeds": {
+    "motorway": 150
   }
 }

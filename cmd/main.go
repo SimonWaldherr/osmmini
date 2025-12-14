@@ -31,35 +31,77 @@ const buildVersion = "dev"
 
 // ---- Settings ----
 
+// TileSettings controls the tile cache proxy behavior.
+// These settings are persisted in the settings file and can be updated
+// at runtime via the settings API.
 type TileSettings struct {
 	CacheDir  string `json:"cache_dir"`
 	Upstream  string `json:"upstream"`
 	UserAgent string `json:"user_agent"`
 }
 
+// Settings holds the server configuration persisted in the settings.json
+// file. The server loads these settings early during startup so routing
+// defaults (e.g. highway speeds) can be applied before the graph is built.
+// Use the HTTP API `PUT /api/v1/settings` to update them at runtime; some
+// changes (like default speeds used during graph import) require rebuilding
+// the graph or restarting the server to take full effect.
 type Settings struct {
 	Routing osmmini.RouteOptions `json:"routing"`
 	Tiles   TileSettings         `json:"tiles"`
+	// DefaultHighwaySpeeds allows overriding fallback speeds per highway type
+	DefaultHighwaySpeeds map[string]float64 `json:"default_highway_speeds,omitempty"`
+	// AllowedHighwayTypes controls which highway types are imported/allowed
+	AllowedHighwayTypes []string `json:"allowed_highway_types,omitempty"`
 }
 
+// DefaultSettings returns a sane set of defaults used when no
+// settings.json exists. These defaults are chosen for Germany: the
+// routing objective is set to minimize duration and motorway speeds are
+// assumed higher (e.g. 150 km/h). Adjust `settings.json` to override.
 func DefaultSettings(cacheDir, upstream string) Settings {
 	return Settings{
 		Routing: osmmini.RouteOptions{
 			Engine:    osmmini.EngineAStar,
-			Objective: osmmini.ObjectiveDistance,
+			// Default routing objective for Germany: minimize duration
+			Objective: osmmini.ObjectiveDuration,
 			Pro:       false,
 			Weights: osmmini.ProWeights{
 				LeftTurn:    0,
 				RightTurn:   0,
 				UTurn:       0,
 				Crossing:    0,
-				MaxSpeedKph: 130,
+				// MaxSpeedKph caps speeds used by the routing heuristics
+				// and cost calculations. Set higher to allow faster
+				// assumptions on unrestricted Autobahn sections.
+				MaxSpeedKph: 150,
 			},
 		},
 		Tiles: TileSettings{
 			CacheDir:  cacheDir,
 			Upstream:  upstream,
 			UserAgent: "osmmini-routerd/1.0 (offline routing)",
+		},
+		// DefaultHighwaySpeeds: fallback speeds (kph) per highway type.
+		// These are the built-in defaults used when no "default_highway_speeds"
+		// are provided in the settings file. At startup the server loads the
+		// configured settings (e.g. settings.json) and, if a
+		// `default_highway_speeds` map is present, applies those values to the
+		// routing engine so they override these built-in defaults.
+		// Note: changing the settings file after startup requires using the
+		// settings API (`PUT /api/v1/settings`) or restarting the server for
+		// the new defaults to be applied during graph build.
+		DefaultHighwaySpeeds: map[string]float64{
+			"motorway":      150, // km/h - German Autobahn (assumed higher/default)
+			"trunk":         100, // km/h - from German Bundesstraße default
+			"primary":       80,  // km/h - from German Landesstraße default
+			"secondary":     70,  // km/h - from German Kreisstraße default
+			"tertiary":      60,  // km/h - from German Gemeindestraße default
+			"unclassified":  50,  // km/h - typical urban road
+			"residential":   30,  // km/h - typical urban residential
+			"living_street": 10,  // km/h - typical living street
+			"service":       20,  // km/h - typical service road
+			"track":         25,  // km/h - typical unpaved track
 		},
 	}
 }
@@ -330,6 +372,9 @@ type server struct {
 }
 
 func main() {
+	// Command-line flags. `-pbf` should point at the OSM PBF used to
+	// build the routing graph (e.g. a regional extract). If the file
+	// is missing the server will fail to build the router.
 	pbf := flag.String("pbf", "region.osm.pbf", "Path to OSM PBF")
 	listen := flag.String("listen", ":8080", "HTTP listen address")
 	settingsPath := flag.String("settings", "settings.json", "Settings JSON file")
@@ -352,6 +397,17 @@ func main() {
 		win = &w
 	}
 
+	// Load settings early so defaults (e.g. highway speeds) can be applied
+	store := NewSettingsStore(*settingsPath, DefaultSettings(*tilesDir, *tileUpstream))
+	if err := store.Load(); err != nil {
+		log.Fatalf("settings load failed: %v", err)
+	}
+
+	// Apply default highway speeds from settings (if provided)
+	if m := store.Get().DefaultHighwaySpeeds; m != nil {
+		osmmini.DefaultHighwaySpeeds = m
+	}
+
 	log.Printf("Loading PBF %s and building router...", *pbf)
 	r, addrs, err := osmmini.BuildRouterWithAddressesOptions(*pbf, osmmini.BuildOptions{
 		Window:        win,
@@ -366,10 +422,6 @@ func main() {
 	}
 	log.Printf("Graph ready: nodes=%d edges=%d addresses=%d", r.NodeCount(), r.EdgeCount(), len(addrs))
 
-	store := NewSettingsStore(*settingsPath, DefaultSettings(*tilesDir, *tileUpstream))
-	if err := store.Load(); err != nil {
-		log.Fatalf("settings load failed: %v", err)
-	}
 	tileCache := NewTileCache(store.Get().Tiles)
 
 	indexTmpl := template.Must(template.ParseFS(embedded, "web/index.html"))
