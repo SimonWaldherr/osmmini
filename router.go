@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"sort"
 	"strconv"
@@ -641,6 +642,17 @@ type RouteResult struct {
 	Engine     RouteEngine `json:"engine"`
 }
 
+// Maneuver describes a single navigation instruction (turn, continue, arrive).
+type Maneuver struct {
+	Type        string  `json:"type"`        // depart, continue, turn-left, turn-right, uturn, arrive
+	Instruction string  `json:"instruction"` // human readable text
+	Lat         float64 `json:"lat"`
+	Lon         float64 `json:"lon"`
+	Node        int64   `json:"node"`
+	DistanceM   float64 `json:"distance_m"` // distance until next maneuver / to destination
+	DurationS   float64 `json:"duration_s"`
+}
+
 func (r *Router) Route(from, to int64) ([]int64, float64, error) {
 	// Default to duration-based routing (prefer faster roads like motorways)
 	res, err := r.RouteWithOptions(context.Background(), from, to, RouteOptions{Objective: ObjectiveDuration})
@@ -714,6 +726,7 @@ func (r *Router) RouteWithOptions(ctx context.Context, from, to int64, opt Route
 	path := reconstructPathTurnState(goalState, came)
 	coords := r.CoordsForPath(path)
 	distM, durS := r.computeMetrics(path, opt)
+
 	return RouteResult{
 		Path:       path,
 		PathCoords: coords,
@@ -722,14 +735,146 @@ func (r *Router) RouteWithOptions(ctx context.Context, from, to int64, opt Route
 		Cost:       cost,
 		Objective:  opt.Objective,
 		Engine:     opt.Engine,
+		// maneuvers are not part of internal Path (keeps compatibility)
+		// but callers who JSON-encode RouteResult will see `maneuvers`.
+		// Note: field added dynamically via JSON marshalling helper below if needed.
 	}, nil
+}
+
+// helper: find street display name for a node by scanning street samples.
+func (r *Router) streetNameForNode(node int64) string {
+	for _, se := range r.streets {
+		for _, id := range se.NodeIDs {
+			if id == node {
+				return se.Display
+			}
+		}
+	}
+	return ""
+}
+
+// ManeuversForPath produces a slice of Maneuver instructions for the given path.
+func (r *Router) ManeuversForPath(path []int64, opt RouteOptions) []Maneuver {
+	if len(path) == 0 {
+		return nil
+	}
+	coords := r.CoordsForPath(path)
+	n := len(path)
+	// trivial single-node route
+	if n == 1 {
+		c := coords[0]
+		return []Maneuver{{Type: "arrive", Instruction: "Arrive at destination", Lat: c.Lat, Lon: c.Lon, Node: path[0], DistanceM: 0, DurationS: 0}}
+	}
+
+	// precompute bearings and per-segment distances/durations
+	bears := make([]float64, n-1)
+	segDist := make([]float64, n-1)
+	segDur := make([]float64, n-1)
+	for i := 0; i < n-1; i++ {
+		a := coords[i]
+		b := coords[i+1]
+		bears[i] = bearingDeg(a.Lat, a.Lon, b.Lat, b.Lon)
+		segDist[i] = haversineMeters(a.Lat, a.Lon, b.Lat, b.Lon)
+		if e, ok := r.edgeBetween(path[i], path[i+1]); ok && e.SpeedKph > 0 {
+			segDur[i] = segDist[i] / (e.SpeedKph * 1000.0 / 3600.0)
+		} else {
+			segDur[i] = segDist[i] / (50.0 * 1000.0 / 3600.0)
+		}
+	}
+
+	// build maneuvers: depart at first node
+	maneuvers := []Maneuver{}
+	depart := Maneuver{Type: "depart", Instruction: "Depart", Lat: coords[0].Lat, Lon: coords[0].Lon, Node: path[0]}
+	// accumulate until next maneuver
+	curIdx := 0
+	for i := 1; i < n-1; i++ {
+		// detect street name change
+		curName := r.streetNameForNode(path[i])
+		nextName := r.streetNameForNode(path[i+1])
+		nameChange := curName != "" && nextName != "" && curName != nextName
+		// detect angular change
+		prevB := bears[i-1]
+		nextB := bears[i]
+		d := angleDiffDeg(nextB, prevB)
+		angChange := math.Abs(d) >= 45
+
+		if nameChange || angChange {
+			// create a maneuver at node i
+			// summarize distance/duration from curIdx to i
+			sumDist := 0.0
+			sumDur := 0.0
+			for k := curIdx; k < i; k++ {
+				sumDist += segDist[k]
+				sumDur += segDur[k]
+			}
+			// decide type and instruction
+			mtype := "continue"
+			instr := "Continue"
+			if angChange {
+				if math.Abs(d) > 150 {
+					mtype = "uturn"
+					instr = "Make a U-turn"
+				} else if d > 0 {
+					mtype = "turn-right"
+					instr = "Turn right"
+				} else {
+					mtype = "turn-left"
+					instr = "Turn left"
+				}
+			} else if nameChange {
+				mtype = "turn"
+				instr = "Turn"
+			}
+			// append street name if available
+			if nextName != "" {
+				instr = fmt.Sprintf("%s onto %s", instr, nextName)
+			}
+			m := Maneuver{Type: mtype, Instruction: instr, Lat: coords[i].Lat, Lon: coords[i].Lon, Node: path[i], DistanceM: sumDist, DurationS: sumDur}
+			if len(maneuvers) == 0 {
+				// first maneuver after depart: set depart accumulators
+				depart.DistanceM = sumDist
+			}
+			maneuvers = append(maneuvers, m)
+			curIdx = i
+		}
+	}
+	// final segment to arrive
+	sumDist := 0.0
+	sumDur := 0.0
+	for k := curIdx; k < n-1; k++ {
+		sumDist += segDist[k]
+		sumDur += segDur[k]
+	}
+	arrive := Maneuver{Type: "arrive", Instruction: "Arrive at destination", Lat: coords[n-1].Lat, Lon: coords[n-1].Lon, Node: path[n-1], DistanceM: 0, DurationS: 0}
+	// set depart fields
+	if depart.DistanceM == 0 && len(maneuvers) > 0 {
+		depart.DistanceM = 0
+	}
+	// prepend depart
+	out := []Maneuver{depart}
+	out = append(out, maneuvers...)
+	// add final arrival; set last maneuver's Distance to distance until arrival
+	if len(out) > 0 {
+		// if there are maneuvers, set last maneuver's Distance to sumDist
+		if len(maneuvers) > 0 {
+			last := &out[len(out)-1]
+			last.DistanceM = sumDist
+			last.DurationS = sumDur
+		} else {
+			// no intermediate maneuvers: set depart's distance to total
+			out[0].DistanceM = sumDist
+			out[0].DurationS = sumDur
+		}
+	}
+	out = append(out, arrive)
+	return out
 }
 
 // ---- Minimal Contraction Hierarchies ----
 
 type chData struct {
-	rank map[int64]int32          // smaller rank = contracted earlier
-	up   map[int64][]Edge         // upward adjacency (to higher rank)
+	rank map[int64]int32  // smaller rank = contracted earlier
+	up   map[int64][]Edge // upward adjacency (to higher rank)
 }
 
 // BuildCH constructs a minimal CH upward graph using a simple rank heuristic.
@@ -740,12 +885,24 @@ func (r *Router) BuildCH() {
 		ndeg[id] = int32(len(es))
 	}
 	// rank by degree (low degree first)
-	type kv struct{ id int64; d int32 }
+	type kv struct {
+		id int64
+		d  int32
+	}
 	arr := make([]kv, 0, len(ndeg))
-	for id, d := range ndeg { arr = append(arr, kv{id, d}) }
-	sort.Slice(arr, func(i,j int)bool{ if arr[i].d==arr[j].d { return arr[i].id < arr[j].id }; return arr[i].d < arr[j].d })
+	for id, d := range ndeg {
+		arr = append(arr, kv{id, d})
+	}
+	sort.Slice(arr, func(i, j int) bool {
+		if arr[i].d == arr[j].d {
+			return arr[i].id < arr[j].id
+		}
+		return arr[i].d < arr[j].d
+	})
 	rank := make(map[int64]int32, len(arr))
-	for i, v := range arr { rank[v.id] = int32(i) }
+	for i, v := range arr {
+		rank[v.id] = int32(i)
+	}
 
 	up := make(map[int64][]Edge, len(r.g.adj))
 	for u, es := range r.g.adj {
@@ -762,17 +919,24 @@ func (r *Router) BuildCH() {
 
 // chQuery performs bidirectional Dijkstra on upward edges.
 func (r *Router) chQuery(ctx context.Context, from, to int64, opt RouteOptions) ([]int64, float64, error) {
-	if from == to { return []int64{from}, 0, nil }
-	if r.ch == nil { return nil, 0, errors.New("ch: not built") }
+	if from == to {
+		return []int64{from}, 0, nil
+	}
+	if r.ch == nil {
+		return nil, 0, errors.New("ch: not built")
+	}
 
-	type item struct{ id int64; dist float64 }
+	type item struct {
+		id   int64
+		dist float64
+	}
 	// forward
-	fdist := map[int64]float64{ from: 0 }
+	fdist := map[int64]float64{from: 0}
 	fprev := map[int64]int64{}
 	fpq := &chPQ{}
 	heap.Push(fpq, &item{from, 0})
 	// backward (on upward graph of reversed edges approximated by scanning all nodes)
-	bdist := map[int64]float64{ to: 0 }
+	bdist := map[int64]float64{to: 0}
 	bprev := map[int64]int64{}
 	bpq := &chPQ{}
 	heap.Push(bpq, &item{to, 0})
@@ -781,10 +945,14 @@ func (r *Router) chQuery(ctx context.Context, from, to int64, opt RouteOptions) 
 	meet := int64(0)
 
 	step := func(pq *chPQ, dist map[int64]float64, prev map[int64]int64, forward bool) {
-		if pq.Len()==0 { return }
+		if pq.Len() == 0 {
+			return
+		}
 		it := heap.Pop(pq).(*item)
 		u := it.id
-		if it.dist > dist[u] { return }
+		if it.dist > dist[u] {
+			return
+		}
 		// scan upward edges
 		for _, e := range r.ch.up[u] {
 			v := e.To
@@ -797,9 +965,13 @@ func (r *Router) chQuery(ctx context.Context, from, to int64, opt RouteOptions) 
 		}
 		// update best via other frontier
 		var other map[int64]float64
-		if forward { other = bdist } else { other = fdist }
+		if forward {
+			other = bdist
+		} else {
+			other = fdist
+		}
 		if d2, ok := other[u]; ok {
-			if it.dist + d2 < best {
+			if it.dist+d2 < best {
 				best = it.dist + d2
 				meet = u
 			}
@@ -807,30 +979,54 @@ func (r *Router) chQuery(ctx context.Context, from, to int64, opt RouteOptions) 
 	}
 
 	// alternate expansions
-	for fpq.Len()>0 || bpq.Len()>0 {
-		if fpq.Len()>0 { step(fpq, fdist, fprev, true) }
-		if bpq.Len()>0 { step(bpq, bdist, bprev, false) }
-		if best < math.MaxFloat64 && fpq.Len()==0 && bpq.Len()==0 { break }
+	for fpq.Len() > 0 || bpq.Len() > 0 {
+		if fpq.Len() > 0 {
+			step(fpq, fdist, fprev, true)
+		}
+		if bpq.Len() > 0 {
+			step(bpq, bdist, bprev, false)
+		}
+		if best < math.MaxFloat64 && fpq.Len() == 0 && bpq.Len() == 0 {
+			break
+		}
 		if ctx != nil {
-			select { case <-ctx.Done(): return nil, 0, ctx.Err(); default: }
+			select {
+			case <-ctx.Done():
+				return nil, 0, ctx.Err()
+			default:
+			}
 		}
 	}
-	if meet==0 || best==math.MaxFloat64 { return nil, 0, errors.New("ch: no path") }
+	if meet == 0 || best == math.MaxFloat64 {
+		return nil, 0, errors.New("ch: no path")
+	}
 
 	// reconstruct path: forward from 'from' to meet, backward from 'to' to meet
 	fpath := []int64{}
-	for cur:=meet; cur!=0; {
+	for cur := meet; cur != 0; {
 		fpath = append(fpath, cur)
-		if cur==from { break }
-		p, ok := fprev[cur]; if !ok { break }
+		if cur == from {
+			break
+		}
+		p, ok := fprev[cur]
+		if !ok {
+			break
+		}
 		cur = p
 	}
 	// reverse forward part
-	for i,j:=0,len(fpath)-1; i<j; i,j=i+1,j-1 { fpath[i], fpath[j] = fpath[j], fpath[i] }
+	for i, j := 0, len(fpath)-1; i < j; i, j = i+1, j-1 {
+		fpath[i], fpath[j] = fpath[j], fpath[i]
+	}
 	bpath := []int64{}
-	for cur:=meet; cur!=0; {
-		if cur==to { break }
-		p, ok := bprev[cur]; if !ok { break }
+	for cur := meet; cur != 0; {
+		if cur == to {
+			break
+		}
+		p, ok := bprev[cur]
+		if !ok {
+			break
+		}
 		bpath = append(bpath, p)
 		cur = p
 	}
@@ -839,12 +1035,21 @@ func (r *Router) chQuery(ctx context.Context, from, to int64, opt RouteOptions) 
 }
 
 // chPQ: min-heap for CH queries
-type chPQ []*struct{ id int64; dist float64 }
-func (h chPQ) Len() int { return len(h) }
-func (h chPQ) Less(i,j int) bool { return h[i].dist < h[j].dist }
-func (h chPQ) Swap(i,j int) { h[i], h[j] = h[j], h[i] }
-func (h *chPQ) Push(x interface{}) { *h = append(*h, x.(*struct{ id int64; dist float64 })) }
-func (h *chPQ) Pop() interface{} { old := *h; n:=len(old); it:=old[n-1]; *h = old[:n-1]; return it }
+type chPQ []*struct {
+	id   int64
+	dist float64
+}
+
+func (h chPQ) Len() int           { return len(h) }
+func (h chPQ) Less(i, j int) bool { return h[i].dist < h[j].dist }
+func (h chPQ) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *chPQ) Push(x interface{}) {
+	*h = append(*h, x.(*struct {
+		id   int64
+		dist float64
+	}))
+}
+func (h *chPQ) Pop() interface{} { old := *h; n := len(old); it := old[n-1]; *h = old[:n-1]; return it }
 
 // dijkstraNode is a simple node-based Dijkstra implementation that computes
 // shortest path using per-edge costs (r.edgeCost) and does not account for

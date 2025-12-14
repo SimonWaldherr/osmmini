@@ -24,7 +24,7 @@ import (
 	osmmini "simonwaldherr.de/go/osmmini"
 )
 
-//go:embed web/* docs/* api/openapi.yaml
+//go:embed web/index.html web/style.css web/static/* web/static/leaflet/* docs/* api/openapi.yaml
 var embedded embed.FS
 
 const buildVersion = "dev"
@@ -297,16 +297,17 @@ type RoutePoint struct {
 }
 
 type RouteResponse struct {
-	From          RoutePoint      `json:"from"`
-	To            RoutePoint      `json:"to"`
-	Engine        string          `json:"engine"`
-	Objective     string          `json:"objective"`
-	Cost          float64         `json:"cost"`
-	DistanceM     float64         `json:"distance_m"`
-	DurationS     float64         `json:"duration_s"`
-	Path          []osmmini.Coord `json:"path"`
-	GoogleMapsURL string          `json:"google_maps_url"`
-	AppleMapsURL  string          `json:"apple_maps_url"`
+	From          RoutePoint         `json:"from"`
+	To            RoutePoint         `json:"to"`
+	Engine        string             `json:"engine"`
+	Objective     string             `json:"objective"`
+	Cost          float64            `json:"cost"`
+	DistanceM     float64            `json:"distance_m"`
+	DurationS     float64            `json:"duration_s"`
+	Path          []osmmini.Coord    `json:"path"`
+	GoogleMapsURL string             `json:"google_maps_url"`
+	AppleMapsURL  string             `json:"apple_maps_url"`
+	Steps         []osmmini.Maneuver `json:"steps,omitempty"`
 }
 
 type TripStop struct {
@@ -502,8 +503,27 @@ func createHybridFileServer(localDir, embeddedDir string) http.Handler {
 			return
 		}
 
-		// Fall back to embedded
+		// Also try under a "static" subdirectory (some assets live in cmd/web/static)
+		localPath2 := filepath.Join(localDir, "static", r.URL.Path)
+		if info, err := os.Stat(localPath2); err == nil && !info.IsDir() {
+			http.ServeFile(w, r, localPath2)
+			return
+		}
+
+		// Fall back to embedded; try both direct path and under embeddedDir/static
 		embedFS, _ := fs.Sub(embedded, embeddedDir)
+		// Try direct
+		if f, err := fs.Stat(embedFS, r.URL.Path); err == nil && !f.IsDir() {
+			http.FileServer(http.FS(embedFS)).ServeHTTP(w, r)
+			return
+		}
+		// Try embeddedDir/static/<path>
+		embedFS2, _ := fs.Sub(embedded, filepath.Join(embeddedDir, "static"))
+		if f, err := fs.Stat(embedFS2, r.URL.Path); err == nil && !f.IsDir() {
+			http.FileServer(http.FS(embedFS2)).ServeHTTP(w, r)
+			return
+		}
+		// default: serve (this will produce 404)
 		http.FileServer(http.FS(embedFS)).ServeHTTP(w, r)
 	})
 }
@@ -565,11 +585,11 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	
+
 	// Load current settings to pass to frontend
 	settings := s.settings.Load()
 	settingsJSON, _ := json.Marshal(settings)
-	
+
 	_ = s.indexTmpl.Execute(w, map[string]any{
 		"Version":  buildVersion,
 		"Settings": string(settingsJSON),
@@ -751,6 +771,9 @@ func (s *server) handleRoute(w http.ResponseWriter, r *http.Request) {
 	gURL := buildGoogleMapsURL([]osmmini.Coord{fromCoord, toCoord}, 0)
 	aURL := buildAppleMapsURL([]osmmini.Coord{fromCoord, toCoord})
 
+	// generate maneuvers/steps for the frontend
+	steps := s.router.ManeuversForPath(res.Path, opt)
+
 	writeJSON(w, http.StatusOK, RouteResponse{
 		From: RoutePoint{
 			Input: fromInput,
@@ -776,6 +799,7 @@ func (s *server) handleRoute(w http.ResponseWriter, r *http.Request) {
 		Path:          res.PathCoords,
 		GoogleMapsURL: gURL,
 		AppleMapsURL:  aURL,
+		Steps:         steps,
 	})
 }
 

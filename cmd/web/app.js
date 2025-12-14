@@ -313,6 +313,15 @@ async function compute() {
       }
       const data = await apiRoute(from, to, options);
       renderPath(data.path, data);
+      // ensure maneuvers shown from response (top-level steps)
+      (function(){
+        let steps = data.steps || null;
+        if ((!steps || steps.length === 0) && data.legs && Array.isArray(data.legs)) {
+          steps = [];
+          data.legs.forEach(l => { if (l && l.steps) steps = steps.concat(l.steps); });
+        }
+        if (steps && steps.length) renderManeuvers(steps);
+      })();
       document.getElementById('status').textContent = '✅ Route gefunden';
       renderStopList([]);
       setMapsLinks(data.google_maps_url, data.apple_maps_url);
@@ -320,6 +329,15 @@ async function compute() {
     } else {
       const data = await apiTripSolve(from, to, options);
       renderPath(data.path, data);
+      // aggregate maneuvers from legs if present
+      (function(){
+        let steps = data.steps || null;
+        if ((!steps || steps.length === 0) && data.legs && Array.isArray(data.legs)) {
+          steps = [];
+          data.legs.forEach(l => { if (l && l.steps) steps = steps.concat(l.steps); });
+        }
+        if (steps && steps.length) renderManeuvers(steps);
+      })();
       const optText = document.getElementById('optimize').checked ? 'optimiert' : 'fix';
       document.getElementById('status').textContent = '✅ Trip (' + optText + ')';
       syncStopIcons(data.order || []);
@@ -336,6 +354,82 @@ async function compute() {
     showSpinner(false);
     setComputeDisabled(false);
   }
+}
+
+function formatMeters(m) {
+  if (m >= 1000) return (m/1000).toFixed(1) + ' km';
+  return Math.round(m) + ' m';
+}
+
+function formatDuration(s) {
+  if (!s) return '';
+  const mins = Math.round(s/60);
+  if (mins >= 60) {
+    const h = Math.floor(mins/60);
+    const m = mins % 60;
+    return `${h}h ${m}m`;
+  }
+  return `${mins} min`;
+}
+
+function iconForType(t) {
+  switch(t) {
+    case 'turn-left': return '⬅️';
+    case 'turn-right': return '➡️';
+    case 'uturn': return '⤴️';
+    case 'depart': return '🚦';
+    case 'arrive': return '🏁';
+    case 'continue': return '➡️';
+    default: return '➡️';
+  }
+}
+
+function renderManeuvers(steps) {
+  const el = document.getElementById('maneuvers');
+  if (!el) return;
+  el.innerHTML = '';
+  if (!steps || steps.length === 0) { el.style.display = 'none'; return; }
+  const list = document.createElement('div');
+  list.className = 'maneuver-list';
+  steps.forEach((s, idx) => {
+    const row = document.createElement('div');
+    row.className = 'maneuver-row';
+    row.style.display = 'flex';
+    row.style.alignItems = 'center';
+    row.style.justifyContent = 'space-between';
+    row.style.padding = '6px 8px';
+    row.style.borderRadius = '6px';
+    row.style.marginBottom = '6px';
+    row.style.background = 'rgba(255,255,255,0.02)';
+
+    const left = document.createElement('div');
+    left.style.display = 'flex';
+    left.style.alignItems = 'center';
+    left.style.gap = '8px';
+
+    const ic = document.createElement('div'); ic.textContent = iconForType(s.type || s.Type || ''); ic.style.fontSize = '18px';
+    const txt = document.createElement('div'); txt.style.fontSize = '13px'; txt.style.lineHeight = '1.1';
+    txt.innerHTML = `<div style="font-weight:600">${escapeHtml(s.instruction || s.Instruction || '')}</div><div style="font-size:11px; opacity:0.7;">${escapeHtml((s.type||s.Type||'').toString())}</div>`;
+    left.appendChild(ic); left.appendChild(txt);
+
+    const right = document.createElement('div');
+    right.style.textAlign = 'right';
+    right.style.minWidth = '70px';
+    right.innerHTML = `<div style="font-weight:600">${formatMeters(s.distance_m || s.DistanceM || 0)}</div><div style="font-size:11px; opacity:0.7">${formatDuration(s.duration_s || s.DurationS || 0)}</div>`;
+
+    row.appendChild(left);
+    row.appendChild(right);
+
+    // pan to maneuver on click
+    row.addEventListener('click', () => {
+      const lat = s.lat || s.Lat; const lon = s.lon || s.Lon;
+      if (lat && lon) map.panTo([lat, lon]);
+    });
+
+    list.appendChild(row);
+  });
+  el.appendChild(list);
+  el.style.display = 'block';
 }
 
 document.getElementById('go').addEventListener('click', e=>{ e.preventDefault(); compute(); });
