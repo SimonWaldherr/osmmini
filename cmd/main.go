@@ -62,15 +62,15 @@ type Settings struct {
 func DefaultSettings(cacheDir, upstream string) Settings {
 	return Settings{
 		Routing: osmmini.RouteOptions{
-			Engine:    osmmini.EngineAStar,
+			Engine: osmmini.EngineAStar,
 			// Default routing objective for Germany: minimize duration
 			Objective: osmmini.ObjectiveDuration,
 			Pro:       false,
 			Weights: osmmini.ProWeights{
-				LeftTurn:    0,
-				RightTurn:   0,
-				UTurn:       0,
-				Crossing:    0,
+				LeftTurn:  0,
+				RightTurn: 0,
+				UTurn:     0,
+				Crossing:  0,
 				// MaxSpeedKph caps speeds used by the routing heuristics
 				// and cost calculations. Set higher to allow faster
 				// assumptions on unrestricted Autobahn sections.
@@ -380,6 +380,7 @@ func main() {
 	settingsPath := flag.String("settings", "settings.json", "Settings JSON file")
 	tilesDir := flag.String("tiles-dir", "tiles-cache", "Tile cache directory")
 	tileUpstream := flag.String("tile-upstream", "https://tile.openstreetmap.org/{z}/{x}/{y}.png", "Tile upstream template")
+	buildCH := flag.Bool("build-ch", true, "Build Contraction Hierarchies (CH) after graph load")
 
 	// Coord window support
 	windowStr := flag.String("window", "", "Coord window minLat,maxLat,minLon,maxLon (optional)")
@@ -421,6 +422,11 @@ func main() {
 		log.Printf("Graph bounds: lat[%.6f..%.6f] lon[%.6f..%.6f]", b.MinLat, b.MaxLat, b.MinLon, b.MaxLon)
 	}
 	log.Printf("Graph ready: nodes=%d edges=%d addresses=%d", r.NodeCount(), r.EdgeCount(), len(addrs))
+	if *buildCH {
+		log.Printf("Building CH (upward graph)...")
+		r.BuildCH()
+		log.Printf("CH ready")
+	}
 
 	tileCache := NewTileCache(store.Get().Tiles)
 

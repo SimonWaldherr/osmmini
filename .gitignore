@@ -1,2 +1,4 @@
 tiles-cache
 region.osm.pbf
+osmmini.wasm
+wasm_exec.js

@@ -25,6 +25,14 @@ type RouteEngine string
 const (
 	EngineAStar    RouteEngine = "astar"
 	EngineDijkstra RouteEngine = "dijkstra" // A* with h=0
+	// EngineDijkstraNode is a simple node-based Dijkstra implementation
+	// that ignores turn-state penalties and uses per-edge costs only.
+	// It is provided as an alternative algorithm for comparison/testing.
+	EngineDijkstraNode RouteEngine = "dijkstra-node"
+	// EngineCH is a minimal Contraction Hierarchies query over an upward-only
+	// graph using bidirectional Dijkstra. Preprocessing builds ranks and
+	// upward adjacency; shortcut generation is minimal and can be extended.
+	EngineCH RouteEngine = "ch"
 )
 
 // Objective controls the routing objective used for scoring edges:
@@ -65,7 +73,7 @@ func (o RouteOptions) withDefaults() RouteOptions {
 	if o.Engine == "" {
 		o.Engine = EngineAStar
 	}
-	if o.Engine != EngineAStar && o.Engine != EngineDijkstra {
+	if o.Engine != EngineAStar && o.Engine != EngineDijkstra && o.Engine != EngineDijkstraNode {
 		o.Engine = EngineAStar
 	}
 	if o.Objective == "" {
@@ -102,6 +110,9 @@ type Router struct {
 	streets map[string]streetEntry // normalized -> display + sample nodes
 	idx     *spatialIndex
 	bounds  *CoordWindow
+
+	// CH data
+	ch *chData
 }
 
 type streetEntry struct {
@@ -327,6 +338,24 @@ func computeBounds(coords map[int64]Coord) (CoordWindow, bool) {
 	}
 	w := CoordWindow{MinLat: minLat, MaxLat: maxLat, MinLon: minLon, MaxLon: maxLon}
 	return w, w.Valid()
+}
+
+// NewRouterFromGraph constructs a `Router` from an existing graph.
+// This is useful for environments where parsing PBFs is not practical,
+// such as WebAssembly. Provide `coords` and `adj` maps and this will
+// build the spatial index and bounds accordingly.
+func NewRouterFromGraph(coords map[int64]Coord, adj map[int64][]Edge) *Router {
+	idx := buildSpatialIndex(coords)
+	var bounds *CoordWindow
+	if b, ok := computeBounds(coords); ok {
+		bounds = &b
+	}
+	return &Router{
+		g:       Graph{coords: coords, adj: adj},
+		streets: make(map[string]streetEntry),
+		idx:     idx,
+		bounds:  bounds,
+	}
 }
 
 func (r *Router) Bounds() (CoordWindow, bool) {
@@ -622,12 +651,62 @@ func (r *Router) Route(from, to int64) ([]int64, float64, error) {
 }
 
 func (r *Router) RouteCostWithOptions(ctx context.Context, from, to int64, opt RouteOptions) (float64, error) {
-	_, cost, _, err := r.astar(ctx, from, to, opt.withDefaults(), false)
+	opt = opt.withDefaults()
+	if opt.Engine == EngineDijkstraNode {
+		_, cost, err := r.dijkstraNode(ctx, from, to, opt)
+		return cost, err
+	}
+	if opt.Engine == EngineCH {
+		if r.ch == nil {
+			return 0, errors.New("ch: not built")
+		}
+		_, cost, err := r.chQuery(ctx, from, to, opt)
+		return cost, err
+	}
+	_, cost, _, err := r.astar(ctx, from, to, opt, false)
 	return cost, err
 }
 
 func (r *Router) RouteWithOptions(ctx context.Context, from, to int64, opt RouteOptions) (RouteResult, error) {
 	opt = opt.withDefaults()
+	if opt.Engine == EngineDijkstraNode {
+		path, cost, err := r.dijkstraNode(ctx, from, to, opt)
+		if err != nil {
+			return RouteResult{}, err
+		}
+		coords := r.CoordsForPath(path)
+		distM, durS := r.computeMetrics(path, opt)
+		return RouteResult{
+			Path:       path,
+			PathCoords: coords,
+			DistanceM:  distM,
+			DurationS:  durS,
+			Cost:       cost,
+			Objective:  opt.Objective,
+			Engine:     opt.Engine,
+		}, nil
+	}
+	if opt.Engine == EngineCH {
+		if r.ch == nil {
+			return RouteResult{}, errors.New("ch: not built")
+		}
+		path, cost, err := r.chQuery(ctx, from, to, opt)
+		if err != nil {
+			return RouteResult{}, err
+		}
+		coords := r.CoordsForPath(path)
+		distM, durS := r.computeMetrics(path, opt)
+		return RouteResult{
+			Path:       path,
+			PathCoords: coords,
+			DistanceM:  distM,
+			DurationS:  durS,
+			Cost:       cost,
+			Objective:  opt.Objective,
+			Engine:     opt.Engine,
+		}, nil
+	}
+
 	goalState, cost, came, err := r.astar(ctx, from, to, opt, true)
 	if err != nil {
 		return RouteResult{}, err
@@ -644,6 +723,240 @@ func (r *Router) RouteWithOptions(ctx context.Context, from, to int64, opt Route
 		Objective:  opt.Objective,
 		Engine:     opt.Engine,
 	}, nil
+}
+
+// ---- Minimal Contraction Hierarchies ----
+
+type chData struct {
+	rank map[int64]int32          // smaller rank = contracted earlier
+	up   map[int64][]Edge         // upward adjacency (to higher rank)
+}
+
+// BuildCH constructs a minimal CH upward graph using a simple rank heuristic.
+// This placeholder can be extended to add full shortcut generation.
+func (r *Router) BuildCH() {
+	ndeg := make(map[int64]int32, len(r.g.adj))
+	for id, es := range r.g.adj {
+		ndeg[id] = int32(len(es))
+	}
+	// rank by degree (low degree first)
+	type kv struct{ id int64; d int32 }
+	arr := make([]kv, 0, len(ndeg))
+	for id, d := range ndeg { arr = append(arr, kv{id, d}) }
+	sort.Slice(arr, func(i,j int)bool{ if arr[i].d==arr[j].d { return arr[i].id < arr[j].id }; return arr[i].d < arr[j].d })
+	rank := make(map[int64]int32, len(arr))
+	for i, v := range arr { rank[v.id] = int32(i) }
+
+	up := make(map[int64][]Edge, len(r.g.adj))
+	for u, es := range r.g.adj {
+		ru := rank[u]
+		for _, e := range es {
+			rv := rank[e.To]
+			if rv > ru { // upward edge
+				up[u] = append(up[u], e)
+			}
+		}
+	}
+	r.ch = &chData{rank: rank, up: up}
+}
+
+// chQuery performs bidirectional Dijkstra on upward edges.
+func (r *Router) chQuery(ctx context.Context, from, to int64, opt RouteOptions) ([]int64, float64, error) {
+	if from == to { return []int64{from}, 0, nil }
+	if r.ch == nil { return nil, 0, errors.New("ch: not built") }
+
+	type item struct{ id int64; dist float64 }
+	// forward
+	fdist := map[int64]float64{ from: 0 }
+	fprev := map[int64]int64{}
+	fpq := &chPQ{}
+	heap.Push(fpq, &item{from, 0})
+	// backward (on upward graph of reversed edges approximated by scanning all nodes)
+	bdist := map[int64]float64{ to: 0 }
+	bprev := map[int64]int64{}
+	bpq := &chPQ{}
+	heap.Push(bpq, &item{to, 0})
+
+	best := math.MaxFloat64
+	meet := int64(0)
+
+	step := func(pq *chPQ, dist map[int64]float64, prev map[int64]int64, forward bool) {
+		if pq.Len()==0 { return }
+		it := heap.Pop(pq).(*item)
+		u := it.id
+		if it.dist > dist[u] { return }
+		// scan upward edges
+		for _, e := range r.ch.up[u] {
+			v := e.To
+			alt := dist[u] + r.edgeCost(e, opt)
+			if d, ok := dist[v]; !ok || alt < d {
+				dist[v] = alt
+				prev[v] = u
+				heap.Push(pq, &item{v, alt})
+			}
+		}
+		// update best via other frontier
+		var other map[int64]float64
+		if forward { other = bdist } else { other = fdist }
+		if d2, ok := other[u]; ok {
+			if it.dist + d2 < best {
+				best = it.dist + d2
+				meet = u
+			}
+		}
+	}
+
+	// alternate expansions
+	for fpq.Len()>0 || bpq.Len()>0 {
+		if fpq.Len()>0 { step(fpq, fdist, fprev, true) }
+		if bpq.Len()>0 { step(bpq, bdist, bprev, false) }
+		if best < math.MaxFloat64 && fpq.Len()==0 && bpq.Len()==0 { break }
+		if ctx != nil {
+			select { case <-ctx.Done(): return nil, 0, ctx.Err(); default: }
+		}
+	}
+	if meet==0 || best==math.MaxFloat64 { return nil, 0, errors.New("ch: no path") }
+
+	// reconstruct path: forward from 'from' to meet, backward from 'to' to meet
+	fpath := []int64{}
+	for cur:=meet; cur!=0; {
+		fpath = append(fpath, cur)
+		if cur==from { break }
+		p, ok := fprev[cur]; if !ok { break }
+		cur = p
+	}
+	// reverse forward part
+	for i,j:=0,len(fpath)-1; i<j; i,j=i+1,j-1 { fpath[i], fpath[j] = fpath[j], fpath[i] }
+	bpath := []int64{}
+	for cur:=meet; cur!=0; {
+		if cur==to { break }
+		p, ok := bprev[cur]; if !ok { break }
+		bpath = append(bpath, p)
+		cur = p
+	}
+	path := append(fpath, bpath...)
+	return path, best, nil
+}
+
+// chPQ: min-heap for CH queries
+type chPQ []*struct{ id int64; dist float64 }
+func (h chPQ) Len() int { return len(h) }
+func (h chPQ) Less(i,j int) bool { return h[i].dist < h[j].dist }
+func (h chPQ) Swap(i,j int) { h[i], h[j] = h[j], h[i] }
+func (h *chPQ) Push(x interface{}) { *h = append(*h, x.(*struct{ id int64; dist float64 })) }
+func (h *chPQ) Pop() interface{} { old := *h; n:=len(old); it:=old[n-1]; *h = old[:n-1]; return it }
+
+// dijkstraNode is a simple node-based Dijkstra implementation that computes
+// shortest path using per-edge costs (r.edgeCost) and does not account for
+// turn/state penalties. It is useful as an alternative algorithm and for
+// testing differences to the turn-aware A*/Dijkstra implementation.
+func (r *Router) dijkstraNode(ctx context.Context, from, to int64, opt RouteOptions) ([]int64, float64, error) {
+	if from == to {
+		return []int64{from}, 0, nil
+	}
+	if _, ok := r.g.coords[from]; !ok {
+		return nil, 0, errors.New("start node missing in graph")
+	}
+	if _, ok := r.g.coords[to]; !ok {
+		return nil, 0, errors.New("target node missing in graph")
+	}
+
+	// use a small slice-backed priority queue for nodes
+	pq := make([]*dijkstraItem, 0)
+	push := func(it *dijkstraItem) {
+		heap.Push(&pqWrapper{&pq}, it)
+	}
+	pop := func() *dijkstraItem {
+		if len(pq) == 0 {
+			return nil
+		}
+		it := heap.Pop(&pqWrapper{&pq}).(*dijkstraItem)
+		return it
+	}
+
+	dist := make(map[int64]float64, len(r.g.coords))
+	prev := make(map[int64]int64, len(r.g.coords))
+	for id := range r.g.coords {
+		dist[id] = math.MaxFloat64
+	}
+	dist[from] = 0
+	push(&dijkstraItem{id: from, dist: 0})
+
+	for len(pq) > 0 {
+		if ctx != nil {
+			select {
+			case <-ctx.Done():
+				return nil, 0, ctx.Err()
+			default:
+			}
+		}
+		it := pop()
+		if it == nil {
+			break
+		}
+		u := it.id
+		if it.dist != dist[u] {
+			continue // stale
+		}
+		if u == to {
+			break
+		}
+		for _, e := range r.g.adj[u] {
+			if !edgeAllowed(e, opt) {
+				continue
+			}
+			v := e.To
+			alt := dist[u] + r.edgeCost(e, opt)
+			if alt < dist[v] {
+				dist[v] = alt
+				prev[v] = u
+				push(&dijkstraItem{id: v, dist: alt})
+			}
+		}
+	}
+
+	if dist[to] == math.MaxFloat64 {
+		return nil, 0, errors.New("no path found")
+	}
+	// reconstruct path
+	path := make([]int64, 0)
+	for cur := to; ; {
+		path = append(path, cur)
+		if cur == from {
+			break
+		}
+		p, ok := prev[cur]
+		if !ok {
+			return nil, 0, errors.New("path reconstruction failed")
+		}
+		cur = p
+	}
+	// reverse
+	for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
+		path[i], path[j] = path[j], path[i]
+	}
+	return path, dist[to], nil
+}
+
+// dijkstraItem is a small heap entry used by the node-Dijkstra implementation.
+type dijkstraItem struct {
+	id   int64
+	dist float64
+}
+
+// pqWrapper adapts a []*dijkstraItem slice to heap.Interface for dijkstraNode.
+type pqWrapper struct{ s *[]*dijkstraItem }
+
+func (w pqWrapper) Len() int            { return len(*w.s) }
+func (w pqWrapper) Less(i, j int) bool  { return (*w.s)[i].dist < (*w.s)[j].dist }
+func (w pqWrapper) Swap(i, j int)       { (*w.s)[i], (*w.s)[j] = (*w.s)[j], (*w.s)[i] }
+func (w *pqWrapper) Push(x interface{}) { *w.s = append(*w.s, x.(*dijkstraItem)) }
+func (w *pqWrapper) Pop() interface{} {
+	old := *w.s
+	n := len(old)
+	it := old[n-1]
+	*w.s = old[:n-1]
+	return it
 }
 
 func (r *Router) computeMetrics(path []int64, opt RouteOptions) (distM, durS float64) {
