@@ -2,6 +2,8 @@
 
 Lightweight offline routing server and web UI using OSM PBF extracts.
 
+![](https://simonwaldherr.de/gh-pages/osmmini.png)
+
 Features
 - Build a routing graph from an OSM PBF and serve offline routes via HTTP API
 - Multiple routing engines: `astar`, `dijkstra`, `dijkstra-node` (node-only Dijkstra), minimal `ch` scaffold
@@ -17,12 +19,7 @@ Quick start
 1. Build or run the server (example):
 
 ```bash
-# build
-gofmt -w .
-go build -o osmmini-server ./cmd
-
-# run (point `-pbf` at your extract)
-./osmmini-server -pbf region.osm.pbf -listen :8080
+go run ./cmd -pbf region.osm.pbf
 ```
 
 2. Open the web UI: http://localhost:8080/
