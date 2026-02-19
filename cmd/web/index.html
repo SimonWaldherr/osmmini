@@ -132,6 +132,54 @@
               </div>
             </div>
 
+            <!-- Map / Tile Source -->
+            <div class="settings-section collapsible" id="mapSection">
+              <div class="section-header clickable" id="mapHeader">
+                <span class="section-icon">🗺️</span>
+                <h3>Kartenquelle</h3>
+                <span class="collapse-indicator">›</span>
+              </div>
+              <div id="mapSettings" style="display:none">
+                <div class="settings-grid">
+                  <div class="setting-item">
+                    <label class="setting-label" title="Vordefinierte Kartenquellen">
+                      Preset
+                      <span class="info-icon" title="Wähle eine vordefinierte Kartenquelle aus">ⓘ</span>
+                    </label>
+                    <select id="tilePreset" class="setting-select">
+                      <option value="">— Benutzerdefiniert —</option>
+                    </select>
+                  </div>
+                  <div class="setting-item">
+                    <label class="setting-label" title="Kartentyp: Raster (Leaflet), Vektor (MapLibre GL) oder WMS">
+                      Kartentyp
+                    </label>
+                    <select id="mapType" class="setting-select">
+                      <option value="raster">🖼️ Raster (Leaflet)</option>
+                      <option value="vector">✨ Vektor (MapLibre GL)</option>
+                      <option value="wms">🌍 WMS</option>
+                    </select>
+                  </div>
+                  <div class="setting-item" id="upstreamRow">
+                    <label class="setting-label">Tile-URL ({z}/{x}/{y})</label>
+                    <input id="tileUpstream" type="text" class="setting-input" placeholder="https://…/{z}/{x}/{y}.png"/>
+                  </div>
+                  <div class="setting-item" id="styleUrlRow" style="display:none">
+                    <label class="setting-label">Style-URL (MapLibre GL)</label>
+                    <input id="tileStyleUrl" type="text" class="setting-input" placeholder="https://…/style.json"/>
+                  </div>
+                  <div class="setting-item" id="wmsLayersRow" style="display:none">
+                    <label class="setting-label">WMS-Layer</label>
+                    <input id="wmsLayers" type="text" class="setting-input" placeholder="layer1,layer2"/>
+                  </div>
+                  <div class="setting-item">
+                    <label class="setting-label">Attribution</label>
+                    <input id="tileAttribution" type="text" class="setting-input" placeholder="© OpenStreetMap contributors"/>
+                  </div>
+                </div>
+              </div>
+            </div>
+
             <!-- Highway Types -->
             <div class="settings-section collapsible" id="highwaySection">
               <div class="section-header clickable" id="highwayHeader">

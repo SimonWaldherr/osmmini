@@ -31,13 +31,80 @@ const buildVersion = "dev"
 
 // ---- Settings ----
 
-// TileSettings controls the tile cache proxy behavior.
+// TileSettings controls the tile cache / map display behavior.
 // These settings are persisted in the settings file and can be updated
 // at runtime via the settings API.
 type TileSettings struct {
-	CacheDir  string `json:"cache_dir"`
-	Upstream  string `json:"upstream"`
-	UserAgent string `json:"user_agent"`
+	CacheDir    string `json:"cache_dir"`
+	Upstream    string `json:"upstream"`
+	UserAgent   string `json:"user_agent"`
+	MapType     string `json:"map_type,omitempty"`   // "raster" (default), "vector", "wms"
+	StyleURL    string `json:"style_url,omitempty"`  // vector: MapLibre GL style URL
+	WMSLayers   string `json:"wms_layers,omitempty"` // wms: comma-separated layer names
+	Attribution string `json:"attribution,omitempty"` // attribution text shown on the map
+}
+
+// TileSourcePreset is a named tile/map-source configuration shown in the UI preset picker.
+type TileSourcePreset struct {
+	ID          string `json:"id"`
+	Label       string `json:"label"`
+	MapType     string `json:"map_type"`
+	Upstream    string `json:"upstream,omitempty"`
+	StyleURL    string `json:"style_url,omitempty"`
+	WMSLayers   string `json:"wms_layers,omitempty"`
+	Attribution string `json:"attribution"`
+	MaxZoom     int    `json:"max_zoom,omitempty"`
+}
+
+// BuiltinTilePresets lists the map/tile sources available out of the box.
+// These are served via GET /api/v1/tile-sources.
+var BuiltinTilePresets = []TileSourcePreset{
+	{
+		ID: "osm", Label: "OpenStreetMap Standard", MapType: "raster",
+		Upstream:    "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+		Attribution: "© OpenStreetMap contributors", MaxZoom: 19,
+	},
+	{
+		ID: "osm_de", Label: "OpenStreetMap Deutschland", MapType: "raster",
+		Upstream:    "https://tile.openstreetmap.de/{z}/{x}/{y}.png",
+		Attribution: "© OpenStreetMap contributors", MaxZoom: 18,
+	},
+	{
+		ID: "osm_hot", Label: "OSM Humanitarian", MapType: "raster",
+		Upstream:    "https://a.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png",
+		Attribution: "© OpenStreetMap contributors, Tiles by HOT", MaxZoom: 19,
+	},
+	{
+		ID: "osm_topo", Label: "OpenTopoMap", MapType: "raster",
+		Upstream:    "https://tile.opentopomap.org/{z}/{x}/{y}.png",
+		Attribution: "© OpenStreetMap contributors, © OpenTopoMap", MaxZoom: 17,
+	},
+	{
+		ID: "carto_light", Label: "CartoDB Positron (hell)", MapType: "raster",
+		Upstream:    "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
+		Attribution: "© OpenStreetMap contributors © CARTO", MaxZoom: 19,
+	},
+	{
+		ID: "carto_dark", Label: "CartoDB Dark Matter (dunkel)", MapType: "raster",
+		Upstream:    "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+		Attribution: "© OpenStreetMap contributors © CARTO", MaxZoom: 19,
+	},
+	{
+		ID: "basemap_de", Label: "Basemap.de (BKG)", MapType: "raster",
+		Upstream:    "https://sgx.geodatenzentrum.de/wmts_basemapde/tile/1.0.0/basemap_de_webkarte/default/GLOBAL_WEBMERCATOR/{z}/{y}/{x}.png",
+		Attribution: "© Bundesamt für Kartographie und Geodäsie (BKG)", MaxZoom: 18,
+	},
+	{
+		ID: "geodaten_bavaria", Label: "Geodaten Bayern – BayernAtlas", MapType: "wms",
+		Upstream:    "https://geoservices.bayern.de/wms/v2/ogc_bayernatlas.cgi",
+		WMSLayers:   "by_dtk",
+		Attribution: "© Bayerische Vermessungsverwaltung", MaxZoom: 18,
+	},
+	{
+		ID: "maplibre_demo", Label: "MapLibre Demo Tiles (Vektor)", MapType: "vector",
+		StyleURL:    "https://demotiles.maplibre.org/style.json",
+		Attribution: "© MapLibre", MaxZoom: 19,
+	},
 }
 
 // Settings holds the server configuration persisted in the settings.json
@@ -78,9 +145,11 @@ func DefaultSettings(cacheDir, upstream string) Settings {
 			},
 		},
 		Tiles: TileSettings{
-			CacheDir:  cacheDir,
-			Upstream:  upstream,
-			UserAgent: "osmmini-routerd/1.0 (offline routing)",
+			CacheDir:    cacheDir,
+			Upstream:    upstream,
+			UserAgent:   "osmmini-routerd/1.0 (offline routing)",
+			MapType:     "raster",
+			Attribution: "© OpenStreetMap contributors",
 		},
 		// DefaultHighwaySpeeds: fallback speeds (kph) per highway type.
 		// These are the built-in defaults used when no "default_highway_speeds"
@@ -482,6 +551,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/api/v1/health", s.handleHealth)
 	mux.HandleFunc("/api/v1/status", s.handleStatus)
 	mux.HandleFunc("/api/v1/settings", s.handleSettings)
+	mux.HandleFunc("/api/v1/tile-sources", s.handleTileSources)
 	mux.HandleFunc("/api/v1/search", s.handleSearch)
 	mux.HandleFunc("/api/v1/route", s.handleRoute)
 	mux.HandleFunc("/api/v1/trip/solve", s.handleTripSolve)
@@ -586,8 +656,11 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
-	// Load current settings to pass to frontend
-	settings := s.settings.Load()
+	// Attempt to refresh settings from disk before serving the page.
+	// Any load error is intentionally ignored — Get() returns the last
+	// successfully loaded settings in that case.
+	_ = s.settings.Load()
+	settings := s.settings.Get()
 	settingsJSON, _ := json.Marshal(settings)
 
 	_ = s.indexTmpl.Execute(w, map[string]any{
@@ -638,6 +711,14 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+func (s *server) handleTileSources(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	writeJSON(w, http.StatusOK, BuiltinTilePresets)
+}
+
 func (s *server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -653,8 +734,9 @@ func (s *server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusBadRequest, "tiles.cache_dir required")
 			return
 		}
-		if v.Tiles.Upstream == "" {
-			writeJSONError(w, http.StatusBadRequest, "tiles.upstream required")
+		// upstream is required for raster/wms; for vector map_type, style_url is used instead
+		if v.Tiles.Upstream == "" && v.Tiles.StyleURL == "" {
+			writeJSONError(w, http.StatusBadRequest, "tiles.upstream or tiles.style_url required")
 			return
 		}
 		if err := s.settings.Put(v); err != nil {
