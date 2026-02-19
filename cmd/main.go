@@ -24,7 +24,7 @@ import (
 	osmmini "simonwaldherr.de/go/osmmini"
 )
 
-//go:embed web/index.html web/style.css web/static/* web/static/leaflet/* docs/* api/openapi.yaml
+//go:embed web/index.html web/style.css web/app.js docs/* api/openapi.yaml
 var embedded embed.FS
 
 const buildVersion = "dev"

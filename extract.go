@@ -1029,7 +1029,7 @@ func processRelation(raw []byte, ctx blockCtx, opts Options, cb Callbacks) error
 			return err
 		}
 
-		n := min3(len(roles), len(memDeltas), len(types))
+		n := min(len(roles), len(memDeltas), len(types))
 		members = make([]Member, 0, n)
 
 		var memAcc int64
@@ -1299,13 +1299,3 @@ func skipField(wire int, b []byte, i *int) error {
 	}
 }
 
-func min3(a, b, c int) int {
-	m := a
-	if b < m {
-		m = b
-	}
-	if c < m {
-		m = c
-	}
-	return m
-}

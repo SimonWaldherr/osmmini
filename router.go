@@ -1,22 +1,16 @@
 package osmmini
 
 import (
+	"cmp"
 	"container/heap"
 	"context"
 	"errors"
 	"fmt"
 	"math"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 )
-
-// Coord holds WGS84 coordinates.
-// Used throughout the router to represent node and waypoint positions.
-type Coord struct {
-	Lat float64 `json:"lat"`
-	Lon float64 `json:"lon"`
-}
 
 // RouteEngine selects the pathfinding engine implementation.
 // - "astar": A* with admissible heuristic
@@ -103,7 +97,6 @@ type Graph struct {
 	adj    map[int64][]Edge
 }
 
-// Router wraps a road graph built from OSM highways.
 // Router wraps a road graph built from OSM highways and provides
 // nearest-node lookup, street search and pathfinding (A*/Dijkstra).
 type Router struct {
@@ -435,11 +428,11 @@ func (r *Router) SearchStreets(q string, limit int) []StreetMatch {
 		}
 		sc = append(sc, scored{key: key, e: e, score: s})
 	}
-	sort.Slice(sc, func(i, j int) bool {
-		if sc[i].score == sc[j].score {
-			return sc[i].e.Display < sc[j].e.Display
+	slices.SortFunc(sc, func(a, b scored) int {
+		if a.score != b.score {
+			return cmp.Compare(b.score, a.score) // descending by score
 		}
-		return sc[i].score > sc[j].score
+		return cmp.Compare(a.e.Display, b.e.Display)
 	})
 	if limit > 0 && limit < len(sc) {
 		sc = sc[:limit]
@@ -614,11 +607,11 @@ func SearchAddresses(entries []AddressEntry, q AddressQuery, limit int) []Addres
 		}
 		sc = append(sc, scored{e: e, s: s})
 	}
-	sort.Slice(sc, func(i, j int) bool {
-		if sc[i].s == sc[j].s {
-			return sc[i].e.ID < sc[j].e.ID
+	slices.SortFunc(sc, func(a, b scored) int {
+		if a.s != b.s {
+			return cmp.Compare(b.s, a.s) // descending by score
 		}
-		return sc[i].s > sc[j].s
+		return cmp.Compare(a.e.ID, b.e.ID)
 	})
 	if limit <= 0 || limit > len(sc) {
 		limit = len(sc)
@@ -893,11 +886,11 @@ func (r *Router) BuildCH() {
 	for id, d := range ndeg {
 		arr = append(arr, kv{id, d})
 	}
-	sort.Slice(arr, func(i, j int) bool {
-		if arr[i].d == arr[j].d {
-			return arr[i].id < arr[j].id
+	slices.SortFunc(arr, func(a, b kv) int {
+		if a.d != b.d {
+			return cmp.Compare(a.d, b.d) // ascending by degree
 		}
-		return arr[i].d < arr[j].d
+		return cmp.Compare(a.id, b.id)
 	})
 	rank := make(map[int64]int32, len(arr))
 	for i, v := range arr {
@@ -926,20 +919,16 @@ func (r *Router) chQuery(ctx context.Context, from, to int64, opt RouteOptions) 
 		return nil, 0, errors.New("ch: not built")
 	}
 
-	type item struct {
-		id   int64
-		dist float64
-	}
 	// forward
 	fdist := map[int64]float64{from: 0}
 	fprev := map[int64]int64{}
 	fpq := &chPQ{}
-	heap.Push(fpq, &item{from, 0})
+	heap.Push(fpq, &dijkstraItem{id: from, dist: 0})
 	// backward (on upward graph of reversed edges approximated by scanning all nodes)
 	bdist := map[int64]float64{to: 0}
 	bprev := map[int64]int64{}
 	bpq := &chPQ{}
-	heap.Push(bpq, &item{to, 0})
+	heap.Push(bpq, &dijkstraItem{id: to, dist: 0})
 
 	best := math.MaxFloat64
 	meet := int64(0)
@@ -948,7 +937,7 @@ func (r *Router) chQuery(ctx context.Context, from, to int64, opt RouteOptions) 
 		if pq.Len() == 0 {
 			return
 		}
-		it := heap.Pop(pq).(*item)
+		it := heap.Pop(pq).(*dijkstraItem)
 		u := it.id
 		if it.dist > dist[u] {
 			return
@@ -960,7 +949,7 @@ func (r *Router) chQuery(ctx context.Context, from, to int64, opt RouteOptions) 
 			if d, ok := dist[v]; !ok || alt < d {
 				dist[v] = alt
 				prev[v] = u
-				heap.Push(pq, &item{v, alt})
+				heap.Push(pq, &dijkstraItem{id: v, dist: alt})
 			}
 		}
 		// update best via other frontier
@@ -1015,9 +1004,7 @@ func (r *Router) chQuery(ctx context.Context, from, to int64, opt RouteOptions) 
 		cur = p
 	}
 	// reverse forward part
-	for i, j := 0, len(fpath)-1; i < j; i, j = i+1, j-1 {
-		fpath[i], fpath[j] = fpath[j], fpath[i]
-	}
+	slices.Reverse(fpath)
 	bpath := []int64{}
 	for cur := meet; cur != 0; {
 		if cur == to {
@@ -1034,22 +1021,14 @@ func (r *Router) chQuery(ctx context.Context, from, to int64, opt RouteOptions) 
 	return path, best, nil
 }
 
-// chPQ: min-heap for CH queries
-type chPQ []*struct {
-	id   int64
-	dist float64
-}
+// chPQ: min-heap for CH queries (reuses dijkstraItem).
+type chPQ []*dijkstraItem
 
 func (h chPQ) Len() int           { return len(h) }
 func (h chPQ) Less(i, j int) bool { return h[i].dist < h[j].dist }
 func (h chPQ) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *chPQ) Push(x interface{}) {
-	*h = append(*h, x.(*struct {
-		id   int64
-		dist float64
-	}))
-}
-func (h *chPQ) Pop() interface{} { old := *h; n := len(old); it := old[n-1]; *h = old[:n-1]; return it }
+func (h *chPQ) Push(x any)        { *h = append(*h, x.(*dijkstraItem)) }
+func (h *chPQ) Pop() any          { old := *h; n := len(old); it := old[n-1]; *h = old[:n-1]; return it }
 
 // dijkstraNode is a simple node-based Dijkstra implementation that computes
 // shortest path using per-edge costs (r.edgeCost) and does not account for
@@ -1137,9 +1116,7 @@ func (r *Router) dijkstraNode(ctx context.Context, from, to int64, opt RouteOpti
 		cur = p
 	}
 	// reverse
-	for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
-		path[i], path[j] = path[j], path[i]
-	}
+	slices.Reverse(path)
 	return path, dist[to], nil
 }
 
@@ -1155,8 +1132,8 @@ type pqWrapper struct{ s *[]*dijkstraItem }
 func (w pqWrapper) Len() int            { return len(*w.s) }
 func (w pqWrapper) Less(i, j int) bool  { return (*w.s)[i].dist < (*w.s)[j].dist }
 func (w pqWrapper) Swap(i, j int)       { (*w.s)[i], (*w.s)[j] = (*w.s)[j], (*w.s)[i] }
-func (w *pqWrapper) Push(x interface{}) { *w.s = append(*w.s, x.(*dijkstraItem)) }
-func (w *pqWrapper) Pop() interface{} {
+func (w *pqWrapper) Push(x any) { *w.s = append(*w.s, x.(*dijkstraItem)) }
+func (w *pqWrapper) Pop() any {
 	old := *w.s
 	n := len(old)
 	it := old[n-1]
@@ -1220,12 +1197,12 @@ func (pq priorityQueue) Swap(i, j int) {
 	pq[i].idx = i
 	pq[j].idx = j
 }
-func (pq *priorityQueue) Push(x interface{}) {
+func (pq *priorityQueue) Push(x any) {
 	it := x.(*pqItem)
 	it.idx = len(*pq)
 	*pq = append(*pq, it)
 }
-func (pq *priorityQueue) Pop() interface{} {
+func (pq *priorityQueue) Pop() any {
 	old := *pq
 	n := len(old)
 	it := old[n-1]
@@ -1323,9 +1300,7 @@ func reconstructPathTurnState(goal turnState, came map[turnState]turnState) []in
 		}
 		s = prev
 	}
-	for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
-		path[i], path[j] = path[j], path[i]
-	}
+	slices.Reverse(path)
 	return path
 }
 
