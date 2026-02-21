@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,13 +36,14 @@ const buildVersion = "dev"
 // These settings are persisted in the settings file and can be updated
 // at runtime via the settings API.
 type TileSettings struct {
-	CacheDir    string `json:"cache_dir"`
-	Upstream    string `json:"upstream"`
-	UserAgent   string `json:"user_agent"`
-	MapType     string `json:"map_type,omitempty"`   // "raster" (default), "vector", "wms"
-	StyleURL    string `json:"style_url,omitempty"`  // vector: MapLibre GL style URL
-	WMSLayers   string `json:"wms_layers,omitempty"` // wms: comma-separated layer names
-	Attribution string `json:"attribution,omitempty"` // attribution text shown on the map
+	CacheDir     string `json:"cache_dir"`
+	Upstream     string `json:"upstream"`
+	UserAgent    string `json:"user_agent"`
+	MapType      string `json:"map_type,omitempty"`      // "raster" (default), "vector", "wms"
+	StyleURL     string `json:"style_url,omitempty"`     // vector: MapLibre GL style URL
+	WMSLayers    string `json:"wms_layers,omitempty"`    // wms: comma-separated layer names
+	Attribution  string `json:"attribution,omitempty"`   // attribution text shown on the map
+	MemCacheSize int    `json:"mem_cache_size,omitempty"` // L1 in-memory tile cache capacity (0 = default 512)
 }
 
 // TileSourcePreset is a named tile/map-source configuration shown in the UI preset picker.
@@ -145,11 +147,12 @@ func DefaultSettings(cacheDir, upstream string) Settings {
 			},
 		},
 		Tiles: TileSettings{
-			CacheDir:    cacheDir,
-			Upstream:    upstream,
-			UserAgent:   "osmmini-routerd/1.0 (offline routing)",
-			MapType:     "raster",
-			Attribution: "© OpenStreetMap contributors",
+			CacheDir:     cacheDir,
+			Upstream:     upstream,
+			UserAgent:    "osmmini-routerd/1.0 (offline routing)",
+			MapType:      "raster",
+			Attribution:  "© OpenStreetMap contributors",
+			MemCacheSize: tileMemCacheDefaultMaxItems,
 		},
 		// DefaultHighwaySpeeds: fallback speeds (kph) per highway type.
 		// These are the built-in defaults used when no "default_highway_speeds"
@@ -231,24 +234,91 @@ func (s *SettingsStore) saveLocked() error {
 
 // ---- Tile cache proxy ----
 
+// tileCacheKey is the lookup key for a single tile (zoom / x / y).
+type tileCacheKey struct{ z, x, y int }
+
+// tileMemEntry holds a tile's raw bytes and its L1 expiry time.
+type tileMemEntry struct {
+	data      []byte
+	expiresAt time.Time
+}
+
+// tileMemCacheDefaultMaxItems is the default in-memory tile cache capacity.
+const tileMemCacheDefaultMaxItems = 512
+
+// tileCacheStats tracks hit/miss counters for observability.
+type tileCacheStats struct {
+	memHits  int64
+	diskHits int64
+	fetches  int64
+	errors   int64
+}
+
+// TileCache proxies /tiles/{z}/{x}/{y}.png requests using a two-tier cache:
+//
+//   - L1: bounded in-memory cache (fast; lost on restart)
+//   - L2: disk cache under cfg.CacheDir (persistent across restarts)
+//
+// Request flow: L1 hit → serve immediately; L2 hit → warm L1, serve;
+// miss → fetch upstream, write to L1+L2, serve.
 type TileCache struct {
 	mu     sync.RWMutex
 	cfg    TileSettings
 	client *http.Client
+
+	// L1 in-memory cache
+	mem    map[tileCacheKey]*tileMemEntry
+	memMax int
+
+	stats tileCacheStats
+	stopC chan struct{} // closed to stop the background eviction goroutine
 }
 
 func NewTileCache(cfg TileSettings) *TileCache {
-	return &TileCache{
-		cfg: cfg,
-		client: &http.Client{
-			Timeout: 25 * time.Second,
-		},
+	memMax := cfg.MemCacheSize
+	if memMax <= 0 {
+		memMax = tileMemCacheDefaultMaxItems
 	}
+	tc := &TileCache{
+		cfg:    cfg,
+		client: &http.Client{Timeout: 25 * time.Second},
+		mem:    make(map[tileCacheKey]*tileMemEntry, memMax),
+		memMax: memMax,
+		stopC:  make(chan struct{}),
+	}
+	// Background L1 eviction: purge expired entries every hour.
+	go func() {
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				tc.evictMem()
+			case <-tc.stopC:
+				return
+			}
+		}
+	}()
+	return tc
+}
+
+// Close stops the background eviction goroutine.
+func (tc *TileCache) Close() {
+	close(tc.stopC)
 }
 
 func (tc *TileCache) Update(cfg TileSettings) {
+	newMax := cfg.MemCacheSize
+	if newMax <= 0 {
+		newMax = tileMemCacheDefaultMaxItems
+	}
 	tc.mu.Lock()
 	tc.cfg = cfg
+	if newMax != tc.memMax {
+		tc.memMax = newMax
+		// Clear L1 on capacity change so the new limit is respected immediately.
+		tc.mem = make(map[tileCacheKey]*tileMemEntry, tc.memMax)
+	}
 	tc.mu.Unlock()
 }
 
@@ -256,6 +326,101 @@ func (tc *TileCache) cfgCopy() TileSettings {
 	tc.mu.RLock()
 	defer tc.mu.RUnlock()
 	return tc.cfg
+}
+
+// Stats returns a snapshot of cache hit/miss counters.
+func (tc *TileCache) Stats() map[string]int64 {
+	tc.mu.RLock()
+	defer tc.mu.RUnlock()
+	return map[string]int64{
+		"mem_size":  int64(len(tc.mem)),
+		"mem_hits":  tc.stats.memHits,
+		"disk_hits": tc.stats.diskHits,
+		"fetches":   tc.stats.fetches,
+		"errors":    tc.stats.errors,
+	}
+}
+
+// sortTileEntriesByExpiry sorts a slice of (key, expiry) pairs ascending
+// by expiry time using slices.SortFunc for O(n log n) performance.
+type tileKV struct {
+	k tileCacheKey
+	t time.Time
+}
+
+func sortTileEntriesByExpiry(entries []tileKV) {
+	slices.SortFunc(entries, func(a, b tileKV) int {
+		return a.t.Compare(b.t)
+	})
+}
+
+// evictMem removes expired L1 entries under the write lock.
+// If still over capacity after expiry removal, it removes the oldest 25%.
+func (tc *TileCache) evictMem() {
+	now := time.Now()
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	for k, e := range tc.mem {
+		if now.After(e.expiresAt) {
+			delete(tc.mem, k)
+		}
+	}
+	if len(tc.mem) <= tc.memMax {
+		return
+	}
+	// Still over capacity: sort by expiry and remove oldest 25%.
+	entries := make([]tileKV, 0, len(tc.mem))
+	for k, e := range tc.mem {
+		entries = append(entries, tileKV{k, e.expiresAt})
+	}
+	sortTileEntriesByExpiry(entries)
+	n := max(1, len(entries)/4)
+	for _, kv := range entries[:n] {
+		delete(tc.mem, kv.k)
+	}
+}
+
+// getFromMem checks the L1 cache while holding the read lock throughout,
+// ensuring the expiry check is race-free.
+func (tc *TileCache) getFromMem(key tileCacheKey) ([]byte, bool) {
+	tc.mu.RLock()
+	defer tc.mu.RUnlock()
+	e, ok := tc.mem[key]
+	if !ok || time.Now().After(e.expiresAt) {
+		return nil, false
+	}
+	return e.data, true
+}
+
+// setInMem inserts or updates an L1 entry with a 24-hour TTL.
+// When at capacity it first removes expired entries, then sorts and
+// removes the oldest 25% if still full.
+func (tc *TileCache) setInMem(key tileCacheKey, data []byte) {
+	expiry := time.Now().Add(24 * time.Hour)
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	if len(tc.mem) >= tc.memMax {
+		// Pass 1: purge expired entries.
+		now := time.Now()
+		for k, e := range tc.mem {
+			if now.After(e.expiresAt) {
+				delete(tc.mem, k)
+			}
+		}
+		// Pass 2: if still full, remove oldest 25% by expiry.
+		if len(tc.mem) >= tc.memMax {
+			entries := make([]tileKV, 0, len(tc.mem))
+			for k, e := range tc.mem {
+				entries = append(entries, tileKV{k, e.expiresAt})
+			}
+			sortTileEntriesByExpiry(entries)
+			n := max(1, len(entries)/4)
+			for _, kv := range entries[:n] {
+				delete(tc.mem, kv.k)
+			}
+		}
+	}
+	tc.mem[key] = &tileMemEntry{data: data, expiresAt: expiry}
 }
 
 func (tc *TileCache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -283,15 +448,30 @@ func (tc *TileCache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	key := tileCacheKey{z, x, y}
 	cfg := tc.cfgCopy()
-	cachePath := filepath.Join(cfg.CacheDir, strconv.Itoa(z), strconv.Itoa(x), fmt.Sprintf("%d.png", y))
-	if b, ok := readFileIfExists(cachePath); ok {
-		w.Header().Set("Content-Type", "image/png")
-		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-		_, _ = w.Write(b)
+
+	// L1: in-memory
+	if data, ok := tc.getFromMem(key); ok {
+		tc.mu.Lock()
+		tc.stats.memHits++
+		tc.mu.Unlock()
+		serveTile(w, data)
 		return
 	}
 
+	// L2: disk
+	cachePath := filepath.Join(cfg.CacheDir, strconv.Itoa(z), strconv.Itoa(x), fmt.Sprintf("%d.png", y))
+	if data, ok := readFileIfExists(cachePath); ok {
+		tc.mu.Lock()
+		tc.stats.diskHits++
+		tc.mu.Unlock()
+		tc.setInMem(key, data) // warm L1
+		serveTile(w, data)
+		return
+	}
+
+	// Miss: fetch from upstream
 	up := cfg.Upstream
 	up = strings.ReplaceAll(up, "{z}", strconv.Itoa(z))
 	up = strings.ReplaceAll(up, "{x}", strconv.Itoa(x))
@@ -303,26 +483,45 @@ func (tc *TileCache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := tc.client.Do(req)
 	if err != nil {
+		tc.mu.Lock()
+		tc.stats.errors++
+		tc.mu.Unlock()
 		http.Error(w, "tile upstream error", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
+		tc.mu.Lock()
+		tc.stats.errors++
+		tc.mu.Unlock()
 		http.Error(w, "tile upstream non-200", http.StatusBadGateway)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if err != nil || len(body) == 0 {
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil || len(data) == 0 {
+		tc.mu.Lock()
+		tc.stats.errors++
+		tc.mu.Unlock()
 		http.Error(w, "tile read error", http.StatusBadGateway)
 		return
 	}
 
+	// Persist to L2 (disk) and warm L1.
 	_ = os.MkdirAll(filepath.Dir(cachePath), 0o755)
-	_ = os.WriteFile(cachePath, body, 0o644)
+	_ = os.WriteFile(cachePath, data, 0o644)
+	tc.setInMem(key, data)
 
+	tc.mu.Lock()
+	tc.stats.fetches++
+	tc.mu.Unlock()
+
+	serveTile(w, data)
+}
+
+func serveTile(w http.ResponseWriter, data []byte) {
 	w.Header().Set("Content-Type", "image/png")
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-	_, _ = w.Write(body)
+	_, _ = w.Write(data)
 }
 
 func readFileIfExists(path string) ([]byte, bool) {
@@ -850,6 +1049,7 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"route_cache": map[string]any{
 			"size": s.routeCache.Size(),
 		},
+		"tile_cache": s.tiles.Stats(),
 	}
 	if s.window != nil {
 		out["window"] = s.window
