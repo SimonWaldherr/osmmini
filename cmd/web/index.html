@@ -73,6 +73,16 @@
               </div>
               <div class="settings-grid">
                 <div class="setting-item">
+                  <label class="setting-label" title="Fahrzeugprofil">
+                    Profil
+                    <span class="info-icon" title="Wähle ein Fahrprofil passend zum Fahrzeug/Nutzer">ⓘ</span>
+                  </label>
+                  <select id="profile" class="setting-select">
+                    <option value="">— Benutzerdefiniert —</option>
+                    <!-- populated by JS from /api/v1/profiles -->
+                  </select>
+                </div>
+                <div class="setting-item">
                   <label class="setting-label" title="Algorithmus für Pfadfindung">
                     Engine
                     <span class="info-icon" title="A* ist schnell und optimal, CH ist sehr schnell bei großen Graphen">ⓘ</span>

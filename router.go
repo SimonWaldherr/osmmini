@@ -42,6 +42,107 @@ const (
 	ObjectiveEconomy  Objective = "economy"
 )
 
+// VehicleProfile is an identifier for a named travel profile.
+// Profiles encode sensible defaults for specific use-cases (max speed,
+// allowed highway types, objective, weights) and can be used as a
+// convenient shortcut instead of supplying all individual RouteOptions
+// fields. When a non-empty profile is set in RouteOptions, its defaults
+// are applied before any explicit field overrides.
+type VehicleProfile string
+
+const (
+	ProfileCar          VehicleProfile = "car"           // standard passenger car
+	ProfileDelivery     VehicleProfile = "delivery"      // light delivery van (urban streets)
+	ProfileTruck        VehicleProfile = "truck"         // heavy goods vehicle (HGV)
+	ProfileTravel       VehicleProfile = "travel"        // long-distance / touring
+	ProfileFirefighting VehicleProfile = "firefighting"  // fire engine (ignores some restrictions)
+	ProfileEmergency    VehicleProfile = "emergency"     // ambulance / police
+	ProfileCycling      VehicleProfile = "cycling"       // bicycle
+	ProfileWalking      VehicleProfile = "walking"       // pedestrian
+)
+
+// VehicleProfileDef defines the pre-set routing parameters for a VehicleProfile.
+type VehicleProfileDef struct {
+	ID            VehicleProfile `json:"id"`
+	Label         string         `json:"label"`
+	Icon          string         `json:"icon"`
+	Objective     Objective      `json:"objective"`
+	MaxSpeedKph   float64        `json:"max_speed_kph"`
+	AllowedHwySet []string       `json:"allowed_highway_types,omitempty"` // nil = all driveable
+	// SpeedScale multiplies the edge speed for this profile (e.g. 0.25 for cycling)
+	SpeedScale float64 `json:"speed_scale,omitempty"`
+	LeftTurn   float64 `json:"left_turn,omitempty"`
+	UTurn      float64 `json:"u_turn,omitempty"`
+}
+
+// BuiltinProfiles lists the named travel profiles available out of the box.
+var BuiltinProfiles = []VehicleProfileDef{
+	{
+		ID: ProfileCar, Label: "Pkw", Icon: "🚗",
+		Objective: ObjectiveDuration, MaxSpeedKph: 130,
+		AllowedHwySet: []string{"motorway", "trunk", "primary", "secondary", "tertiary",
+			"unclassified", "residential", "living_street", "service", "road",
+			"motorway_link", "trunk_link", "primary_link", "secondary_link", "tertiary_link"},
+	},
+	{
+		ID: ProfileDelivery, Label: "Lieferfahrzeug", Icon: "🚚",
+		Objective: ObjectiveDuration, MaxSpeedKph: 80,
+		AllowedHwySet: []string{"primary", "secondary", "tertiary", "unclassified",
+			"residential", "living_street", "service", "road",
+			"primary_link", "secondary_link", "tertiary_link"},
+		LeftTurn: 3, UTurn: 10,
+	},
+	{
+		ID: ProfileTruck, Label: "LKW / HGV", Icon: "🚛",
+		Objective: ObjectiveDuration, MaxSpeedKph: 90,
+		AllowedHwySet: []string{"motorway", "trunk", "primary", "secondary",
+			"motorway_link", "trunk_link", "primary_link"},
+	},
+	{
+		ID: ProfileTravel, Label: "Fernreise / Touring", Icon: "🛣️",
+		Objective: ObjectiveEconomy, MaxSpeedKph: 130,
+		AllowedHwySet: []string{"motorway", "trunk", "primary", "secondary", "tertiary",
+			"motorway_link", "trunk_link", "primary_link", "secondary_link"},
+	},
+	{
+		ID: ProfileFirefighting, Label: "Feuerwehr", Icon: "🚒",
+		Objective: ObjectiveDuration, MaxSpeedKph: 130,
+		// fire engines use all roads; no explicit restriction
+	},
+	{
+		ID: ProfileEmergency, Label: "Rettungsdienst / Polizei", Icon: "🚑",
+		Objective: ObjectiveDuration, MaxSpeedKph: 130,
+		// emergency vehicles use all roads; no explicit restriction
+	},
+	{
+		ID: ProfileCycling, Label: "Fahrrad", Icon: "🚲",
+		Objective: ObjectiveDistance, MaxSpeedKph: 25,
+		AllowedHwySet: []string{"primary", "secondary", "tertiary", "unclassified",
+			"residential", "living_street", "service", "track", "road",
+			"primary_link", "secondary_link", "tertiary_link"},
+		SpeedScale: 0.25,
+	},
+	{
+		ID: ProfileWalking, Label: "Zu Fuß", Icon: "🚶",
+		Objective: ObjectiveDistance, MaxSpeedKph: 6,
+		// pedestrians use all non-motorway roads and paths
+		AllowedHwySet: []string{"secondary", "tertiary", "unclassified",
+			"residential", "living_street", "service", "track", "road", "path",
+			"secondary_link", "tertiary_link"},
+		SpeedScale: 0.05,
+	},
+}
+
+// profileDefByID returns the VehicleProfileDef for id, or nil if not found.
+func profileDefByID(id VehicleProfile) *VehicleProfileDef {
+	for i := range BuiltinProfiles {
+		if BuiltinProfiles[i].ID == id {
+			return &BuiltinProfiles[i]
+		}
+	}
+	return nil
+}
+
 // ProWeights contains optional advanced routing weights and vehicle constraints.
 // Values influence penalties (turns, crossings) and maximum assumed speed
 // used by heuristics and cost calculations.
@@ -57,14 +158,35 @@ type ProWeights struct {
 
 // RouteOptions are supplied to routing calls to control engine, objective
 // and pro-level weights/constraints.
+// When Profile is set the matching VehicleProfileDef supplies sensible
+// defaults; explicit fields in Weights override those defaults.
 type RouteOptions struct {
-	Engine    RouteEngine `json:"engine,omitempty"`
-	Objective Objective   `json:"objective"`
-	Pro       bool        `json:"pro"`
-	Weights   ProWeights  `json:"weights"`
+	Engine    RouteEngine    `json:"engine,omitempty"`
+	Objective Objective      `json:"objective"`
+	Profile   VehicleProfile `json:"profile,omitempty"`
+	Pro       bool           `json:"pro"`
+	Weights   ProWeights     `json:"weights"`
 }
 
 func (o RouteOptions) withDefaults() RouteOptions {
+	// Apply profile defaults first, then override with explicit values.
+	if o.Profile != "" {
+		if def := profileDefByID(o.Profile); def != nil {
+			if o.Objective == "" {
+				o.Objective = def.Objective
+			}
+			if o.Weights.MaxSpeedKph <= 0 {
+				o.Weights.MaxSpeedKph = def.MaxSpeedKph
+			}
+			if o.Weights.LeftTurn == 0 && def.LeftTurn > 0 {
+				o.Weights.LeftTurn = def.LeftTurn
+			}
+			if o.Weights.UTurn == 0 && def.UTurn > 0 {
+				o.Weights.UTurn = def.UTurn
+			}
+		}
+	}
+
 	if o.Engine == "" {
 		o.Engine = EngineAStar
 	}
@@ -84,12 +206,42 @@ func (o RouteOptions) withDefaults() RouteOptions {
 	return o
 }
 
+// profileAllowedHwySet returns the set of allowed highway types for the given
+// options, or nil if no profile restriction applies.
+func profileAllowedHwySet(opt RouteOptions) map[string]bool {
+	if opt.Profile == "" {
+		return nil
+	}
+	def := profileDefByID(opt.Profile)
+	if def == nil || len(def.AllowedHwySet) == 0 {
+		return nil
+	}
+	m := make(map[string]bool, len(def.AllowedHwySet))
+	for _, h := range def.AllowedHwySet {
+		m[h] = true
+	}
+	return m
+}
+
+// profileSpeedScale returns the speed scale factor for the given options.
+func profileSpeedScale(opt RouteOptions) float64 {
+	if opt.Profile == "" {
+		return 1
+	}
+	def := profileDefByID(opt.Profile)
+	if def == nil || def.SpeedScale <= 0 {
+		return 1
+	}
+	return def.SpeedScale
+}
+
 type Edge struct {
 	To         int64
 	DistM      float64
 	SpeedKph   float64
 	MaxHeightM float64
 	MaxWeightT float64
+	HwyType    string // OSM highway tag value (e.g. "residential")
 }
 
 type Graph struct {
@@ -209,6 +361,7 @@ func BuildRouterWithAddressesOptions(path string, bo BuildOptions) (*Router, []A
 			copy(ids, w.NodeIDs)
 			highways = append(highways, highwayWay{
 				nodes:      ids,
+				hwyType:    strings.ToLower(strings.TrimSpace(hwy)),
 				speedKph:   speed,
 				maxHeightM: mh,
 				maxWeightT: mw,
@@ -240,6 +393,7 @@ func BuildRouterWithAddressesOptions(path string, bo BuildOptions) (*Router, []A
 			SpeedKph:   hw.speedKph,
 			MaxHeightM: hw.maxHeightM,
 			MaxWeightT: hw.maxWeightT,
+			HwyType:    hw.hwyType,
 		})
 	}
 
@@ -1409,11 +1563,15 @@ func effectiveSpeedKph(e Edge, opt RouteOptions) float64 {
 	if v <= 0 {
 		v = 50
 	}
+	// Apply profile speed scale (e.g. cycling at 25% of road speed)
+	if scale := profileSpeedScale(opt); scale > 0 && scale < 1 {
+		v *= scale
+	}
 	if opt.Weights.MaxSpeedKph > 0 && v > opt.Weights.MaxSpeedKph {
 		v = opt.Weights.MaxSpeedKph
 	}
-	if v < 5 {
-		v = 5
+	if v < 3 {
+		v = 3 // minimum 3 kph (walking pace) to keep heuristics well-behaved
 	}
 	return v
 }
@@ -1429,6 +1587,12 @@ func edgeAllowed(e Edge, opt RouteOptions) bool {
 	}
 	if opt.Weights.VehicleWeightT > 0 && e.MaxWeightT > 0 && opt.Weights.VehicleWeightT > e.MaxWeightT {
 		return false
+	}
+	// Check profile highway-type restriction.
+	if allowed := profileAllowedHwySet(opt); allowed != nil && e.HwyType != "" {
+		if !allowed[e.HwyType] {
+			return false
+		}
 	}
 	return true
 }
@@ -1583,6 +1747,7 @@ func (r *Router) nearestNodeBrute(lat, lon float64) (int64, float64, bool) {
 
 type highwayWay struct {
 	nodes      []int64
+	hwyType    string // OSM highway tag value
 	speedKph   float64
 	maxHeightM float64
 	maxWeightT float64

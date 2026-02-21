@@ -247,6 +247,7 @@ function routeOptionsFromUI(){
   return {
     engine: document.getElementById('engine').value,
     objective: document.getElementById('objective').value,
+    profile: document.getElementById('profile')?.value || '',
     pro: document.getElementById('pro').checked,
     weights: {
       left_turn: parseFloat(document.getElementById('w_left').value) || 0,
@@ -788,6 +789,8 @@ function initializeSettingsUI(s) {
     if(s.routing) {
         document.getElementById('engine').value = (s.routing.engine || 'astar');
         document.getElementById('objective').value = s.routing.objective || 'duration';
+        const profileEl = document.getElementById('profile');
+        if (profileEl) profileEl.value = s.routing.profile || '';
         document.getElementById('pro').checked = !!s.routing.pro;
         if(s.routing.pro) weights.classList.remove('hidden');
         
@@ -943,6 +946,50 @@ if (tilePresetEl) {
     } catch (e) {
       console.warn('Failed to parse preset data:', e);
     }});
+}
+
+// Vehicle profile loading from API
+async function loadVehicleProfiles() {
+  try {
+    const res = await fetch('/api/v1/profiles');
+    if (!res.ok) return;
+    const profiles = await res.json();
+    const sel = document.getElementById('profile');
+    if (!sel) return;
+    // remove old dynamic options (preserve the blank entry)
+    Array.from(sel.options).forEach(o => { if (o.value !== '') o.remove(); });
+    profiles.forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p.id;
+      opt.textContent = `${p.icon || ''} ${p.label}`.trim();
+      sel.appendChild(opt);
+    });
+    // restore active profile from preloaded settings
+    const curProfile = preloadedSettings?.routing?.profile || '';
+    if (curProfile) sel.value = curProfile;
+  } catch (e) {
+    console.warn('Failed to load vehicle profiles:', e);
+  }
+}
+loadVehicleProfiles();
+
+// When a profile is selected, auto-apply its default objective if the user
+// hasn't explicitly changed it.
+const profileSelEl = document.getElementById('profile');
+if (profileSelEl) {
+  profileSelEl.addEventListener('change', async function() {
+    if (!this.value) return; // custom — no auto-apply
+    try {
+      const res = await fetch('/api/v1/profiles');
+      if (!res.ok) return;
+      const profiles = await res.json();
+      const def = profiles.find(p => p.id === this.value);
+      if (def) {
+        const objEl = document.getElementById('objective');
+        if (objEl && def.objective) objEl.value = def.objective;
+      }
+    } catch (e) { /* non-critical */ }
+  });
 }
 
 // Load settings (use preloaded or fetch)

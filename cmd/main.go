@@ -370,6 +370,7 @@ type RouteResponse struct {
 	To            RoutePoint         `json:"to"`
 	Engine        string             `json:"engine"`
 	Objective     string             `json:"objective"`
+	Profile       string             `json:"profile,omitempty"`
 	Cost          float64            `json:"cost"`
 	DistanceM     float64            `json:"distance_m"`
 	DurationS     float64            `json:"duration_s"`
@@ -377,6 +378,7 @@ type RouteResponse struct {
 	GoogleMapsURL string             `json:"google_maps_url"`
 	AppleMapsURL  string             `json:"apple_maps_url"`
 	Steps         []osmmini.Maneuver `json:"steps,omitempty"`
+	Cached        bool               `json:"cached,omitempty"`
 }
 
 type TripStop struct {
@@ -426,6 +428,147 @@ type TripSolveResponse struct {
 	AppleMapsURL  string             `json:"apple_maps_url"`
 }
 
+// ---- Route result cache ----
+
+// routeCacheKey uniquely identifies a route request for caching purposes.
+type routeCacheKey struct {
+	fromNode int64
+	toNode   int64
+	// include routing-relevant options in the key
+	engine    string
+	objective string
+	profile   string
+	maxSpeed  float64
+	heightM   float64
+	weightT   float64
+}
+
+// routeCacheEntry holds a cached route response with its expiry time.
+type routeCacheEntry struct {
+	resp      RouteResponse
+	expiresAt time.Time
+}
+
+// routeCacheDefaultMaxItems is the default capacity bound for the route cache.
+const routeCacheDefaultMaxItems = 4096
+
+// RouteCache is a bounded in-memory cache for route responses.
+// It uses a simple RW-mutex protected map with TTL eviction.
+// Maximum capacity is capped so it never grows unbounded.
+type RouteCache struct {
+	mu       sync.RWMutex
+	entries  map[routeCacheKey]*routeCacheEntry
+	ttl      time.Duration
+	maxItems int
+}
+
+func newRouteCache(ttl time.Duration, maxItems int) *RouteCache {
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	if maxItems <= 0 {
+		maxItems = routeCacheDefaultMaxItems
+	}
+	c := &RouteCache{
+		entries:  make(map[routeCacheKey]*routeCacheEntry, 64),
+		ttl:      ttl,
+		maxItems: maxItems,
+	}
+	// Background eviction goroutine: purge expired entries every TTL/2.
+	go func() {
+		ticker := time.NewTicker(ttl / 2)
+		defer ticker.Stop()
+		for range ticker.C {
+			c.evict()
+		}
+	}()
+	return c
+}
+
+func (c *RouteCache) cacheKey(fromNode, toNode int64, opt osmmini.RouteOptions) routeCacheKey {
+	return routeCacheKey{
+		fromNode:  fromNode,
+		toNode:    toNode,
+		engine:    string(opt.Engine),
+		objective: string(opt.Objective),
+		profile:   string(opt.Profile),
+		maxSpeed:  opt.Weights.MaxSpeedKph,
+		heightM:   opt.Weights.VehicleHeightM,
+		weightT:   opt.Weights.VehicleWeightT,
+	}
+}
+
+func (c *RouteCache) get(key routeCacheKey) (RouteResponse, bool) {
+	c.mu.RLock()
+	e, ok := c.entries[key]
+	c.mu.RUnlock()
+	if !ok || time.Now().After(e.expiresAt) {
+		return RouteResponse{}, false
+	}
+	return e.resp, true
+}
+
+func (c *RouteCache) set(key routeCacheKey, resp RouteResponse) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// When at capacity, evict all entries that are already expired.
+	// If still at capacity afterwards, remove entries with the earliest
+	// expiry time to make room (approximate LRU via expiry ordering).
+	if len(c.entries) >= c.maxItems {
+		now := time.Now()
+		for k, e := range c.entries {
+			if now.After(e.expiresAt) {
+				delete(c.entries, k)
+			}
+		}
+		// If still full, remove the half with the soonest expiry.
+		if len(c.entries) >= c.maxItems {
+			type kv struct {
+				k routeCacheKey
+				t time.Time
+			}
+			evictions := make([]kv, 0, len(c.entries))
+			for k, e := range c.entries {
+				evictions = append(evictions, kv{k, e.expiresAt})
+			}
+			// Sort ascending so we remove the shortest-lived first.
+			for i := 1; i < len(evictions); i++ {
+				for j := i; j > 0 && evictions[j].t.Before(evictions[j-1].t); j-- {
+					evictions[j], evictions[j-1] = evictions[j-1], evictions[j]
+				}
+			}
+			for _, kv := range evictions[:len(evictions)/2] {
+				delete(c.entries, kv.k)
+			}
+		}
+	}
+	c.entries[key] = &routeCacheEntry{resp: resp, expiresAt: time.Now().Add(c.ttl)}
+}
+
+func (c *RouteCache) evict() {
+	now := time.Now()
+	c.mu.Lock()
+	for k, e := range c.entries {
+		if now.After(e.expiresAt) {
+			delete(c.entries, k)
+		}
+	}
+	c.mu.Unlock()
+}
+
+func (c *RouteCache) Invalidate() {
+	c.mu.Lock()
+	c.entries = make(map[routeCacheKey]*routeCacheEntry, 64)
+	c.mu.Unlock()
+}
+
+// Size returns the current number of cached entries.
+func (c *RouteCache) Size() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.entries)
+}
+
 // ---- Server ----
 
 type server struct {
@@ -434,6 +577,7 @@ type server struct {
 	startedAt     time.Time
 	settings      *SettingsStore
 	tiles         *TileCache
+	routeCache    *RouteCache
 	window        *osmmini.CoordWindow
 	enforceWindow bool
 
@@ -499,6 +643,7 @@ func main() {
 	}
 
 	tileCache := NewTileCache(store.Get().Tiles)
+	rCache := newRouteCache(5*time.Minute, routeCacheDefaultMaxItems)
 
 	indexTmpl := template.Must(template.ParseFS(embedded, "web/index.html"))
 	openapiBytes, _ := embedded.ReadFile("api/openapi.yaml")
@@ -509,6 +654,7 @@ func main() {
 		startedAt:     time.Now(),
 		settings:      store,
 		tiles:         tileCache,
+		routeCache:    rCache,
 		window:        win,
 		enforceWindow: *enforceWindow,
 		indexTmpl:     indexTmpl,
@@ -552,6 +698,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/api/v1/status", s.handleStatus)
 	mux.HandleFunc("/api/v1/settings", s.handleSettings)
 	mux.HandleFunc("/api/v1/tile-sources", s.handleTileSources)
+	mux.HandleFunc("/api/v1/profiles", s.handleProfiles)
 	mux.HandleFunc("/api/v1/search", s.handleSearch)
 	mux.HandleFunc("/api/v1/route", s.handleRoute)
 	mux.HandleFunc("/api/v1/trip/solve", s.handleTripSolve)
@@ -700,6 +847,9 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"graph":     map[string]any{"nodes": s.router.NodeCount(), "edges": s.router.EdgeCount()},
 		"addresses": len(s.addrs),
 		"settings":  set,
+		"route_cache": map[string]any{
+			"size": s.routeCache.Size(),
+		},
 	}
 	if s.window != nil {
 		out["window"] = s.window
@@ -717,6 +867,14 @@ func (s *server) handleTileSources(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, BuiltinTilePresets)
+}
+
+func (s *server) handleProfiles(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	writeJSON(w, http.StatusOK, osmmini.BuiltinProfiles)
 }
 
 func (s *server) handleSettings(w http.ResponseWriter, r *http.Request) {
@@ -840,6 +998,17 @@ func (s *server) handleRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check route cache before running the (potentially expensive) pathfinder.
+	cacheKey := s.routeCache.cacheKey(startID, endID, opt)
+	if cached, hit := s.routeCache.get(cacheKey); hit {
+		// Update from/to labels (they depend on the query string, not the node)
+		cached.From = RoutePoint{Input: fromInput, Label: fromLabel, Lat: fromCoord.Lat, Lon: fromCoord.Lon, Node: startID, SnapM: startDist}
+		cached.To = RoutePoint{Input: toInput, Label: toLabel, Lat: toCoord.Lat, Lon: toCoord.Lon, Node: endID, SnapM: endDist}
+		cached.Cached = true
+		writeJSON(w, http.StatusOK, cached)
+		return
+	}
+
 	res, err := s.router.RouteWithOptions(r.Context(), startID, endID, opt)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
@@ -856,7 +1025,7 @@ func (s *server) handleRoute(w http.ResponseWriter, r *http.Request) {
 	// generate maneuvers/steps for the frontend
 	steps := s.router.ManeuversForPath(res.Path, opt)
 
-	writeJSON(w, http.StatusOK, RouteResponse{
+	resp := RouteResponse{
 		From: RoutePoint{
 			Input: fromInput,
 			Label: fromLabel,
@@ -875,6 +1044,7 @@ func (s *server) handleRoute(w http.ResponseWriter, r *http.Request) {
 		},
 		Engine:        string(res.Engine),
 		Objective:     string(res.Objective),
+		Profile:       string(opt.Profile),
 		Cost:          res.Cost,
 		DistanceM:     res.DistanceM,
 		DurationS:     res.DurationS,
@@ -882,7 +1052,9 @@ func (s *server) handleRoute(w http.ResponseWriter, r *http.Request) {
 		GoogleMapsURL: gURL,
 		AppleMapsURL:  aURL,
 		Steps:         steps,
-	})
+	}
+	s.routeCache.set(cacheKey, resp)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *server) handleTripSolve(w http.ResponseWriter, r *http.Request) {
