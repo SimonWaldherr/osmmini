@@ -10,8 +10,11 @@
       "crossing": 0,
       "max_speed_kph": 150,
       "vehicle_height_m": 0,
-      "vehicle_weight_t": 0
-    }
+      "vehicle_weight_t": 0,
+      "no_left_turn": false,
+      "traffic_light_penalty": 0
+    },
+    "emergency_mode": false
   },
   "tiles": {
     "cache_dir": "tiles-cache",

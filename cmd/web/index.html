@@ -139,7 +139,32 @@
                   <label class="setting-label">Rechtsabbiegen (s)</label>
                   <input id="w_right" type="number" step="0.5" min="0" max="60" class="setting-input"/>
                 </div>
+                <div class="setting-item">
+                  <label class="setting-label">Ampelstrafe (s)
+                    <span class="info-icon" title="Zeitstrafe pro Kreuzung mit Ampel">ⓘ</span>
+                  </label>
+                  <input id="w_traffic_light" type="number" step="1" min="0" max="120" class="setting-input"/>
+                </div>
               </div>
+              <label class="checkbox switch" title="Linksabbiegen vermeiden (no-left-turn Routing)">
+                <input id="noLeftTurn" type="checkbox" role="switch" aria-checked="false"/>
+                <span>Linksabbiegen vermeiden</span>
+              </label>
+            </div>
+
+            <!-- Emergency / BOS Mode -->
+            <div class="settings-section">
+              <div class="section-header">
+                <span class="section-icon">🚒</span>
+                <h3>BOS / Einsatzmodus</h3>
+              </div>
+              <label class="checkbox switch" title="Einsatzfahrt: Höhere Geschwindigkeiten, Vorrang an Kreuzungen">
+                <input id="emergencyMode" type="checkbox" role="switch" aria-checked="false"/>
+                <span>Einsatzmodus (Feuerwehr, Rettung)</span>
+              </label>
+              <p style="font-size:11px; color:var(--text-muted); margin-top:8px; opacity:0.7;">
+                🔵 Höhere Geschwindigkeiten, optimiert für Einsatzfahrzeuge
+              </p>
             </div>
 
             <!-- Map / Tile Source -->
@@ -259,6 +284,25 @@
               <div class="shortcut-item"><kbd>Esc</kbd> <span>Suche schließen</span></div>
               <div class="shortcut-item"><kbd>↑ ↓</kbd> <span>Suche navigieren</span></div>
               <div class="shortcut-item"><kbd>Rechtsklick</kbd> <span>Marker löschen</span></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="card ai-card collapsed" id="aiCard">
+          <div class="card-header">
+            <h2>🤖 KI-Assistent</h2>
+            <button id="aiToggle" class="btn btn-sm btn-outline" aria-expanded="false">›</button>
+          </div>
+          <div class="card-body" id="aiBody" style="display:none">
+            <div id="aiStatus" style="font-size:12px; color:var(--text-muted); margin-bottom:8px;">Prüfe KI-Verfügbarkeit...</div>
+            <div id="aiModelSelect" style="margin-bottom:8px; display:none;">
+              <label class="setting-label">Modell</label>
+              <select id="aiModel" class="setting-select"></select>
+            </div>
+            <div id="aiMessages" class="ai-messages" style="max-height:200px; overflow-y:auto; margin-bottom:8px;"></div>
+            <div style="display:flex; gap:6px;">
+              <input id="aiPrompt" type="text" placeholder="Frage zur Route oder Navigation..." style="flex:1;" autocomplete="off"/>
+              <button id="aiSend" class="btn btn-primary btn-sm" disabled>Senden</button>
             </div>
           </div>
         </section>

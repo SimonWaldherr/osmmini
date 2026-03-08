@@ -147,13 +147,15 @@ func profileDefByID(id VehicleProfile) *VehicleProfileDef {
 // Values influence penalties (turns, crossings) and maximum assumed speed
 // used by heuristics and cost calculations.
 type ProWeights struct {
-	LeftTurn       float64 `json:"left_turn"`
-	RightTurn      float64 `json:"right_turn"`
-	UTurn          float64 `json:"u_turn"`
-	Crossing       float64 `json:"crossing"`
-	MaxSpeedKph    float64 `json:"max_speed_kph"`
-	VehicleHeightM float64 `json:"vehicle_height_m"`
-	VehicleWeightT float64 `json:"vehicle_weight_t"`
+	LeftTurn            float64 `json:"left_turn"`
+	RightTurn           float64 `json:"right_turn"`
+	UTurn               float64 `json:"u_turn"`
+	Crossing            float64 `json:"crossing"`
+	MaxSpeedKph         float64 `json:"max_speed_kph"`
+	VehicleHeightM      float64 `json:"vehicle_height_m"`
+	VehicleWeightT      float64 `json:"vehicle_weight_t"`
+	NoLeftTurn          bool    `json:"no_left_turn,omitempty"`
+	TrafficLightPenalty float64 `json:"traffic_light_penalty,omitempty"`
 }
 
 // RouteOptions are supplied to routing calls to control engine, objective
@@ -166,6 +168,7 @@ type RouteOptions struct {
 	Profile   VehicleProfile `json:"profile,omitempty"`
 	Pro       bool           `json:"pro"`
 	Weights   ProWeights     `json:"weights"`
+  EmergencyMode bool        `json:"emergency_mode,omitempty"`
 }
 
 func (o RouteOptions) withDefaults() RouteOptions {
@@ -1477,6 +1480,19 @@ func (r *Router) heuristic(from, to int64, opt RouteOptions) float64 {
 }
 
 func (r *Router) edgeCost(e Edge, opt RouteOptions) float64 {
+	if opt.EmergencyMode {
+		// BOS/emergency: minimize time, use higher assumed speeds
+		v := e.SpeedKph
+		if v <= 0 {
+			v = 60
+		}
+		// Emergency vehicles can exceed normal speed limits by ~30%
+		v *= 1.3
+		if v < 10 {
+			v = 10
+		}
+		return e.DistM * 3.6 / v
+	}
 	switch opt.Objective {
 	case ObjectiveDuration:
 		return edgeTimeSeconds(e, opt)
@@ -1498,10 +1514,18 @@ func (r *Router) transitionPenalty(prev, cur, next int64, opt RouteOptions) floa
 	if opt.Weights.Crossing > 0 && len(r.g.adj[cur]) > 2 {
 		pen += opt.Weights.Crossing
 	}
+	// Traffic light penalty at intersections with more than 2 edges
+	if opt.Weights.TrafficLightPenalty > 0 && len(r.g.adj[cur]) > 2 {
+		pen += opt.Weights.TrafficLightPenalty
+	}
 	tt := r.turnType(prev, cur, next)
 	switch tt {
 	case turnLeft:
-		pen += opt.Weights.LeftTurn
+		if opt.Weights.NoLeftTurn {
+			pen += noLeftTurnPenalty
+		} else {
+			pen += opt.Weights.LeftTurn
+		}
 	case turnRight:
 		pen += opt.Weights.RightTurn
 	case turnUTurn:
@@ -1518,6 +1542,10 @@ const (
 	turnRight
 	turnUTurn
 )
+
+// noLeftTurnPenalty is a very high cost added when NoLeftTurn is enabled,
+// effectively forbidding left turns.
+const noLeftTurnPenalty = 1e6
 
 func (r *Router) turnType(prev, cur, next int64) turnKind {
 	p, ok1 := r.g.coords[prev]
