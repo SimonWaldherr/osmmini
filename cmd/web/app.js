@@ -12,13 +12,69 @@ try {
 }
 
 const map = L.map('map').setView([48.7, 12.7], 10);
-L.tileLayer('/tiles/{z}/{x}/{y}.png', { 
-  maxZoom: 19,
-  attribution: '',
-  updateWhenIdle: true,
-  updateWhenZooming: false,
-  keepBuffer: 2
-}).addTo(map);
+let currentTileLayer = null;
+
+// Dynamic script/css loader helpers (used for MapLibre GL lazy-loading)
+function _loadScript(src) {
+  return new Promise((resolve, reject) => {
+    if (document.querySelector(`script[src="${src}"]`)) { resolve(); return; }
+    const s = document.createElement('script');
+    s.src = src;
+    s.onload = resolve; s.onerror = reject;
+    document.head.appendChild(s);
+  });
+}
+function _loadCss(href) {
+  if (document.querySelector(`link[href="${href}"]`)) return;
+  const l = document.createElement('link');
+  l.rel = 'stylesheet'; l.href = href;
+  document.head.appendChild(l);
+}
+function _loadMapLibreGL() {
+  if (window.maplibregl && window.L && L.maplibreGL) return Promise.resolve();
+  _loadCss('https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css');
+  return _loadScript('https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js')
+    .then(() => _loadScript('https://unpkg.com/@maplibre/maplibre-gl-leaflet@0.0.20/leaflet-maplibre-gl.js'));
+}
+
+// Apply a tile/map layer from settings. Removes the old layer first.
+async function applyTileLayer(settings) {
+  if (currentTileLayer) { map.removeLayer(currentTileLayer); }
+  currentTileLayer = null;
+  const tiles = (settings && settings.tiles) || {};
+  const mapType = tiles.map_type || 'raster';
+  const attribution = tiles.attribution || '';
+
+  if (mapType === 'vector' && tiles.style_url) {
+    try {
+      await _loadMapLibreGL();
+      currentTileLayer = L.maplibreGL({ style: tiles.style_url, attribution }).addTo(map);
+      return;
+    } catch (e) {
+      console.warn('MapLibre GL load failed, falling back to raster tiles', e);
+    }
+  } else if (mapType === 'wms' && tiles.upstream) {
+    currentTileLayer = L.tileLayer.wms(tiles.upstream, {
+      layers: tiles.wms_layers || '',
+      format: 'image/png',
+      transparent: false,
+      attribution,
+      maxZoom: 18,
+    }).addTo(map);
+    return;
+  }
+  // Default: raster tiles via the server proxy
+  currentTileLayer = L.tileLayer('/tiles/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution,
+    updateWhenIdle: true,
+    updateWhenZooming: false,
+    keepBuffer: 2,
+  }).addTo(map);
+}
+
+// Initialize the tile layer from preloaded (server-side) settings
+applyTileLayer(preloadedSettings);
 
 // Toast notification system
 function showToast(message, type = 'info', duration = 3000) {
@@ -191,6 +247,7 @@ function routeOptionsFromUI(){
   return {
     engine: document.getElementById('engine').value,
     objective: document.getElementById('objective').value,
+    profile: document.getElementById('profile')?.value || '',
     pro: document.getElementById('pro').checked,
     emergency_mode: document.getElementById('emergencyMode').checked,
     weights: {
@@ -735,6 +792,8 @@ function initializeSettingsUI(s) {
     if(s.routing) {
         document.getElementById('engine').value = (s.routing.engine || 'astar');
         document.getElementById('objective').value = s.routing.objective || 'duration';
+        const profileEl = document.getElementById('profile');
+        if (profileEl) profileEl.value = s.routing.profile || '';
         document.getElementById('pro').checked = !!s.routing.pro;
         document.getElementById('emergencyMode').checked = !!s.routing.emergency_mode;
         if(s.routing.pro) weights.classList.remove('hidden');
@@ -807,6 +866,136 @@ function initializeSettingsUI(s) {
       row.appendChild(inp);
       speedContainer.appendChild(row);
     });
+
+    // populate tile/map source UI
+    const tiles = s.tiles || {};
+    const mt = tiles.map_type || 'raster';
+    const mtEl = document.getElementById('mapType');
+    if (mtEl) mtEl.value = mt;
+    const upEl = document.getElementById('tileUpstream');
+    if (upEl) upEl.value = tiles.upstream || '';
+    const suEl = document.getElementById('tileStyleUrl');
+    if (suEl) suEl.value = tiles.style_url || '';
+    const wlEl = document.getElementById('wmsLayers');
+    if (wlEl) wlEl.value = tiles.wms_layers || '';
+    const atEl = document.getElementById('tileAttribution');
+    if (atEl) atEl.value = tiles.attribution || '';
+    updateMapTypeVisibility(mt);
+}
+
+// Show/hide tile source fields based on selected map type
+function updateMapTypeVisibility(mt) {
+  const upstreamRow = document.getElementById('upstreamRow');
+  const styleUrlRow = document.getElementById('styleUrlRow');
+  const wmsLayersRow = document.getElementById('wmsLayersRow');
+  if (upstreamRow) upstreamRow.style.display = (mt === 'vector') ? 'none' : '';
+  if (styleUrlRow) styleUrlRow.style.display = (mt === 'vector') ? '' : 'none';
+  if (wmsLayersRow) wmsLayersRow.style.display = (mt === 'wms') ? '' : 'none';
+}
+
+// Tile preset loading from API
+async function loadTilePresets() {
+  try {
+    const res = await fetch('/api/v1/tile-sources');
+    if (!res.ok) return;
+    const presets = await res.json();
+    const sel = document.getElementById('tilePreset');
+    if (!sel) return;
+    // remove old dynamic options (preserve the blank '— Benutzerdefiniert —' entry)
+    Array.from(sel.options).forEach(o => { if (o.value !== '') o.remove(); });
+    presets.forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p.id;
+      opt.textContent = p.label;
+      opt.dataset.preset = JSON.stringify(p);
+      sel.appendChild(opt);
+    });
+    // set current selection based on active upstream/style_url
+    const curSettings = preloadedSettings || {};
+    const curTiles = curSettings.tiles || {};
+    const match = presets.find(p =>
+      (p.upstream && p.upstream === curTiles.upstream) ||
+      (p.style_url && p.style_url === curTiles.style_url)
+    );
+    if (match) sel.value = match.id;
+  } catch (e) {
+    console.warn('Failed to load tile presets:', e);
+  }
+}
+loadTilePresets();
+
+// Handle map type selector change
+const mapTypeEl = document.getElementById('mapType');
+if (mapTypeEl) {
+  mapTypeEl.addEventListener('change', () => updateMapTypeVisibility(mapTypeEl.value));
+}
+
+// Handle tile preset selector change — auto-fill fields
+const tilePresetEl = document.getElementById('tilePreset');
+if (tilePresetEl) {
+  tilePresetEl.addEventListener('change', function() {
+    const opt = this.options[this.selectedIndex];
+    if (!opt || !opt.dataset.preset) return;
+    try {
+      const p = JSON.parse(opt.dataset.preset);
+      const mtEl = document.getElementById('mapType');
+      if (mtEl) mtEl.value = p.map_type || 'raster';
+      const upEl = document.getElementById('tileUpstream');
+      if (upEl) upEl.value = p.upstream || '';
+      const suEl = document.getElementById('tileStyleUrl');
+      if (suEl) suEl.value = p.style_url || '';
+      const wlEl = document.getElementById('wmsLayers');
+      if (wlEl) wlEl.value = p.wms_layers || '';
+      const atEl = document.getElementById('tileAttribution');
+      if (atEl) atEl.value = p.attribution || '';
+      updateMapTypeVisibility(p.map_type || 'raster');
+    } catch (e) {
+      console.warn('Failed to parse preset data:', e);
+    }});
+}
+
+// Vehicle profile loading from API
+async function loadVehicleProfiles() {
+  try {
+    const res = await fetch('/api/v1/profiles');
+    if (!res.ok) return;
+    const profiles = await res.json();
+    const sel = document.getElementById('profile');
+    if (!sel) return;
+    // remove old dynamic options (preserve the blank entry)
+    Array.from(sel.options).forEach(o => { if (o.value !== '') o.remove(); });
+    profiles.forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p.id;
+      opt.textContent = `${p.icon || ''} ${p.label}`.trim();
+      sel.appendChild(opt);
+    });
+    // restore active profile from preloaded settings
+    const curProfile = preloadedSettings?.routing?.profile || '';
+    if (curProfile) sel.value = curProfile;
+  } catch (e) {
+    console.warn('Failed to load vehicle profiles:', e);
+  }
+}
+loadVehicleProfiles();
+
+// When a profile is selected, auto-apply its default objective if the user
+// hasn't explicitly changed it.
+const profileSelEl = document.getElementById('profile');
+if (profileSelEl) {
+  profileSelEl.addEventListener('change', async function() {
+    if (!this.value) return; // custom — no auto-apply
+    try {
+      const res = await fetch('/api/v1/profiles');
+      if (!res.ok) return;
+      const profiles = await res.json();
+      const def = profiles.find(p => p.id === this.value);
+      if (def) {
+        const objEl = document.getElementById('objective');
+        if (objEl && def.objective) objEl.value = def.objective;
+      }
+    } catch (e) { /* non-critical */ }
+  });
 }
 
 // Load settings (use preloaded or fetch)
@@ -842,8 +1031,22 @@ document.getElementById('save').onclick = async () => {
     const speedInputs = Array.from(document.querySelectorAll('.speed-input'));
     cur.default_highway_speeds = cur.default_highway_speeds || {};
     speedInputs.forEach(si => { const k=si.dataset.type; const v=parseFloat(si.value); if(!isNaN(v)) cur.default_highway_speeds[k]=v; });
+    // collect tile/map source settings
+    cur.tiles = cur.tiles || {};
+    const mtEl = document.getElementById('mapType');
+    if (mtEl) cur.tiles.map_type = mtEl.value;
+    const upEl = document.getElementById('tileUpstream');
+    if (upEl) cur.tiles.upstream = upEl.value;
+    const suEl = document.getElementById('tileStyleUrl');
+    if (suEl) cur.tiles.style_url = suEl.value;
+    const wlEl = document.getElementById('wmsLayers');
+    if (wlEl) cur.tiles.wms_layers = wlEl.value;
+    const atEl = document.getElementById('tileAttribution');
+    if (atEl) cur.tiles.attribution = atEl.value;
     await apiPutSettings(cur);
     apiCache.delete('settings'); // Invalidate cache
+    // Refresh map tile layer with updated settings
+    applyTileLayer(cur);
     btn.innerHTML = '✅ Gespeichert';
     showToast('Einstellungen erfolgreich gespeichert', 'success', 2000);
     setTimeout(() => { btn.innerHTML = origText; btn.disabled = false; }, 1500);
@@ -909,6 +1112,7 @@ function setupCollapsibleSection(headerId, contentId, storageKey) {
 
 setupCollapsibleSection('highwayHeader', 'allowedHighways', 'highwaysOpen');
 setupCollapsibleSection('speedHeader', 'speedDefaults', 'speedsOpen');
+setupCollapsibleSection('mapHeader', 'mapSettings', 'mapSettingsOpen');
 
 // Intersection Observer for lazy rendering of collapsed sections
 if ('IntersectionObserver' in window) {
