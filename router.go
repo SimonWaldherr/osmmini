@@ -1393,7 +1393,7 @@ func (r *Router) transitionPenalty(prev, cur, next int64, opt RouteOptions) floa
 	switch tt {
 	case turnLeft:
 		if opt.Weights.NoLeftTurn {
-			pen += 1e6 // effectively forbid left turns
+			pen += noLeftTurnPenalty
 		} else {
 			pen += opt.Weights.LeftTurn
 		}
@@ -1413,6 +1413,10 @@ const (
 	turnRight
 	turnUTurn
 )
+
+// noLeftTurnPenalty is a very high cost added when NoLeftTurn is enabled,
+// effectively forbidding left turns.
+const noLeftTurnPenalty = 1e6
 
 func (r *Router) turnType(prev, cur, next int64) turnKind {
 	p, ok1 := r.g.coords[prev]

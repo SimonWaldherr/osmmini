@@ -30,6 +30,12 @@ var embedded embed.FS
 
 const buildVersion = "dev"
 
+// aiQueryTimeout is the maximum time allowed for an AI query to complete.
+const aiQueryTimeout = 120 * time.Second
+
+// maxAIResponseBytes is the maximum response body size read from AI providers.
+const maxAIResponseBytes = 1 << 20
+
 // ---- Settings ----
 
 // TileSettings controls the tile cache proxy behavior.
@@ -1194,11 +1200,28 @@ func (s *server) tspGreedy(ctx context.Context, startNode, endNode int64, stops 
 
 // tsp2opt applies the 2-opt local search improvement to the given tour order.
 // It repeatedly reverses sub-segments of the tour if doing so reduces total cost,
-// while respecting dependency constraints.
+// while respecting dependency constraints. Route costs are cached to avoid
+// redundant pathfinding computations.
 func (s *server) tsp2opt(ctx context.Context, startNode, endNode int64, stops []stopR, pre []uint64, opt osmmini.RouteOptions, order []int) []int {
 	n := len(order)
 	if n < 4 {
 		return order
+	}
+
+	// Cache route costs between node pairs to avoid repeated pathfinding
+	type nodePair struct{ from, to int64 }
+	costCache := make(map[nodePair]float64)
+	cachedCost := func(from, to int64) float64 {
+		key := nodePair{from, to}
+		if c, ok := costCache[key]; ok {
+			return c
+		}
+		c, err := s.router.RouteCostWithOptions(ctx, from, to, opt)
+		if err != nil {
+			c = math.MaxFloat64
+		}
+		costCache[key] = c
+		return c
 	}
 
 	// helper to compute total tour cost for a given order
@@ -1206,15 +1229,15 @@ func (s *server) tsp2opt(ctx context.Context, startNode, endNode int64, stops []
 		total := 0.0
 		prev := startNode
 		for _, idx := range ord {
-			c, err := s.router.RouteCostWithOptions(ctx, prev, stops[idx].node, opt)
-			if err != nil {
+			c := cachedCost(prev, stops[idx].node)
+			if c >= math.MaxFloat64/4 {
 				return math.MaxFloat64
 			}
 			total += c
 			prev = stops[idx].node
 		}
-		c, err := s.router.RouteCostWithOptions(ctx, prev, endNode, opt)
-		if err != nil {
+		c := cachedCost(prev, endNode)
+		if c >= math.MaxFloat64/4 {
 			return math.MaxFloat64
 		}
 		total += c
@@ -1487,7 +1510,7 @@ func probeAIProvider(ctx context.Context, name, baseURL, modelsPath string) aiPr
 	if resp.StatusCode != http.StatusOK {
 		return p
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxAIResponseBytes))
 	if err != nil {
 		return p
 	}
@@ -1555,7 +1578,7 @@ func (s *server) handleAIQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req aiQueryRequest
-	if err := readJSON(w, r, &req, 1<<20); err != nil {
+	if err := readJSON(w, r, &req, maxAIResponseBytes); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
@@ -1564,7 +1587,7 @@ func (s *server) handleAIQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), aiQueryTimeout)
 	defer cancel()
 
 	// Build system prompt with context about available routing features
@@ -1638,7 +1661,7 @@ func queryOllama(ctx context.Context, baseURL, model, systemPrompt, userPrompt s
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 120 * time.Second}
+	client := &http.Client{Timeout: aiQueryTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -1647,7 +1670,7 @@ func queryOllama(ctx context.Context, baseURL, model, systemPrompt, userPrompt s
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("ollama returned %d", resp.StatusCode)
 	}
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxAIResponseBytes))
 	if err != nil {
 		return "", err
 	}
@@ -1682,7 +1705,7 @@ func queryOpenAICompatible(ctx context.Context, baseURL, model, systemPrompt, us
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 120 * time.Second}
+	client := &http.Client{Timeout: aiQueryTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -1691,7 +1714,7 @@ func queryOpenAICompatible(ctx context.Context, baseURL, model, systemPrompt, us
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("lm studio returned %d", resp.StatusCode)
 	}
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxAIResponseBytes))
 	if err != nil {
 		return "", err
 	}
