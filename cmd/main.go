@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,20 +25,88 @@ import (
 	osmmini "simonwaldherr.de/go/osmmini"
 )
 
-//go:embed web/index.html web/style.css web/static/* web/static/leaflet/* docs/* api/openapi.yaml
+//go:embed web/index.html web/style.css web/app.js docs/* api/openapi.yaml
 var embedded embed.FS
 
 const buildVersion = "dev"
 
 // ---- Settings ----
 
-// TileSettings controls the tile cache proxy behavior.
+// TileSettings controls the tile cache / map display behavior.
 // These settings are persisted in the settings file and can be updated
 // at runtime via the settings API.
 type TileSettings struct {
-	CacheDir  string `json:"cache_dir"`
-	Upstream  string `json:"upstream"`
-	UserAgent string `json:"user_agent"`
+	CacheDir     string `json:"cache_dir"`
+	Upstream     string `json:"upstream"`
+	UserAgent    string `json:"user_agent"`
+	MapType      string `json:"map_type,omitempty"`      // "raster" (default), "vector", "wms"
+	StyleURL     string `json:"style_url,omitempty"`     // vector: MapLibre GL style URL
+	WMSLayers    string `json:"wms_layers,omitempty"`    // wms: comma-separated layer names
+	Attribution  string `json:"attribution,omitempty"`   // attribution text shown on the map
+	MemCacheSize int    `json:"mem_cache_size,omitempty"` // L1 in-memory tile cache capacity (0 = default 512)
+}
+
+// TileSourcePreset is a named tile/map-source configuration shown in the UI preset picker.
+type TileSourcePreset struct {
+	ID          string `json:"id"`
+	Label       string `json:"label"`
+	MapType     string `json:"map_type"`
+	Upstream    string `json:"upstream,omitempty"`
+	StyleURL    string `json:"style_url,omitempty"`
+	WMSLayers   string `json:"wms_layers,omitempty"`
+	Attribution string `json:"attribution"`
+	MaxZoom     int    `json:"max_zoom,omitempty"`
+}
+
+// BuiltinTilePresets lists the map/tile sources available out of the box.
+// These are served via GET /api/v1/tile-sources.
+var BuiltinTilePresets = []TileSourcePreset{
+	{
+		ID: "osm", Label: "OpenStreetMap Standard", MapType: "raster",
+		Upstream:    "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+		Attribution: "© OpenStreetMap contributors", MaxZoom: 19,
+	},
+	{
+		ID: "osm_de", Label: "OpenStreetMap Deutschland", MapType: "raster",
+		Upstream:    "https://tile.openstreetmap.de/{z}/{x}/{y}.png",
+		Attribution: "© OpenStreetMap contributors", MaxZoom: 18,
+	},
+	{
+		ID: "osm_hot", Label: "OSM Humanitarian", MapType: "raster",
+		Upstream:    "https://a.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png",
+		Attribution: "© OpenStreetMap contributors, Tiles by HOT", MaxZoom: 19,
+	},
+	{
+		ID: "osm_topo", Label: "OpenTopoMap", MapType: "raster",
+		Upstream:    "https://tile.opentopomap.org/{z}/{x}/{y}.png",
+		Attribution: "© OpenStreetMap contributors, © OpenTopoMap", MaxZoom: 17,
+	},
+	{
+		ID: "carto_light", Label: "CartoDB Positron (hell)", MapType: "raster",
+		Upstream:    "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
+		Attribution: "© OpenStreetMap contributors © CARTO", MaxZoom: 19,
+	},
+	{
+		ID: "carto_dark", Label: "CartoDB Dark Matter (dunkel)", MapType: "raster",
+		Upstream:    "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+		Attribution: "© OpenStreetMap contributors © CARTO", MaxZoom: 19,
+	},
+	{
+		ID: "basemap_de", Label: "Basemap.de (BKG)", MapType: "raster",
+		Upstream:    "https://sgx.geodatenzentrum.de/wmts_basemapde/tile/1.0.0/basemap_de_webkarte/default/GLOBAL_WEBMERCATOR/{z}/{y}/{x}.png",
+		Attribution: "© Bundesamt für Kartographie und Geodäsie (BKG)", MaxZoom: 18,
+	},
+	{
+		ID: "geodaten_bavaria", Label: "Geodaten Bayern – BayernAtlas", MapType: "wms",
+		Upstream:    "https://geoservices.bayern.de/wms/v2/ogc_bayernatlas.cgi",
+		WMSLayers:   "by_dtk",
+		Attribution: "© Bayerische Vermessungsverwaltung", MaxZoom: 18,
+	},
+	{
+		ID: "maplibre_demo", Label: "MapLibre Demo Tiles (Vektor)", MapType: "vector",
+		StyleURL:    "https://demotiles.maplibre.org/style.json",
+		Attribution: "© MapLibre", MaxZoom: 19,
+	},
 }
 
 // Settings holds the server configuration persisted in the settings.json
@@ -78,9 +147,12 @@ func DefaultSettings(cacheDir, upstream string) Settings {
 			},
 		},
 		Tiles: TileSettings{
-			CacheDir:  cacheDir,
-			Upstream:  upstream,
-			UserAgent: "osmmini-routerd/1.0 (offline routing)",
+			CacheDir:     cacheDir,
+			Upstream:     upstream,
+			UserAgent:    "osmmini-routerd/1.0 (offline routing)",
+			MapType:      "raster",
+			Attribution:  "© OpenStreetMap contributors",
+			MemCacheSize: tileMemCacheDefaultMaxItems,
 		},
 		// DefaultHighwaySpeeds: fallback speeds (kph) per highway type.
 		// These are the built-in defaults used when no "default_highway_speeds"
@@ -162,24 +234,91 @@ func (s *SettingsStore) saveLocked() error {
 
 // ---- Tile cache proxy ----
 
+// tileCacheKey is the lookup key for a single tile (zoom / x / y).
+type tileCacheKey struct{ z, x, y int }
+
+// tileMemEntry holds a tile's raw bytes and its L1 expiry time.
+type tileMemEntry struct {
+	data      []byte
+	expiresAt time.Time
+}
+
+// tileMemCacheDefaultMaxItems is the default in-memory tile cache capacity.
+const tileMemCacheDefaultMaxItems = 512
+
+// tileCacheStats tracks hit/miss counters for observability.
+type tileCacheStats struct {
+	memHits  int64
+	diskHits int64
+	fetches  int64
+	errors   int64
+}
+
+// TileCache proxies /tiles/{z}/{x}/{y}.png requests using a two-tier cache:
+//
+//   - L1: bounded in-memory cache (fast; lost on restart)
+//   - L2: disk cache under cfg.CacheDir (persistent across restarts)
+//
+// Request flow: L1 hit → serve immediately; L2 hit → warm L1, serve;
+// miss → fetch upstream, write to L1+L2, serve.
 type TileCache struct {
 	mu     sync.RWMutex
 	cfg    TileSettings
 	client *http.Client
+
+	// L1 in-memory cache
+	mem    map[tileCacheKey]*tileMemEntry
+	memMax int
+
+	stats tileCacheStats
+	stopC chan struct{} // closed to stop the background eviction goroutine
 }
 
 func NewTileCache(cfg TileSettings) *TileCache {
-	return &TileCache{
-		cfg: cfg,
-		client: &http.Client{
-			Timeout: 25 * time.Second,
-		},
+	memMax := cfg.MemCacheSize
+	if memMax <= 0 {
+		memMax = tileMemCacheDefaultMaxItems
 	}
+	tc := &TileCache{
+		cfg:    cfg,
+		client: &http.Client{Timeout: 25 * time.Second},
+		mem:    make(map[tileCacheKey]*tileMemEntry, memMax),
+		memMax: memMax,
+		stopC:  make(chan struct{}),
+	}
+	// Background L1 eviction: purge expired entries every hour.
+	go func() {
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				tc.evictMem()
+			case <-tc.stopC:
+				return
+			}
+		}
+	}()
+	return tc
+}
+
+// Close stops the background eviction goroutine.
+func (tc *TileCache) Close() {
+	close(tc.stopC)
 }
 
 func (tc *TileCache) Update(cfg TileSettings) {
+	newMax := cfg.MemCacheSize
+	if newMax <= 0 {
+		newMax = tileMemCacheDefaultMaxItems
+	}
 	tc.mu.Lock()
 	tc.cfg = cfg
+	if newMax != tc.memMax {
+		tc.memMax = newMax
+		// Clear L1 on capacity change so the new limit is respected immediately.
+		tc.mem = make(map[tileCacheKey]*tileMemEntry, tc.memMax)
+	}
 	tc.mu.Unlock()
 }
 
@@ -187,6 +326,101 @@ func (tc *TileCache) cfgCopy() TileSettings {
 	tc.mu.RLock()
 	defer tc.mu.RUnlock()
 	return tc.cfg
+}
+
+// Stats returns a snapshot of cache hit/miss counters.
+func (tc *TileCache) Stats() map[string]int64 {
+	tc.mu.RLock()
+	defer tc.mu.RUnlock()
+	return map[string]int64{
+		"mem_size":  int64(len(tc.mem)),
+		"mem_hits":  tc.stats.memHits,
+		"disk_hits": tc.stats.diskHits,
+		"fetches":   tc.stats.fetches,
+		"errors":    tc.stats.errors,
+	}
+}
+
+// sortTileEntriesByExpiry sorts a slice of (key, expiry) pairs ascending
+// by expiry time using slices.SortFunc for O(n log n) performance.
+type tileKV struct {
+	k tileCacheKey
+	t time.Time
+}
+
+func sortTileEntriesByExpiry(entries []tileKV) {
+	slices.SortFunc(entries, func(a, b tileKV) int {
+		return a.t.Compare(b.t)
+	})
+}
+
+// evictMem removes expired L1 entries under the write lock.
+// If still over capacity after expiry removal, it removes the oldest 25%.
+func (tc *TileCache) evictMem() {
+	now := time.Now()
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	for k, e := range tc.mem {
+		if now.After(e.expiresAt) {
+			delete(tc.mem, k)
+		}
+	}
+	if len(tc.mem) <= tc.memMax {
+		return
+	}
+	// Still over capacity: sort by expiry and remove oldest 25%.
+	entries := make([]tileKV, 0, len(tc.mem))
+	for k, e := range tc.mem {
+		entries = append(entries, tileKV{k, e.expiresAt})
+	}
+	sortTileEntriesByExpiry(entries)
+	n := max(1, len(entries)/4)
+	for _, kv := range entries[:n] {
+		delete(tc.mem, kv.k)
+	}
+}
+
+// getFromMem checks the L1 cache while holding the read lock throughout,
+// ensuring the expiry check is race-free.
+func (tc *TileCache) getFromMem(key tileCacheKey) ([]byte, bool) {
+	tc.mu.RLock()
+	defer tc.mu.RUnlock()
+	e, ok := tc.mem[key]
+	if !ok || time.Now().After(e.expiresAt) {
+		return nil, false
+	}
+	return e.data, true
+}
+
+// setInMem inserts or updates an L1 entry with a 24-hour TTL.
+// When at capacity it first removes expired entries, then sorts and
+// removes the oldest 25% if still full.
+func (tc *TileCache) setInMem(key tileCacheKey, data []byte) {
+	expiry := time.Now().Add(24 * time.Hour)
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	if len(tc.mem) >= tc.memMax {
+		// Pass 1: purge expired entries.
+		now := time.Now()
+		for k, e := range tc.mem {
+			if now.After(e.expiresAt) {
+				delete(tc.mem, k)
+			}
+		}
+		// Pass 2: if still full, remove oldest 25% by expiry.
+		if len(tc.mem) >= tc.memMax {
+			entries := make([]tileKV, 0, len(tc.mem))
+			for k, e := range tc.mem {
+				entries = append(entries, tileKV{k, e.expiresAt})
+			}
+			sortTileEntriesByExpiry(entries)
+			n := max(1, len(entries)/4)
+			for _, kv := range entries[:n] {
+				delete(tc.mem, kv.k)
+			}
+		}
+	}
+	tc.mem[key] = &tileMemEntry{data: data, expiresAt: expiry}
 }
 
 func (tc *TileCache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -214,15 +448,30 @@ func (tc *TileCache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	key := tileCacheKey{z, x, y}
 	cfg := tc.cfgCopy()
-	cachePath := filepath.Join(cfg.CacheDir, strconv.Itoa(z), strconv.Itoa(x), fmt.Sprintf("%d.png", y))
-	if b, ok := readFileIfExists(cachePath); ok {
-		w.Header().Set("Content-Type", "image/png")
-		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-		_, _ = w.Write(b)
+
+	// L1: in-memory
+	if data, ok := tc.getFromMem(key); ok {
+		tc.mu.Lock()
+		tc.stats.memHits++
+		tc.mu.Unlock()
+		serveTile(w, data)
 		return
 	}
 
+	// L2: disk
+	cachePath := filepath.Join(cfg.CacheDir, strconv.Itoa(z), strconv.Itoa(x), fmt.Sprintf("%d.png", y))
+	if data, ok := readFileIfExists(cachePath); ok {
+		tc.mu.Lock()
+		tc.stats.diskHits++
+		tc.mu.Unlock()
+		tc.setInMem(key, data) // warm L1
+		serveTile(w, data)
+		return
+	}
+
+	// Miss: fetch from upstream
 	up := cfg.Upstream
 	up = strings.ReplaceAll(up, "{z}", strconv.Itoa(z))
 	up = strings.ReplaceAll(up, "{x}", strconv.Itoa(x))
@@ -234,26 +483,45 @@ func (tc *TileCache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := tc.client.Do(req)
 	if err != nil {
+		tc.mu.Lock()
+		tc.stats.errors++
+		tc.mu.Unlock()
 		http.Error(w, "tile upstream error", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
+		tc.mu.Lock()
+		tc.stats.errors++
+		tc.mu.Unlock()
 		http.Error(w, "tile upstream non-200", http.StatusBadGateway)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if err != nil || len(body) == 0 {
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil || len(data) == 0 {
+		tc.mu.Lock()
+		tc.stats.errors++
+		tc.mu.Unlock()
 		http.Error(w, "tile read error", http.StatusBadGateway)
 		return
 	}
 
+	// Persist to L2 (disk) and warm L1.
 	_ = os.MkdirAll(filepath.Dir(cachePath), 0o755)
-	_ = os.WriteFile(cachePath, body, 0o644)
+	_ = os.WriteFile(cachePath, data, 0o644)
+	tc.setInMem(key, data)
 
+	tc.mu.Lock()
+	tc.stats.fetches++
+	tc.mu.Unlock()
+
+	serveTile(w, data)
+}
+
+func serveTile(w http.ResponseWriter, data []byte) {
 	w.Header().Set("Content-Type", "image/png")
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-	_, _ = w.Write(body)
+	_, _ = w.Write(data)
 }
 
 func readFileIfExists(path string) ([]byte, bool) {
@@ -301,6 +569,7 @@ type RouteResponse struct {
 	To            RoutePoint         `json:"to"`
 	Engine        string             `json:"engine"`
 	Objective     string             `json:"objective"`
+	Profile       string             `json:"profile,omitempty"`
 	Cost          float64            `json:"cost"`
 	DistanceM     float64            `json:"distance_m"`
 	DurationS     float64            `json:"duration_s"`
@@ -308,6 +577,7 @@ type RouteResponse struct {
 	GoogleMapsURL string             `json:"google_maps_url"`
 	AppleMapsURL  string             `json:"apple_maps_url"`
 	Steps         []osmmini.Maneuver `json:"steps,omitempty"`
+	Cached        bool               `json:"cached,omitempty"`
 }
 
 type TripStop struct {
@@ -357,6 +627,147 @@ type TripSolveResponse struct {
 	AppleMapsURL  string             `json:"apple_maps_url"`
 }
 
+// ---- Route result cache ----
+
+// routeCacheKey uniquely identifies a route request for caching purposes.
+type routeCacheKey struct {
+	fromNode int64
+	toNode   int64
+	// include routing-relevant options in the key
+	engine    string
+	objective string
+	profile   string
+	maxSpeed  float64
+	heightM   float64
+	weightT   float64
+}
+
+// routeCacheEntry holds a cached route response with its expiry time.
+type routeCacheEntry struct {
+	resp      RouteResponse
+	expiresAt time.Time
+}
+
+// routeCacheDefaultMaxItems is the default capacity bound for the route cache.
+const routeCacheDefaultMaxItems = 4096
+
+// RouteCache is a bounded in-memory cache for route responses.
+// It uses a simple RW-mutex protected map with TTL eviction.
+// Maximum capacity is capped so it never grows unbounded.
+type RouteCache struct {
+	mu       sync.RWMutex
+	entries  map[routeCacheKey]*routeCacheEntry
+	ttl      time.Duration
+	maxItems int
+}
+
+func newRouteCache(ttl time.Duration, maxItems int) *RouteCache {
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	if maxItems <= 0 {
+		maxItems = routeCacheDefaultMaxItems
+	}
+	c := &RouteCache{
+		entries:  make(map[routeCacheKey]*routeCacheEntry, 64),
+		ttl:      ttl,
+		maxItems: maxItems,
+	}
+	// Background eviction goroutine: purge expired entries every TTL/2.
+	go func() {
+		ticker := time.NewTicker(ttl / 2)
+		defer ticker.Stop()
+		for range ticker.C {
+			c.evict()
+		}
+	}()
+	return c
+}
+
+func (c *RouteCache) cacheKey(fromNode, toNode int64, opt osmmini.RouteOptions) routeCacheKey {
+	return routeCacheKey{
+		fromNode:  fromNode,
+		toNode:    toNode,
+		engine:    string(opt.Engine),
+		objective: string(opt.Objective),
+		profile:   string(opt.Profile),
+		maxSpeed:  opt.Weights.MaxSpeedKph,
+		heightM:   opt.Weights.VehicleHeightM,
+		weightT:   opt.Weights.VehicleWeightT,
+	}
+}
+
+func (c *RouteCache) get(key routeCacheKey) (RouteResponse, bool) {
+	c.mu.RLock()
+	e, ok := c.entries[key]
+	c.mu.RUnlock()
+	if !ok || time.Now().After(e.expiresAt) {
+		return RouteResponse{}, false
+	}
+	return e.resp, true
+}
+
+func (c *RouteCache) set(key routeCacheKey, resp RouteResponse) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// When at capacity, evict all entries that are already expired.
+	// If still at capacity afterwards, remove entries with the earliest
+	// expiry time to make room (approximate LRU via expiry ordering).
+	if len(c.entries) >= c.maxItems {
+		now := time.Now()
+		for k, e := range c.entries {
+			if now.After(e.expiresAt) {
+				delete(c.entries, k)
+			}
+		}
+		// If still full, remove the half with the soonest expiry.
+		if len(c.entries) >= c.maxItems {
+			type kv struct {
+				k routeCacheKey
+				t time.Time
+			}
+			evictions := make([]kv, 0, len(c.entries))
+			for k, e := range c.entries {
+				evictions = append(evictions, kv{k, e.expiresAt})
+			}
+			// Sort ascending so we remove the shortest-lived first.
+			for i := 1; i < len(evictions); i++ {
+				for j := i; j > 0 && evictions[j].t.Before(evictions[j-1].t); j-- {
+					evictions[j], evictions[j-1] = evictions[j-1], evictions[j]
+				}
+			}
+			for _, kv := range evictions[:len(evictions)/2] {
+				delete(c.entries, kv.k)
+			}
+		}
+	}
+	c.entries[key] = &routeCacheEntry{resp: resp, expiresAt: time.Now().Add(c.ttl)}
+}
+
+func (c *RouteCache) evict() {
+	now := time.Now()
+	c.mu.Lock()
+	for k, e := range c.entries {
+		if now.After(e.expiresAt) {
+			delete(c.entries, k)
+		}
+	}
+	c.mu.Unlock()
+}
+
+func (c *RouteCache) Invalidate() {
+	c.mu.Lock()
+	c.entries = make(map[routeCacheKey]*routeCacheEntry, 64)
+	c.mu.Unlock()
+}
+
+// Size returns the current number of cached entries.
+func (c *RouteCache) Size() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.entries)
+}
+
 // ---- Server ----
 
 type server struct {
@@ -365,6 +776,7 @@ type server struct {
 	startedAt     time.Time
 	settings      *SettingsStore
 	tiles         *TileCache
+	routeCache    *RouteCache
 	window        *osmmini.CoordWindow
 	enforceWindow bool
 
@@ -430,6 +842,7 @@ func main() {
 	}
 
 	tileCache := NewTileCache(store.Get().Tiles)
+	rCache := newRouteCache(5*time.Minute, routeCacheDefaultMaxItems)
 
 	indexTmpl := template.Must(template.ParseFS(embedded, "web/index.html"))
 	openapiBytes, _ := embedded.ReadFile("api/openapi.yaml")
@@ -440,6 +853,7 @@ func main() {
 		startedAt:     time.Now(),
 		settings:      store,
 		tiles:         tileCache,
+		routeCache:    rCache,
 		window:        win,
 		enforceWindow: *enforceWindow,
 		indexTmpl:     indexTmpl,
@@ -482,6 +896,8 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/api/v1/health", s.handleHealth)
 	mux.HandleFunc("/api/v1/status", s.handleStatus)
 	mux.HandleFunc("/api/v1/settings", s.handleSettings)
+	mux.HandleFunc("/api/v1/tile-sources", s.handleTileSources)
+	mux.HandleFunc("/api/v1/profiles", s.handleProfiles)
 	mux.HandleFunc("/api/v1/search", s.handleSearch)
 	mux.HandleFunc("/api/v1/route", s.handleRoute)
 	mux.HandleFunc("/api/v1/trip/solve", s.handleTripSolve)
@@ -586,8 +1002,11 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
-	// Load current settings to pass to frontend
-	settings := s.settings.Load()
+	// Attempt to refresh settings from disk before serving the page.
+	// Any load error is intentionally ignored — Get() returns the last
+	// successfully loaded settings in that case.
+	_ = s.settings.Load()
+	settings := s.settings.Get()
 	settingsJSON, _ := json.Marshal(settings)
 
 	_ = s.indexTmpl.Execute(w, map[string]any{
@@ -627,6 +1046,10 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"graph":     map[string]any{"nodes": s.router.NodeCount(), "edges": s.router.EdgeCount()},
 		"addresses": len(s.addrs),
 		"settings":  set,
+		"route_cache": map[string]any{
+			"size": s.routeCache.Size(),
+		},
+		"tile_cache": s.tiles.Stats(),
 	}
 	if s.window != nil {
 		out["window"] = s.window
@@ -636,6 +1059,22 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		out["graph_bounds"] = b
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *server) handleTileSources(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	writeJSON(w, http.StatusOK, BuiltinTilePresets)
+}
+
+func (s *server) handleProfiles(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	writeJSON(w, http.StatusOK, osmmini.BuiltinProfiles)
 }
 
 func (s *server) handleSettings(w http.ResponseWriter, r *http.Request) {
@@ -653,8 +1092,9 @@ func (s *server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusBadRequest, "tiles.cache_dir required")
 			return
 		}
-		if v.Tiles.Upstream == "" {
-			writeJSONError(w, http.StatusBadRequest, "tiles.upstream required")
+		// upstream is required for raster/wms; for vector map_type, style_url is used instead
+		if v.Tiles.Upstream == "" && v.Tiles.StyleURL == "" {
+			writeJSONError(w, http.StatusBadRequest, "tiles.upstream or tiles.style_url required")
 			return
 		}
 		if err := s.settings.Put(v); err != nil {
@@ -758,6 +1198,17 @@ func (s *server) handleRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check route cache before running the (potentially expensive) pathfinder.
+	cacheKey := s.routeCache.cacheKey(startID, endID, opt)
+	if cached, hit := s.routeCache.get(cacheKey); hit {
+		// Update from/to labels (they depend on the query string, not the node)
+		cached.From = RoutePoint{Input: fromInput, Label: fromLabel, Lat: fromCoord.Lat, Lon: fromCoord.Lon, Node: startID, SnapM: startDist}
+		cached.To = RoutePoint{Input: toInput, Label: toLabel, Lat: toCoord.Lat, Lon: toCoord.Lon, Node: endID, SnapM: endDist}
+		cached.Cached = true
+		writeJSON(w, http.StatusOK, cached)
+		return
+	}
+
 	res, err := s.router.RouteWithOptions(r.Context(), startID, endID, opt)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
@@ -774,7 +1225,7 @@ func (s *server) handleRoute(w http.ResponseWriter, r *http.Request) {
 	// generate maneuvers/steps for the frontend
 	steps := s.router.ManeuversForPath(res.Path, opt)
 
-	writeJSON(w, http.StatusOK, RouteResponse{
+	resp := RouteResponse{
 		From: RoutePoint{
 			Input: fromInput,
 			Label: fromLabel,
@@ -793,6 +1244,7 @@ func (s *server) handleRoute(w http.ResponseWriter, r *http.Request) {
 		},
 		Engine:        string(res.Engine),
 		Objective:     string(res.Objective),
+		Profile:       string(opt.Profile),
 		Cost:          res.Cost,
 		DistanceM:     res.DistanceM,
 		DurationS:     res.DurationS,
@@ -800,7 +1252,9 @@ func (s *server) handleRoute(w http.ResponseWriter, r *http.Request) {
 		GoogleMapsURL: gURL,
 		AppleMapsURL:  aURL,
 		Steps:         steps,
-	})
+	}
+	s.routeCache.set(cacheKey, resp)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *server) handleTripSolve(w http.ResponseWriter, r *http.Request) {

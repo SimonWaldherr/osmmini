@@ -1,22 +1,16 @@
 package osmmini
 
 import (
+	"cmp"
 	"container/heap"
 	"context"
 	"errors"
 	"fmt"
 	"math"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 )
-
-// Coord holds WGS84 coordinates.
-// Used throughout the router to represent node and waypoint positions.
-type Coord struct {
-	Lat float64 `json:"lat"`
-	Lon float64 `json:"lon"`
-}
 
 // RouteEngine selects the pathfinding engine implementation.
 // - "astar": A* with admissible heuristic
@@ -48,6 +42,107 @@ const (
 	ObjectiveEconomy  Objective = "economy"
 )
 
+// VehicleProfile is an identifier for a named travel profile.
+// Profiles encode sensible defaults for specific use-cases (max speed,
+// allowed highway types, objective, weights) and can be used as a
+// convenient shortcut instead of supplying all individual RouteOptions
+// fields. When a non-empty profile is set in RouteOptions, its defaults
+// are applied before any explicit field overrides.
+type VehicleProfile string
+
+const (
+	ProfileCar          VehicleProfile = "car"           // standard passenger car
+	ProfileDelivery     VehicleProfile = "delivery"      // light delivery van (urban streets)
+	ProfileTruck        VehicleProfile = "truck"         // heavy goods vehicle (HGV)
+	ProfileTravel       VehicleProfile = "travel"        // long-distance / touring
+	ProfileFirefighting VehicleProfile = "firefighting"  // fire engine (ignores some restrictions)
+	ProfileEmergency    VehicleProfile = "emergency"     // ambulance / police
+	ProfileCycling      VehicleProfile = "cycling"       // bicycle
+	ProfileWalking      VehicleProfile = "walking"       // pedestrian
+)
+
+// VehicleProfileDef defines the pre-set routing parameters for a VehicleProfile.
+type VehicleProfileDef struct {
+	ID            VehicleProfile `json:"id"`
+	Label         string         `json:"label"`
+	Icon          string         `json:"icon"`
+	Objective     Objective      `json:"objective"`
+	MaxSpeedKph   float64        `json:"max_speed_kph"`
+	AllowedHwySet []string       `json:"allowed_highway_types,omitempty"` // nil = all driveable
+	// SpeedScale multiplies the edge speed for this profile (e.g. 0.25 for cycling)
+	SpeedScale float64 `json:"speed_scale,omitempty"`
+	LeftTurn   float64 `json:"left_turn,omitempty"`
+	UTurn      float64 `json:"u_turn,omitempty"`
+}
+
+// BuiltinProfiles lists the named travel profiles available out of the box.
+var BuiltinProfiles = []VehicleProfileDef{
+	{
+		ID: ProfileCar, Label: "Pkw", Icon: "🚗",
+		Objective: ObjectiveDuration, MaxSpeedKph: 130,
+		AllowedHwySet: []string{"motorway", "trunk", "primary", "secondary", "tertiary",
+			"unclassified", "residential", "living_street", "service", "road",
+			"motorway_link", "trunk_link", "primary_link", "secondary_link", "tertiary_link"},
+	},
+	{
+		ID: ProfileDelivery, Label: "Lieferfahrzeug", Icon: "🚚",
+		Objective: ObjectiveDuration, MaxSpeedKph: 80,
+		AllowedHwySet: []string{"primary", "secondary", "tertiary", "unclassified",
+			"residential", "living_street", "service", "road",
+			"primary_link", "secondary_link", "tertiary_link"},
+		LeftTurn: 3, UTurn: 10,
+	},
+	{
+		ID: ProfileTruck, Label: "LKW / HGV", Icon: "🚛",
+		Objective: ObjectiveDuration, MaxSpeedKph: 90,
+		AllowedHwySet: []string{"motorway", "trunk", "primary", "secondary",
+			"motorway_link", "trunk_link", "primary_link"},
+	},
+	{
+		ID: ProfileTravel, Label: "Fernreise / Touring", Icon: "🛣️",
+		Objective: ObjectiveEconomy, MaxSpeedKph: 130,
+		AllowedHwySet: []string{"motorway", "trunk", "primary", "secondary", "tertiary",
+			"motorway_link", "trunk_link", "primary_link", "secondary_link"},
+	},
+	{
+		ID: ProfileFirefighting, Label: "Feuerwehr", Icon: "🚒",
+		Objective: ObjectiveDuration, MaxSpeedKph: 130,
+		// fire engines use all roads; no explicit restriction
+	},
+	{
+		ID: ProfileEmergency, Label: "Rettungsdienst / Polizei", Icon: "🚑",
+		Objective: ObjectiveDuration, MaxSpeedKph: 130,
+		// emergency vehicles use all roads; no explicit restriction
+	},
+	{
+		ID: ProfileCycling, Label: "Fahrrad", Icon: "🚲",
+		Objective: ObjectiveDistance, MaxSpeedKph: 25,
+		AllowedHwySet: []string{"primary", "secondary", "tertiary", "unclassified",
+			"residential", "living_street", "service", "track", "road",
+			"primary_link", "secondary_link", "tertiary_link"},
+		SpeedScale: 0.25,
+	},
+	{
+		ID: ProfileWalking, Label: "Zu Fuß", Icon: "🚶",
+		Objective: ObjectiveDistance, MaxSpeedKph: 6,
+		// pedestrians use all non-motorway roads and paths
+		AllowedHwySet: []string{"secondary", "tertiary", "unclassified",
+			"residential", "living_street", "service", "track", "road", "path",
+			"secondary_link", "tertiary_link"},
+		SpeedScale: 0.05,
+	},
+}
+
+// profileDefByID returns the VehicleProfileDef for id, or nil if not found.
+func profileDefByID(id VehicleProfile) *VehicleProfileDef {
+	for i := range BuiltinProfiles {
+		if BuiltinProfiles[i].ID == id {
+			return &BuiltinProfiles[i]
+		}
+	}
+	return nil
+}
+
 // ProWeights contains optional advanced routing weights and vehicle constraints.
 // Values influence penalties (turns, crossings) and maximum assumed speed
 // used by heuristics and cost calculations.
@@ -63,14 +158,35 @@ type ProWeights struct {
 
 // RouteOptions are supplied to routing calls to control engine, objective
 // and pro-level weights/constraints.
+// When Profile is set the matching VehicleProfileDef supplies sensible
+// defaults; explicit fields in Weights override those defaults.
 type RouteOptions struct {
-	Engine    RouteEngine `json:"engine,omitempty"`
-	Objective Objective   `json:"objective"`
-	Pro       bool        `json:"pro"`
-	Weights   ProWeights  `json:"weights"`
+	Engine    RouteEngine    `json:"engine,omitempty"`
+	Objective Objective      `json:"objective"`
+	Profile   VehicleProfile `json:"profile,omitempty"`
+	Pro       bool           `json:"pro"`
+	Weights   ProWeights     `json:"weights"`
 }
 
 func (o RouteOptions) withDefaults() RouteOptions {
+	// Apply profile defaults first, then override with explicit values.
+	if o.Profile != "" {
+		if def := profileDefByID(o.Profile); def != nil {
+			if o.Objective == "" {
+				o.Objective = def.Objective
+			}
+			if o.Weights.MaxSpeedKph <= 0 {
+				o.Weights.MaxSpeedKph = def.MaxSpeedKph
+			}
+			if o.Weights.LeftTurn == 0 && def.LeftTurn > 0 {
+				o.Weights.LeftTurn = def.LeftTurn
+			}
+			if o.Weights.UTurn == 0 && def.UTurn > 0 {
+				o.Weights.UTurn = def.UTurn
+			}
+		}
+	}
+
 	if o.Engine == "" {
 		o.Engine = EngineAStar
 	}
@@ -90,12 +206,42 @@ func (o RouteOptions) withDefaults() RouteOptions {
 	return o
 }
 
+// profileAllowedHwySet returns the set of allowed highway types for the given
+// options, or nil if no profile restriction applies.
+func profileAllowedHwySet(opt RouteOptions) map[string]bool {
+	if opt.Profile == "" {
+		return nil
+	}
+	def := profileDefByID(opt.Profile)
+	if def == nil || len(def.AllowedHwySet) == 0 {
+		return nil
+	}
+	m := make(map[string]bool, len(def.AllowedHwySet))
+	for _, h := range def.AllowedHwySet {
+		m[h] = true
+	}
+	return m
+}
+
+// profileSpeedScale returns the speed scale factor for the given options.
+func profileSpeedScale(opt RouteOptions) float64 {
+	if opt.Profile == "" {
+		return 1
+	}
+	def := profileDefByID(opt.Profile)
+	if def == nil || def.SpeedScale <= 0 {
+		return 1
+	}
+	return def.SpeedScale
+}
+
 type Edge struct {
 	To         int64
 	DistM      float64
 	SpeedKph   float64
 	MaxHeightM float64
 	MaxWeightT float64
+	HwyType    string // OSM highway tag value (e.g. "residential")
 }
 
 type Graph struct {
@@ -103,7 +249,6 @@ type Graph struct {
 	adj    map[int64][]Edge
 }
 
-// Router wraps a road graph built from OSM highways.
 // Router wraps a road graph built from OSM highways and provides
 // nearest-node lookup, street search and pathfinding (A*/Dijkstra).
 type Router struct {
@@ -216,6 +361,7 @@ func BuildRouterWithAddressesOptions(path string, bo BuildOptions) (*Router, []A
 			copy(ids, w.NodeIDs)
 			highways = append(highways, highwayWay{
 				nodes:      ids,
+				hwyType:    strings.ToLower(strings.TrimSpace(hwy)),
 				speedKph:   speed,
 				maxHeightM: mh,
 				maxWeightT: mw,
@@ -247,6 +393,7 @@ func BuildRouterWithAddressesOptions(path string, bo BuildOptions) (*Router, []A
 			SpeedKph:   hw.speedKph,
 			MaxHeightM: hw.maxHeightM,
 			MaxWeightT: hw.maxWeightT,
+			HwyType:    hw.hwyType,
 		})
 	}
 
@@ -435,11 +582,11 @@ func (r *Router) SearchStreets(q string, limit int) []StreetMatch {
 		}
 		sc = append(sc, scored{key: key, e: e, score: s})
 	}
-	sort.Slice(sc, func(i, j int) bool {
-		if sc[i].score == sc[j].score {
-			return sc[i].e.Display < sc[j].e.Display
+	slices.SortFunc(sc, func(a, b scored) int {
+		if a.score != b.score {
+			return cmp.Compare(b.score, a.score) // descending by score
 		}
-		return sc[i].score > sc[j].score
+		return cmp.Compare(a.e.Display, b.e.Display)
 	})
 	if limit > 0 && limit < len(sc) {
 		sc = sc[:limit]
@@ -614,11 +761,11 @@ func SearchAddresses(entries []AddressEntry, q AddressQuery, limit int) []Addres
 		}
 		sc = append(sc, scored{e: e, s: s})
 	}
-	sort.Slice(sc, func(i, j int) bool {
-		if sc[i].s == sc[j].s {
-			return sc[i].e.ID < sc[j].e.ID
+	slices.SortFunc(sc, func(a, b scored) int {
+		if a.s != b.s {
+			return cmp.Compare(b.s, a.s) // descending by score
 		}
-		return sc[i].s > sc[j].s
+		return cmp.Compare(a.e.ID, b.e.ID)
 	})
 	if limit <= 0 || limit > len(sc) {
 		limit = len(sc)
@@ -893,11 +1040,11 @@ func (r *Router) BuildCH() {
 	for id, d := range ndeg {
 		arr = append(arr, kv{id, d})
 	}
-	sort.Slice(arr, func(i, j int) bool {
-		if arr[i].d == arr[j].d {
-			return arr[i].id < arr[j].id
+	slices.SortFunc(arr, func(a, b kv) int {
+		if a.d != b.d {
+			return cmp.Compare(a.d, b.d) // ascending by degree
 		}
-		return arr[i].d < arr[j].d
+		return cmp.Compare(a.id, b.id)
 	})
 	rank := make(map[int64]int32, len(arr))
 	for i, v := range arr {
@@ -926,20 +1073,16 @@ func (r *Router) chQuery(ctx context.Context, from, to int64, opt RouteOptions) 
 		return nil, 0, errors.New("ch: not built")
 	}
 
-	type item struct {
-		id   int64
-		dist float64
-	}
 	// forward
 	fdist := map[int64]float64{from: 0}
 	fprev := map[int64]int64{}
 	fpq := &chPQ{}
-	heap.Push(fpq, &item{from, 0})
+	heap.Push(fpq, &dijkstraItem{id: from, dist: 0})
 	// backward (on upward graph of reversed edges approximated by scanning all nodes)
 	bdist := map[int64]float64{to: 0}
 	bprev := map[int64]int64{}
 	bpq := &chPQ{}
-	heap.Push(bpq, &item{to, 0})
+	heap.Push(bpq, &dijkstraItem{id: to, dist: 0})
 
 	best := math.MaxFloat64
 	meet := int64(0)
@@ -948,7 +1091,7 @@ func (r *Router) chQuery(ctx context.Context, from, to int64, opt RouteOptions) 
 		if pq.Len() == 0 {
 			return
 		}
-		it := heap.Pop(pq).(*item)
+		it := heap.Pop(pq).(*dijkstraItem)
 		u := it.id
 		if it.dist > dist[u] {
 			return
@@ -960,7 +1103,7 @@ func (r *Router) chQuery(ctx context.Context, from, to int64, opt RouteOptions) 
 			if d, ok := dist[v]; !ok || alt < d {
 				dist[v] = alt
 				prev[v] = u
-				heap.Push(pq, &item{v, alt})
+				heap.Push(pq, &dijkstraItem{id: v, dist: alt})
 			}
 		}
 		// update best via other frontier
@@ -1015,9 +1158,7 @@ func (r *Router) chQuery(ctx context.Context, from, to int64, opt RouteOptions) 
 		cur = p
 	}
 	// reverse forward part
-	for i, j := 0, len(fpath)-1; i < j; i, j = i+1, j-1 {
-		fpath[i], fpath[j] = fpath[j], fpath[i]
-	}
+	slices.Reverse(fpath)
 	bpath := []int64{}
 	for cur := meet; cur != 0; {
 		if cur == to {
@@ -1034,22 +1175,14 @@ func (r *Router) chQuery(ctx context.Context, from, to int64, opt RouteOptions) 
 	return path, best, nil
 }
 
-// chPQ: min-heap for CH queries
-type chPQ []*struct {
-	id   int64
-	dist float64
-}
+// chPQ: min-heap for CH queries (reuses dijkstraItem).
+type chPQ []*dijkstraItem
 
 func (h chPQ) Len() int           { return len(h) }
 func (h chPQ) Less(i, j int) bool { return h[i].dist < h[j].dist }
 func (h chPQ) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *chPQ) Push(x interface{}) {
-	*h = append(*h, x.(*struct {
-		id   int64
-		dist float64
-	}))
-}
-func (h *chPQ) Pop() interface{} { old := *h; n := len(old); it := old[n-1]; *h = old[:n-1]; return it }
+func (h *chPQ) Push(x any)        { *h = append(*h, x.(*dijkstraItem)) }
+func (h *chPQ) Pop() any          { old := *h; n := len(old); it := old[n-1]; *h = old[:n-1]; return it }
 
 // dijkstraNode is a simple node-based Dijkstra implementation that computes
 // shortest path using per-edge costs (r.edgeCost) and does not account for
@@ -1137,9 +1270,7 @@ func (r *Router) dijkstraNode(ctx context.Context, from, to int64, opt RouteOpti
 		cur = p
 	}
 	// reverse
-	for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
-		path[i], path[j] = path[j], path[i]
-	}
+	slices.Reverse(path)
 	return path, dist[to], nil
 }
 
@@ -1155,8 +1286,8 @@ type pqWrapper struct{ s *[]*dijkstraItem }
 func (w pqWrapper) Len() int            { return len(*w.s) }
 func (w pqWrapper) Less(i, j int) bool  { return (*w.s)[i].dist < (*w.s)[j].dist }
 func (w pqWrapper) Swap(i, j int)       { (*w.s)[i], (*w.s)[j] = (*w.s)[j], (*w.s)[i] }
-func (w *pqWrapper) Push(x interface{}) { *w.s = append(*w.s, x.(*dijkstraItem)) }
-func (w *pqWrapper) Pop() interface{} {
+func (w *pqWrapper) Push(x any) { *w.s = append(*w.s, x.(*dijkstraItem)) }
+func (w *pqWrapper) Pop() any {
 	old := *w.s
 	n := len(old)
 	it := old[n-1]
@@ -1220,12 +1351,12 @@ func (pq priorityQueue) Swap(i, j int) {
 	pq[i].idx = i
 	pq[j].idx = j
 }
-func (pq *priorityQueue) Push(x interface{}) {
+func (pq *priorityQueue) Push(x any) {
 	it := x.(*pqItem)
 	it.idx = len(*pq)
 	*pq = append(*pq, it)
 }
-func (pq *priorityQueue) Pop() interface{} {
+func (pq *priorityQueue) Pop() any {
 	old := *pq
 	n := len(old)
 	it := old[n-1]
@@ -1323,9 +1454,7 @@ func reconstructPathTurnState(goal turnState, came map[turnState]turnState) []in
 		}
 		s = prev
 	}
-	for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
-		path[i], path[j] = path[j], path[i]
-	}
+	slices.Reverse(path)
 	return path
 }
 
@@ -1434,11 +1563,15 @@ func effectiveSpeedKph(e Edge, opt RouteOptions) float64 {
 	if v <= 0 {
 		v = 50
 	}
+	// Apply profile speed scale (e.g. cycling at 25% of road speed)
+	if scale := profileSpeedScale(opt); scale > 0 && scale < 1 {
+		v *= scale
+	}
 	if opt.Weights.MaxSpeedKph > 0 && v > opt.Weights.MaxSpeedKph {
 		v = opt.Weights.MaxSpeedKph
 	}
-	if v < 5 {
-		v = 5
+	if v < 3 {
+		v = 3 // minimum 3 kph (walking pace) to keep heuristics well-behaved
 	}
 	return v
 }
@@ -1454,6 +1587,12 @@ func edgeAllowed(e Edge, opt RouteOptions) bool {
 	}
 	if opt.Weights.VehicleWeightT > 0 && e.MaxWeightT > 0 && opt.Weights.VehicleWeightT > e.MaxWeightT {
 		return false
+	}
+	// Check profile highway-type restriction.
+	if allowed := profileAllowedHwySet(opt); allowed != nil && e.HwyType != "" {
+		if !allowed[e.HwyType] {
+			return false
+		}
 	}
 	return true
 }
@@ -1608,6 +1747,7 @@ func (r *Router) nearestNodeBrute(lat, lon float64) (int64, float64, bool) {
 
 type highwayWay struct {
 	nodes      []int64
+	hwyType    string // OSM highway tag value
 	speedKph   float64
 	maxHeightM float64
 	maxWeightT float64
