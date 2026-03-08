@@ -192,9 +192,12 @@ function routeOptionsFromUI(){
     engine: document.getElementById('engine').value,
     objective: document.getElementById('objective').value,
     pro: document.getElementById('pro').checked,
+    emergency_mode: document.getElementById('emergencyMode').checked,
     weights: {
       left_turn: parseFloat(document.getElementById('w_left').value) || 0,
-      right_turn: parseFloat(document.getElementById('w_right').value) || 0
+      right_turn: parseFloat(document.getElementById('w_right').value) || 0,
+      no_left_turn: document.getElementById('noLeftTurn').checked,
+      traffic_light_penalty: parseFloat(document.getElementById('w_traffic_light').value) || 0
     }
   };
 }
@@ -733,11 +736,14 @@ function initializeSettingsUI(s) {
         document.getElementById('engine').value = (s.routing.engine || 'astar');
         document.getElementById('objective').value = s.routing.objective || 'duration';
         document.getElementById('pro').checked = !!s.routing.pro;
+        document.getElementById('emergencyMode').checked = !!s.routing.emergency_mode;
         if(s.routing.pro) weights.classList.remove('hidden');
         
         const w = s.routing.weights || {};
         document.getElementById('w_left').value = w.left_turn || 0;
         document.getElementById('w_right').value = w.right_turn || 0;
+        document.getElementById('w_traffic_light').value = w.traffic_light_penalty || 0;
+        document.getElementById('noLeftTurn').checked = !!w.no_left_turn;
     }
     // populate allowed highways UI
     const highwayTypes = [
@@ -965,6 +971,144 @@ document.addEventListener('keydown', (ev) => {
   if (ev.key === 'Escape') {
     document.activeElement?.blur();
   }
+});
+
+// Emergency mode change handler
+document.getElementById('emergencyMode').addEventListener('change', (ev) => {
+  try { ev.target.setAttribute('aria-checked', ev.target.checked ? 'true' : 'false'); } catch (e) {}
+  if (ev.target.checked) {
+    showToast('🚒 Einsatzmodus aktiviert', 'info', 2000);
+  }
+  compute();
+});
+
+// No-left-turn change handler
+document.getElementById('noLeftTurn').addEventListener('change', (ev) => {
+  try { ev.target.setAttribute('aria-checked', ev.target.checked ? 'true' : 'false'); } catch (e) {}
+  compute();
+});
+
+// ---- AI Integration ----
+
+// AI card collapse/expand
+const aiToggle = document.getElementById('aiToggle');
+const aiBody = document.getElementById('aiBody');
+const aiCard = document.getElementById('aiCard');
+if (aiToggle) {
+  function setAIOpen(open){
+    aiBody.style.display = open ? 'block' : 'none';
+    aiCard.classList.toggle('collapsed', !open);
+    aiToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    aiToggle.textContent = open ? '‹' : '›';
+    localStorage.setItem('aiOpen', open ? '1' : '0');
+    if (open && !aiCard.dataset.checked) {
+      aiCard.dataset.checked = '1';
+      checkAIStatus();
+    }
+  }
+  aiToggle.addEventListener('click', ()=>{ setAIOpen(aiBody.style.display==='none'); });
+  if(localStorage.getItem('aiOpen') === null) setAIOpen(false); else setAIOpen(localStorage.getItem('aiOpen')==='1');
+}
+
+let aiAvailable = false;
+let aiModels = [];
+
+async function checkAIStatus() {
+  const statusEl = document.getElementById('aiStatus');
+  const modelSelectEl = document.getElementById('aiModelSelect');
+  const sendBtn = document.getElementById('aiSend');
+  
+  try {
+    const res = await fetch('/api/v1/ai/status');
+    if (!res.ok) throw new Error('AI status check failed');
+    const data = await res.json();
+    
+    if (data.available) {
+      aiAvailable = true;
+      aiModels = [];
+      const select = document.getElementById('aiModel');
+      select.innerHTML = '';
+      
+      data.providers.forEach(p => {
+        if (p.available && p.models) {
+          p.models.forEach(m => {
+            aiModels.push({provider: p.name, model: m});
+            const opt = document.createElement('option');
+            opt.value = m;
+            opt.textContent = `${p.name}: ${m}`;
+            select.appendChild(opt);
+          });
+        }
+      });
+      
+      if (aiModels.length > 0) {
+        modelSelectEl.style.display = 'block';
+        sendBtn.disabled = false;
+        const providers = data.providers.filter(p => p.available).map(p => p.name).join(', ');
+        statusEl.innerHTML = `<span style="color:#6ef2a0;">✅ KI verfügbar</span> (${providers}, ${aiModels.length} Modell${aiModels.length>1?'e':''})`;
+      } else {
+        statusEl.innerHTML = '<span style="color:#ffcc66;">⚠️ Provider verfügbar, aber keine Modelle geladen</span>';
+      }
+    } else {
+      statusEl.innerHTML = '<span style="color:var(--text-muted);">❌ Keine KI verfügbar. Starte <a href="https://ollama.com" target="_blank" style="color:var(--primary);">Ollama</a> oder <a href="https://lmstudio.ai" target="_blank" style="color:var(--primary);">LM Studio</a>.</span>';
+    }
+  } catch (e) {
+    statusEl.innerHTML = '<span style="color:var(--text-muted);">❌ KI-Status konnte nicht abgefragt werden</span>';
+  }
+}
+
+async function sendAIQuery() {
+  const input = document.getElementById('aiPrompt');
+  const prompt = input.value.trim();
+  if (!prompt || !aiAvailable) return;
+  
+  const messagesEl = document.getElementById('aiMessages');
+  const sendBtn = document.getElementById('aiSend');
+  
+  // Add user message
+  const userMsg = document.createElement('div');
+  userMsg.className = 'ai-message ai-user';
+  userMsg.textContent = prompt;
+  messagesEl.appendChild(userMsg);
+  
+  // Add loading indicator
+  const loadingMsg = document.createElement('div');
+  loadingMsg.className = 'ai-message ai-assistant';
+  loadingMsg.innerHTML = '<span class="spinner" style="width:14px;height:14px;border-width:2px;"></span> Denke nach...';
+  messagesEl.appendChild(loadingMsg);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  
+  input.value = '';
+  sendBtn.disabled = true;
+  
+  try {
+    const model = document.getElementById('aiModel').value || '';
+    const res = await fetch('/api/v1/ai/query', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({prompt, model})
+    });
+    
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'KI-Anfrage fehlgeschlagen');
+    }
+    
+    const data = await res.json();
+    loadingMsg.textContent = data.response;
+    loadingMsg.innerHTML = `<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">${escapeHtml(data.provider)}/${escapeHtml(data.model)}</div>${escapeHtml(data.response)}`;
+  } catch (e) {
+    loadingMsg.textContent = '❌ ' + (e.message || 'Fehler');
+    loadingMsg.style.color = '#ff6b6b';
+  }
+  
+  sendBtn.disabled = false;
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+document.getElementById('aiSend')?.addEventListener('click', sendAIQuery);
+document.getElementById('aiPrompt')?.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); sendAIQuery(); }
 });
 
 // Visual feedback on button clicks

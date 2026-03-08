@@ -731,6 +731,41 @@ input:-webkit-autofill {
   -webkit-text-fill-color: var(--text-main) !important;
 }
 
+/* AI Messages */
+.ai-messages {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.ai-message {
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.4;
+  word-wrap: break-word;
+  white-space: pre-wrap;
+  animation: fadeIn 0.2s ease;
+}
+.ai-user {
+  background: rgba(77, 163, 255, 0.15);
+  border: 1px solid rgba(77, 163, 255, 0.2);
+  align-self: flex-end;
+  max-width: 85%;
+}
+.ai-assistant {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border-light);
+  align-self: flex-start;
+  max-width: 95%;
+}
+:root.light-mode .ai-user {
+  background: rgba(0, 102, 204, 0.1);
+  border-color: rgba(0, 102, 204, 0.2);
+}
+:root.light-mode .ai-assistant {
+  background: rgba(0, 0, 0, 0.03);
+}
+
 /* Toast notifications */
 .toast {
   position: fixed;

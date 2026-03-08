@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
@@ -485,6 +486,8 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/api/v1/search", s.handleSearch)
 	mux.HandleFunc("/api/v1/route", s.handleRoute)
 	mux.HandleFunc("/api/v1/trip/solve", s.handleTripSolve)
+	mux.HandleFunc("/api/v1/ai/status", s.handleAIStatus)
+	mux.HandleFunc("/api/v1/ai/query", s.handleAIQuery)
 
 	// UI
 	mux.HandleFunc("/", s.handleIndex)
@@ -587,7 +590,7 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
 	// Load current settings to pass to frontend
-	settings := s.settings.Load()
+	settings := s.settings.Get()
 	settingsJSON, _ := json.Marshal(settings)
 
 	_ = s.indexTmpl.Execute(w, map[string]any{
@@ -1179,8 +1182,82 @@ func (s *server) tspGreedy(ctx context.Context, startNode, endNode int64, stops 
 		visited |= uint64(1) << uint64(bestIdx)
 		curNode = stops[bestIdx].node
 	}
+
+	// 2-opt improvement: try swapping segments to find shorter tours
+	if n >= 4 {
+		order = s.tsp2opt(ctx, startNode, endNode, stops, pre, opt, order)
+	}
+
 	_ = endNode
 	return order, nil
+}
+
+// tsp2opt applies the 2-opt local search improvement to the given tour order.
+// It repeatedly reverses sub-segments of the tour if doing so reduces total cost,
+// while respecting dependency constraints.
+func (s *server) tsp2opt(ctx context.Context, startNode, endNode int64, stops []stopR, pre []uint64, opt osmmini.RouteOptions, order []int) []int {
+	n := len(order)
+	if n < 4 {
+		return order
+	}
+
+	// helper to compute total tour cost for a given order
+	tourCost := func(ord []int) float64 {
+		total := 0.0
+		prev := startNode
+		for _, idx := range ord {
+			c, err := s.router.RouteCostWithOptions(ctx, prev, stops[idx].node, opt)
+			if err != nil {
+				return math.MaxFloat64
+			}
+			total += c
+			prev = stops[idx].node
+		}
+		c, err := s.router.RouteCostWithOptions(ctx, prev, endNode, opt)
+		if err != nil {
+			return math.MaxFloat64
+		}
+		total += c
+		return total
+	}
+
+	// check if an order respects all dependency constraints
+	depsOK := func(ord []int) bool {
+		mask := uint64(0)
+		for _, idx := range ord {
+			if (mask & pre[idx]) != pre[idx] {
+				return false
+			}
+			mask |= 1 << uint64(idx)
+		}
+		return true
+	}
+
+	bestCost := tourCost(order)
+	improved := true
+	for improved {
+		improved = false
+		for i := 0; i < n-1; i++ {
+			for j := i + 2; j < n; j++ {
+				// try reversing the segment between i+1 and j
+				newOrder := make([]int, n)
+				copy(newOrder, order)
+				for l, r := i+1, j; l < r; l, r = l+1, r-1 {
+					newOrder[l], newOrder[r] = newOrder[r], newOrder[l]
+				}
+				if !depsOK(newOrder) {
+					continue
+				}
+				newCost := tourCost(newOrder)
+				if newCost < bestCost {
+					order = newOrder
+					bestCost = newCost
+					improved = true
+				}
+			}
+		}
+	}
+	return order
 }
 
 // ---- Location resolve + window enforcement ----
@@ -1362,4 +1439,274 @@ func buildAppleMapsURL(points []osmmini.Coord) string {
 	q.Set("daddr", strings.Join(dparts, "+"))
 	q.Set("dirflg", "d")
 	return "https://maps.apple.com/?" + q.Encode()
+}
+
+// ---- AI Integration ----
+
+// aiProvider describes a detected LLM provider (Ollama or LM Studio).
+type aiProvider struct {
+	Name      string   `json:"name"`
+	URL       string   `json:"url"`
+	Available bool     `json:"available"`
+	Models    []string `json:"models,omitempty"`
+}
+
+// aiStatusResponse is returned by GET /api/v1/ai/status.
+type aiStatusResponse struct {
+	Available bool         `json:"available"`
+	Providers []aiProvider `json:"providers"`
+}
+
+// aiQueryRequest is the body for POST /api/v1/ai/query.
+type aiQueryRequest struct {
+	Prompt string `json:"prompt"`
+	Model  string `json:"model,omitempty"`
+}
+
+// aiQueryResponse is returned by POST /api/v1/ai/query.
+type aiQueryResponse struct {
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
+	Response string `json:"response"`
+}
+
+// probeAIProvider checks if a provider is reachable and fetches available models.
+func probeAIProvider(ctx context.Context, name, baseURL, modelsPath string) aiProvider {
+	p := aiProvider{Name: name, URL: baseURL, Available: false}
+	client := &http.Client{Timeout: 3 * time.Second}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+modelsPath, nil)
+	if err != nil {
+		return p
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return p
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return p
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return p
+	}
+	p.Available = true
+
+	// Parse models - Ollama format: {"models":[{"name":"..."},...]}
+	// LM Studio format (OpenAI-compatible): {"data":[{"id":"..."},...]}
+	var ollamaResp struct {
+		Models []struct {
+			Name string `json:"name"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(body, &ollamaResp); err == nil && len(ollamaResp.Models) > 0 {
+		for _, m := range ollamaResp.Models {
+			p.Models = append(p.Models, m.Name)
+		}
+		return p
+	}
+
+	var openaiResp struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &openaiResp); err == nil && len(openaiResp.Data) > 0 {
+		for _, m := range openaiResp.Data {
+			p.Models = append(p.Models, m.ID)
+		}
+	}
+	return p
+}
+
+func (s *server) handleAIStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	providers := []aiProvider{
+		probeAIProvider(ctx, "ollama", "http://localhost:11434", "/api/tags"),
+		probeAIProvider(ctx, "lmstudio", "http://localhost:1234", "/v1/models"),
+	}
+
+	anyAvailable := false
+	for _, p := range providers {
+		if p.Available {
+			anyAvailable = true
+			break
+		}
+	}
+
+	writeJSON(w, http.StatusOK, aiStatusResponse{
+		Available: anyAvailable,
+		Providers: providers,
+	})
+}
+
+func (s *server) handleAIQuery(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req aiQueryRequest
+	if err := readJSON(w, r, &req, 1<<20); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(req.Prompt) == "" {
+		writeJSONError(w, http.StatusBadRequest, "prompt required")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	defer cancel()
+
+	// Build system prompt with context about available routing features
+	systemPrompt := "Du bist ein Routing-Assistent für OSMmini, ein Offline-Routing-System. " +
+		"Du kannst Fragen zu Routenplanung, Navigation und Verkehr beantworten. " +
+		"Verfügbare Features: A*-, Dijkstra- und CH-Routing, TSP-Optimierung (bis 16 Stops exakt, " +
+		"darüber hinaus Greedy mit 2-opt), Linksabbiege-Vermeidung, Ampelstrafen, " +
+		"BOS/Einsatzmodus (Feuerwehr, Rettungsdienst), Fahrzeugbeschränkungen (Höhe, Gewicht). " +
+		"Antworte kurz und hilfreich auf Deutsch."
+
+	// Try Ollama first, then LM Studio
+	providers := []struct {
+		name    string
+		baseURL string
+		models  string
+	}{
+		{"ollama", "http://localhost:11434", "/api/tags"},
+		{"lmstudio", "http://localhost:1234", "/v1/models"},
+	}
+
+	for _, prov := range providers {
+		p := probeAIProvider(ctx, prov.name, prov.baseURL, prov.models)
+		if !p.Available || len(p.Models) == 0 {
+			continue
+		}
+
+		model := req.Model
+		if model == "" {
+			model = p.Models[0]
+		}
+
+		var respText string
+		var err error
+		if prov.name == "ollama" {
+			respText, err = queryOllama(ctx, prov.baseURL, model, systemPrompt, req.Prompt)
+		} else {
+			respText, err = queryOpenAICompatible(ctx, prov.baseURL, model, systemPrompt, req.Prompt)
+		}
+		if err != nil {
+			continue
+		}
+
+		writeJSON(w, http.StatusOK, aiQueryResponse{
+			Provider: prov.name,
+			Model:    model,
+			Response: respText,
+		})
+		return
+	}
+
+	writeJSONError(w, http.StatusServiceUnavailable, "Kein KI-Provider verfügbar. Bitte Ollama oder LM Studio starten.")
+}
+
+// queryOllama sends a chat completion request to an Ollama instance.
+func queryOllama(ctx context.Context, baseURL, model, systemPrompt, userPrompt string) (string, error) {
+	payload := map[string]any{
+		"model": model,
+		"messages": []map[string]string{
+			{"role": "system", "content": systemPrompt},
+			{"role": "user", "content": userPrompt},
+		},
+		"stream": false,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/api/chat", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("ollama returned %d", resp.StatusCode)
+	}
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", err
+	}
+	var result struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", err
+	}
+	return result.Message.Content, nil
+}
+
+// queryOpenAICompatible sends a chat completion request to an OpenAI-compatible API (LM Studio).
+func queryOpenAICompatible(ctx context.Context, baseURL, model, systemPrompt, userPrompt string) (string, error) {
+	payload := map[string]any{
+		"model": model,
+		"messages": []map[string]string{
+			{"role": "system", "content": systemPrompt},
+			{"role": "user", "content": userPrompt},
+		},
+		"max_tokens": 1024,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("lm studio returned %d", resp.StatusCode)
+	}
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", err
+	}
+	var result struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", err
+	}
+	if len(result.Choices) == 0 {
+		return "", errors.New("no choices returned")
+	}
+	return result.Choices[0].Message.Content, nil
 }
