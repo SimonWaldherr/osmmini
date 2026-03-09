@@ -733,12 +733,14 @@ func tileYToLat(y, z int) float64 {
 // ---- API types ----
 
 type apiSearchResult struct {
-	ID    int64        `json:"id"`
-	Kind  string       `json:"kind"`
-	Label string       `json:"label"`
-	Lat   float64      `json:"lat"`
-	Lon   float64      `json:"lon"`
-	Tags  osmmini.Tags `json:"tags,omitempty"`
+	ID       int64        `json:"id"`
+	Kind     string       `json:"kind"`
+	Label    string       `json:"label"`
+	Subtitle string       `json:"subtitle,omitempty"`
+	Match    string       `json:"match,omitempty"`
+	Lat      float64      `json:"lat"`
+	Lon      float64      `json:"lon"`
+	Tags     osmmini.Tags `json:"tags,omitempty"`
 }
 
 type poiInfoResponse struct {
@@ -2302,94 +2304,361 @@ func (s *server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit := parseLimit(r.URL.Query().Get("limit"), 10, 1, 50)
-	aq := osmmini.ParseAddressGuess(q)
-	addrMatches := osmmini.SearchAddresses(s.addrs, aq, limit)
+	writeJSON(w, http.StatusOK, s.searchLocationResults(q, limit))
+}
 
+func (s *server) searchLocationResults(raw string, limit int) []apiSearchResult {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || limit <= 0 {
+		return nil
+	}
+
+	aq := osmmini.ParseAddressGuess(raw)
 	out := make([]apiSearchResult, 0, limit)
+	seen := make(map[searchResultKey]struct{}, limit)
+
+	addrMatches := osmmini.SearchAddresses(s.addrs, aq, min(limit*2, 50))
 	for _, m := range addrMatches {
 		if s.window != nil && !s.window.Contains(m.Coord) {
 			continue
 		}
-		out = append(out, apiSearchResult{
-			ID:    m.ID,
-			Kind:  "address",
-			Label: formatAddressLabel(m.Tags),
-			Lat:   m.Coord.Lat,
-			Lon:   m.Coord.Lon,
-			Tags:  m.Tags,
-		})
-	}
-
-	// Also search named POI ways (amenity, shop, tourism, etc.) if we still
-	// have room and the POI index is available.
-	if remain := limit - len(out); remain > 0 {
-		qNorm := normalizeForCompare(q)
-		s.poiMu.RLock()
-		for _, w := range s.poiWays {
-			if len(out) >= limit {
-				break
-			}
-			name := w.Tags["name"]
-			brand := w.Tags["brand"]
-			if name == "" && brand == "" {
-				continue
-			}
-			nameNorm := normalizeForCompare(name)
-			brandNorm := normalizeForCompare(brand)
-			if qNorm == "" || (!strings.Contains(nameNorm, qNorm) && !strings.Contains(brandNorm, qNorm)) {
-				continue
-			}
-			// compute centroid
-			var cx, cy float64
-			var cnt int
-			for _, nid := range w.NodeIDs {
-				if c, ok := s.poiNodes[nid]; ok {
-					cx += c.Lat
-					cy += c.Lon
-					cnt++
-				}
-			}
-			if cnt == 0 {
-				continue
-			}
-			coord := osmmini.Coord{Lat: cx / float64(cnt), Lon: cy / float64(cnt)}
-			if s.window != nil && !s.window.Contains(coord) {
-				continue
-			}
-			label := name
-			if label == "" {
-				label = brand
-			}
-			out = append(out, apiSearchResult{
-				ID:    w.ID,
-				Kind:  "poi",
-				Label: label,
-				Lat:   coord.Lat,
-				Lon:   coord.Lon,
-				Tags:  w.Tags,
-			})
+		out = appendUniqueSearchResult(out, seen, buildSearchResult("address", m.ID, m.Coord, m.Tags, raw), limit)
+		if len(out) >= limit {
+			return out
 		}
-		s.poiMu.RUnlock()
 	}
 
-	remain := limit - len(out)
-	if remain > 0 {
-		streetMatches := s.router.SearchStreets(q, remain)
+	if remain := limit - len(out); remain > 0 {
+		for _, res := range s.searchPOIMatches(raw, min(remain*2, 20)) {
+			out = appendUniqueSearchResult(out, seen, res, limit)
+			if len(out) >= limit {
+				return out
+			}
+		}
+	}
+
+	if remain := limit - len(out); remain > 0 {
+		streetQuery := strings.TrimSpace(aq.Street)
+		if streetQuery == "" {
+			streetQuery = raw
+		}
+		streetMatches := s.router.SearchStreets(streetQuery, min(remain*2, 20))
 		for _, st := range streetMatches {
 			if s.window != nil && !s.window.Contains(st.Coord) {
 				continue
 			}
-			out = append(out, apiSearchResult{
-				ID:    st.NodeID,
-				Kind:  "street",
-				Label: st.Name,
-				Lat:   st.Coord.Lat,
-				Lon:   st.Coord.Lon,
-				Tags:  osmmini.Tags{"street": st.Name},
-			})
+			out = appendUniqueSearchResult(out, seen, buildSearchResult("street", st.NodeID, st.Coord, osmmini.Tags{"street": st.Name}, raw), limit)
+			if len(out) >= limit {
+				return out
+			}
 		}
 	}
-	writeJSON(w, http.StatusOK, out)
+
+	return out
+}
+
+type searchResultKey struct {
+	label string
+	lat   int64
+	lon   int64
+}
+
+func appendUniqueSearchResult(out []apiSearchResult, seen map[searchResultKey]struct{}, res apiSearchResult, limit int) []apiSearchResult {
+	if limit > 0 && len(out) >= limit {
+		return out
+	}
+	key := searchResultKey{
+		label: normalizeForCompare(res.Label),
+		lat:   int64(math.Round(res.Lat * 1e6)),
+		lon:   int64(math.Round(res.Lon * 1e6)),
+	}
+	if _, ok := seen[key]; ok {
+		return out
+	}
+	seen[key] = struct{}{}
+	return append(out, res)
+}
+
+func (s *server) searchPOIMatches(raw string, limit int) []apiSearchResult {
+	if limit <= 0 {
+		return nil
+	}
+
+	type scored struct {
+		way   osmmini.Way
+		coord osmmini.Coord
+		score int
+	}
+
+	qNorm := normalizeForCompare(raw)
+	tokens := strings.Fields(qNorm)
+	scoredPOIs := make([]scored, 0, limit*4)
+
+	s.poiMu.RLock()
+	for _, w := range s.poiWays {
+		score := scorePOIResult(w.Tags, qNorm, tokens)
+		if score <= 0 {
+			continue
+		}
+		var cx, cy float64
+		var cnt int
+		for _, nid := range w.NodeIDs {
+			if c, ok := s.poiNodes[nid]; ok {
+				cx += c.Lat
+				cy += c.Lon
+				cnt++
+			}
+		}
+		if cnt == 0 {
+			continue
+		}
+		coord := osmmini.Coord{Lat: cx / float64(cnt), Lon: cy / float64(cnt)}
+		if s.window != nil && !s.window.Contains(coord) {
+			continue
+		}
+		scoredPOIs = append(scoredPOIs, scored{way: w, coord: coord, score: score})
+	}
+	s.poiMu.RUnlock()
+
+	slices.SortFunc(scoredPOIs, func(a, b scored) int {
+		if a.score != b.score {
+			if a.score > b.score {
+				return -1
+			}
+			return 1
+		}
+		al := formatSearchResultLabel("poi", a.way.Tags)
+		bl := formatSearchResultLabel("poi", b.way.Tags)
+		return strings.Compare(al, bl)
+	})
+
+	if len(scoredPOIs) > limit {
+		scoredPOIs = scoredPOIs[:limit]
+	}
+
+	out := make([]apiSearchResult, 0, len(scoredPOIs))
+	for _, item := range scoredPOIs {
+		out = append(out, buildSearchResult("poi", item.way.ID, item.coord, item.way.Tags, raw))
+	}
+	return out
+}
+
+func scorePOIResult(tags osmmini.Tags, query string, tokens []string) int {
+	if query == "" {
+		return 0
+	}
+	score := 0
+	score += scoreSearchField(tags["name"], query, tokens, 120, 100, 80, 12)
+	score += scoreSearchField(tags["brand"], query, tokens, 100, 85, 70, 10)
+	score += scoreSearchField(tags["operator"], query, tokens, 85, 70, 60, 8)
+	score += scoreSearchField(tags["shop"], query, tokens, 70, 55, 45, 7)
+	score += scoreSearchField(tags["amenity"], query, tokens, 70, 55, 45, 7)
+	score += scoreSearchField(tags["office"], query, tokens, 65, 50, 40, 6)
+	score += scoreSearchField(tags["tourism"], query, tokens, 60, 45, 35, 6)
+	score += scoreSearchField(tags["leisure"], query, tokens, 60, 45, 35, 6)
+	score += scoreSearchField(tags["addr:street"], query, tokens, 55, 45, 35, 5)
+	score += scoreSearchField(tags["addr:city"], query, tokens, 45, 35, 25, 4)
+	score += scoreSearchField(tags["addr:place"], query, tokens, 45, 35, 25, 4)
+	score += scoreSearchField(formatAddressLabel(tags), query, tokens, 75, 60, 45, 6)
+	if score > 0 && (tags["name"] != "" || tags["brand"] != "") && (tags["addr:street"] != "" || tags["addr:city"] != "" || tags["addr:place"] != "") {
+		score += 3
+	}
+	return score
+}
+
+func scoreSearchField(value, query string, tokens []string, exact, prefix, contains, tokenUnit int) int {
+	v := normalizeForCompare(value)
+	if v == "" || query == "" {
+		return 0
+	}
+	switch {
+	case v == query:
+		return exact
+	case strings.HasPrefix(v, query):
+		return prefix
+	case strings.Contains(v, query):
+		return contains
+	}
+
+	matched := 0
+	for _, tok := range tokens {
+		if tok != "" && strings.Contains(v, tok) {
+			matched++
+		}
+	}
+	if matched == len(tokens) && matched > 0 {
+		return tokenUnit * matched
+	}
+	if matched > 0 {
+		return tokenUnit
+	}
+	return 0
+}
+
+func buildSearchResult(kind string, id int64, coord osmmini.Coord, tags osmmini.Tags, rawQuery string) apiSearchResult {
+	label := formatSearchResultLabel(kind, tags)
+	return apiSearchResult{
+		ID:       id,
+		Kind:     kind,
+		Label:    label,
+		Subtitle: formatSearchResultSubtitle(kind, tags, label),
+		Match:    formatSearchMatchReason(kind, tags, rawQuery),
+		Lat:      coord.Lat,
+		Lon:      coord.Lon,
+		Tags:     tags,
+	}
+}
+
+func formatSearchResultLabel(kind string, tags osmmini.Tags) string {
+	if kind == "street" {
+		if street := strings.TrimSpace(tags["street"]); street != "" {
+			return street
+		}
+	}
+	if label := formatAddressLabel(tags); label != "" && label != "Adresse" {
+		return label
+	}
+	if category := primarySearchCategory(tags); category != "" {
+		return humanizeSearchValue(category)
+	}
+	switch kind {
+	case "street":
+		return "Straße"
+	case "poi":
+		return "Ort"
+	default:
+		return "Adresse"
+	}
+}
+
+func formatSearchResultSubtitle(kind string, tags osmmini.Tags, label string) string {
+	parts := make([]string, 0, 4)
+	if kind == "street" {
+		parts = append(parts, "Straße")
+	} else if category := primarySearchCategory(tags); category != "" {
+		parts = append(parts, humanizeSearchValue(category))
+	} else if kind == "address" {
+		parts = append(parts, "Adresse")
+	}
+
+	if operator := firstNonEmpty(tags["operator"], tags["brand"]); operator != "" && !normalizedContains(label, operator) {
+		parts = append(parts, operator)
+	}
+	if addrLine := formatAddressLine(tags); addrLine != "" && !normalizedContains(label, addrLine) {
+		parts = append(parts, addrLine)
+	}
+	if locality := formatLocality(tags); locality != "" && !normalizedContains(strings.Join(parts, " "), locality) && !normalizedContains(label, locality) {
+		parts = append(parts, locality)
+	}
+	return joinUniqueParts(parts)
+}
+
+func formatSearchMatchReason(kind string, tags osmmini.Tags, rawQuery string) string {
+	qNorm := normalizeForCompare(rawQuery)
+	if qNorm == "" {
+		return ""
+	}
+	tokens := strings.Fields(qNorm)
+	switch {
+	case kind == "street" || fieldsContainQuery(qNorm, tokens, tags["street"]):
+		return "Treffer über Straße"
+	case fieldsContainQuery(qNorm, tokens, tags["name"], tags["brand"], tags["operator"]):
+		return "Treffer über Name/Marke"
+	case fieldsContainQuery(qNorm, tokens, tags["shop"], tags["amenity"], tags["office"], tags["tourism"], tags["leisure"]):
+		return "Treffer über Kategorie"
+	case fieldsContainQuery(qNorm, tokens, tags["addr:city"], tags["addr:place"]):
+		return "Treffer über Ort"
+	case fieldsContainQuery(qNorm, tokens, tags["addr:street"], tags["addr:housenumber"], tags["addr:postcode"], formatAddressLabel(tags)):
+		return "Treffer über Adresse"
+	default:
+		return ""
+	}
+}
+
+func fieldsContainQuery(query string, tokens []string, values ...string) bool {
+	for _, value := range values {
+		v := normalizeForCompare(value)
+		if v == "" {
+			continue
+		}
+		if strings.Contains(v, query) || strings.Contains(query, v) {
+			return true
+		}
+		matched := 0
+		for _, tok := range tokens {
+			if tok != "" && strings.Contains(v, tok) {
+				matched++
+			}
+		}
+		if matched > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func primarySearchCategory(tags osmmini.Tags) string {
+	for _, key := range []string{"shop", "amenity", "office", "tourism", "leisure", "railway", "public_transport", "aeroway", "place", "natural"} {
+		if v := strings.TrimSpace(tags[key]); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func humanizeSearchValue(v string) string {
+	v = strings.TrimSpace(strings.ReplaceAll(v, "_", " "))
+	return v
+}
+
+func formatAddressLine(tags osmmini.Tags) string {
+	street := strings.TrimSpace(tags["addr:street"])
+	hn := strings.TrimSpace(tags["addr:housenumber"])
+	switch {
+	case street != "" && hn != "":
+		return street + " " + hn
+	case street != "":
+		return street
+	default:
+		return ""
+	}
+}
+
+func formatLocality(tags osmmini.Tags) string {
+	post := strings.TrimSpace(tags["addr:postcode"])
+	city := strings.TrimSpace(firstNonEmpty(tags["addr:city"], tags["addr:place"]))
+	return strings.TrimSpace(strings.Join([]string{post, city}, " "))
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func normalizedContains(haystack, needle string) bool {
+	return strings.Contains(normalizeForCompare(haystack), normalizeForCompare(needle))
+}
+
+func joinUniqueParts(parts []string) string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		key := normalizeForCompare(part)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, part)
+	}
+	return strings.Join(out, " • ")
 }
 
 func (s *server) handleRoute(w http.ResponseWriter, r *http.Request) {
@@ -3026,47 +3295,7 @@ func (s *server) buildLocationSuggestions(raw string, limit int) []apiSearchResu
 	if limit > 12 {
 		limit = 12
 	}
-
-	aq := osmmini.ParseAddressGuess(raw)
-	addrMatches := osmmini.SearchAddresses(s.addrs, aq, limit)
-	out := make([]apiSearchResult, 0, limit)
-	for _, m := range addrMatches {
-		if s.window != nil && !s.window.Contains(m.Coord) {
-			continue
-		}
-		out = append(out, apiSearchResult{
-			ID:    m.ID,
-			Kind:  "address",
-			Label: formatAddressLabel(m.Tags),
-			Lat:   m.Coord.Lat,
-			Lon:   m.Coord.Lon,
-			Tags:  m.Tags,
-		})
-		if len(out) >= limit {
-			return out
-		}
-	}
-	remain := limit - len(out)
-	if remain > 0 {
-		streets := s.router.SearchStreets(raw, remain)
-		for _, st := range streets {
-			if s.window != nil && !s.window.Contains(st.Coord) {
-				continue
-			}
-			out = append(out, apiSearchResult{
-				ID:    st.NodeID,
-				Kind:  "street",
-				Label: st.Name,
-				Lat:   st.Coord.Lat,
-				Lon:   st.Coord.Lon,
-				Tags:  osmmini.Tags{"street": st.Name},
-			})
-			if len(out) >= limit {
-				break
-			}
-		}
-	}
-	return out
+	return s.searchLocationResults(raw, limit)
 }
 
 func (s *server) resolveLocation(loc Location) (osmmini.Coord, string, string, error) {
@@ -3113,14 +3342,7 @@ func (s *server) resolveLocation(loc Location) (osmmini.Coord, string, string, e
 			suggestions := make([]apiSearchResult, 0, min(6, len(munichCandidates)))
 			for i := 0; i < len(munichCandidates) && i < 6; i++ {
 				c := munichCandidates[i]
-				suggestions = append(suggestions, apiSearchResult{
-					ID:    c.ID,
-					Kind:  "address",
-					Label: formatAddressLabel(c.Tags),
-					Lat:   c.Coord.Lat,
-					Lon:   c.Coord.Lon,
-					Tags:  c.Tags,
-				})
+				suggestions = append(suggestions, buildSearchResult("address", c.ID, c.Coord, c.Tags, raw))
 			}
 			return osmmini.Coord{}, "", "", &locationResolveError{
 				Message:     "mehrdeutiges Ziel, bitte auswählen",
@@ -3173,32 +3395,28 @@ func parseLatLon(raw string) (osmmini.Coord, bool) {
 }
 
 func formatAddressLabel(tags osmmini.Tags) string {
-	street := tags["addr:street"]
-	hn := tags["addr:housenumber"]
-	post := tags["addr:postcode"]
-	city := tags["addr:city"]
-	if city == "" {
-		city = tags["addr:place"]
-	}
-	name := tags["name"]
+	line1 := formatAddressLine(tags)
+	line2 := formatLocality(tags)
+	name := firstNonEmpty(tags["name"], tags["brand"], tags["operator"])
 
-	line1 := ""
 	switch {
-	case street != "" && hn != "":
-		line1 = street + " " + hn
-	case street != "":
-		line1 = street
-	case name != "":
-		line1 = name
-	default:
-		line1 = "Adresse"
-	}
-
-	line2 := strings.TrimSpace(strings.Join([]string{post, city}, " "))
-	if line2 != "" {
+	case name != "" && line1 != "" && line2 != "":
+		return name + " — " + line1 + ", " + line2
+	case name != "" && line1 != "":
+		return name + " — " + line1
+	case name != "" && line2 != "":
+		return name + ", " + line2
+	case line1 != "" && line2 != "":
 		return line1 + ", " + line2
+	case line1 != "":
+		return line1
+	case name != "":
+		return name
+	case line2 != "":
+		return line2
+	default:
+		return "Adresse"
 	}
-	return line1
 }
 
 func parseLimit(raw string, def, min, max int) int {
@@ -3323,10 +3541,10 @@ type aiQueryRequest struct {
 	// optional session id to enable multi-turn context
 	Session string `json:"session,omitempty"`
 	// optional current route context (from/to + stats)
-	RouteFrom     string  `json:"route_from,omitempty"`
-	RouteTo       string  `json:"route_to,omitempty"`
-	RouteDistM    float64 `json:"route_dist_m,omitempty"`
-	RouteDurS     float64 `json:"route_dur_s,omitempty"`
+	RouteFrom      string  `json:"route_from,omitempty"`
+	RouteTo        string  `json:"route_to,omitempty"`
+	RouteDistM     float64 `json:"route_dist_m,omitempty"`
+	RouteDurS      float64 `json:"route_dur_s,omitempty"`
 	RouteEngine    string  `json:"route_engine,omitempty"`
 	RouteObjective string  `json:"route_objective,omitempty"`
 	// bounding box of the current route path (for poi_on_route queries)
@@ -3770,14 +3988,11 @@ func (s *server) handleAIQuery(w http.ResponseWriter, r *http.Request) {
 		suggestions := make([]apiSearchResult, 0, suggestLimit)
 		for i := 0; i < suggestLimit; i++ {
 			m := matches[i]
-			suggestions = append(suggestions, apiSearchResult{
-				ID:    m.ID,
-				Kind:  "address",
-				Label: formatAddressLabel(m.Tags),
-				Lat:   m.Coord.Lat,
-				Lon:   m.Coord.Lon,
-				Tags:  m.Tags,
-			})
+			kind := "address"
+			if m.Tags["street"] != "" {
+				kind = "street"
+			}
+			suggestions = append(suggestions, buildSearchResult(kind, m.ID, m.Coord, m.Tags, place))
 		}
 
 		// find nearest by haversine
@@ -3795,7 +4010,12 @@ func (s *server) handleAIQuery(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		best := matches[bestIdx]
-		label := formatAddressLabel(best.Tags)
+		bestKind := "address"
+		if best.Tags["street"] != "" {
+			bestKind = "street"
+		}
+		bestResult := buildSearchResult(bestKind, best.ID, best.Coord, best.Tags, place)
+		label := bestResult.Label
 		// try to build a route from query coord to the POI node using server defaults
 		var routeObj *RouteResponse
 		startID, startDist, okF := s.router.NearestNode(qlat, qlon)
@@ -3824,7 +4044,14 @@ func (s *server) handleAIQuery(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// respond in German with found result and optional route
-		respTxt := fmt.Sprintf("Ich habe '%s' (Entfernung %.0f m) in der Nähe gefunden. Koordinaten: %.6f, %.6f.", label, bestDist, best.Coord.Lat, best.Coord.Lon)
+		respTxt := fmt.Sprintf("Ich habe '%s' gefunden", label)
+		if bestResult.Subtitle != "" {
+			respTxt += fmt.Sprintf(" (%s)", bestResult.Subtitle)
+		}
+		respTxt += fmt.Sprintf(". Entfernung %.0f m. Koordinaten: %.6f, %.6f.", bestDist, best.Coord.Lat, best.Coord.Lon)
+		if bestResult.Match != "" {
+			respTxt += " " + bestResult.Match + "."
+		}
 		if routeObj != nil {
 			respTxt += " Route berechnet."
 		} else {
@@ -3850,7 +4077,7 @@ func (s *server) handleAIQuery(w http.ResponseWriter, r *http.Request) {
 			fromLoc = &aiLocation{Query: fmt.Sprintf("%.6f,%.6f", qlatC, qlonC), Label: "Start", Lat: &qlatC, Lon: &qlonC}
 			tlat := best.Coord.Lat
 			tlon := best.Coord.Lon
-			toLoc = &aiLocation{Query: formatAddressLabel(best.Tags), Label: formatAddressLabel(best.Tags), Lat: &tlat, Lon: &tlon}
+			toLoc = &aiLocation{Query: label, Label: label, Lat: &tlat, Lon: &tlon}
 		}
 		writeJSON(w, http.StatusOK, aiQueryResponse{Provider: "local", Model: "local-search", Response: respTxt, Route: routeObj, Suggestions: suggestions, From: fromLoc, To: toLoc})
 		return
@@ -4559,15 +4786,21 @@ func (s *server) handleIntentLocally(ctx context.Context, w http.ResponseWriter,
 			fromAI = fa
 			toAI = ta
 			if toAI != nil {
-				toAI.Label = best.Label
-				toAI.Query = best.Label
+				bestSearch := buildSearchResult("poi", best.ID, best.Coord, best.Tags, intent.POIType)
+				toAI.Label = bestSearch.Label
+				toAI.Query = bestSearch.Label
 			}
 		}
 		suggestions := make([]apiSearchResult, 0, len(results))
 		for _, r := range results {
-			suggestions = append(suggestions, apiSearchResult{ID: r.ID, Kind: "poi", Label: r.Label, Lat: r.Coord.Lat, Lon: r.Coord.Lon, Tags: r.Tags})
+			suggestions = append(suggestions, buildSearchResult("poi", r.ID, r.Coord, r.Tags, intent.POIType))
 		}
-		resp := fmt.Sprintf("%d **%s** in der Nähe gefunden. Nächste: **%s** (%.0f m).", len(results), intent.POIType, best.Label, best.DistM)
+		bestSearch := buildSearchResult("poi", best.ID, best.Coord, best.Tags, intent.POIType)
+		resp := fmt.Sprintf("%d **%s** in der Nähe gefunden. Nächste: **%s**", len(results), intent.POIType, bestSearch.Label)
+		if bestSearch.Subtitle != "" {
+			resp += fmt.Sprintf(" (%s)", bestSearch.Subtitle)
+		}
+		resp += fmt.Sprintf(" (%.0f m).", best.DistM)
 		if routeObj != nil {
 			resp += " Route berechnet."
 		}
@@ -4636,9 +4869,14 @@ func (s *server) handleIntentLocally(ctx context.Context, w http.ResponseWriter,
 		}
 		suggestions := make([]apiSearchResult, 0, len(results))
 		for _, r := range results {
-			suggestions = append(suggestions, apiSearchResult{ID: r.ID, Kind: "poi", Label: r.Label, Lat: r.Coord.Lat, Lon: r.Coord.Lon, Tags: r.Tags})
+			suggestions = append(suggestions, buildSearchResult("poi", r.ID, r.Coord, r.Tags, intent.POIType))
 		}
-		resp := fmt.Sprintf("%d **%s** auf der Route. Nächste: **%s**.", len(results), intent.POIType, results[0].Label)
+		bestSearch := buildSearchResult("poi", results[0].ID, results[0].Coord, results[0].Tags, intent.POIType)
+		resp := fmt.Sprintf("%d **%s** auf der Route. Nächste: **%s**", len(results), intent.POIType, bestSearch.Label)
+		if bestSearch.Subtitle != "" {
+			resp += fmt.Sprintf(" (%s)", bestSearch.Subtitle)
+		}
+		resp += "."
 		writeJSON(w, http.StatusOK, aiQueryResponse{Provider: "local", Model: "poi-on-route", Response: resp, Suggestions: suggestions})
 		return true
 
@@ -4711,15 +4949,21 @@ func (s *server) handleIntentLocally(ctx context.Context, w http.ResponseWriter,
 			fromAI = fa
 			toAI = ta
 			if toAI != nil {
-				toAI.Label = best.Label
-				toAI.Query = best.Label
+				bestSearch := buildSearchResult("poi", best.ID, best.Coord, best.Tags, intent.POIType)
+				toAI.Label = bestSearch.Label
+				toAI.Query = bestSearch.Label
 			}
 		}
 		suggestions := make([]apiSearchResult, 0, len(results))
 		for _, r := range results {
-			suggestions = append(suggestions, apiSearchResult{ID: r.ID, Kind: "poi", Label: r.Label, Lat: r.Coord.Lat, Lon: r.Coord.Lon, Tags: r.Tags})
+			suggestions = append(suggestions, buildSearchResult("poi", r.ID, r.Coord, r.Tags, intent.POIType))
 		}
-		resp := fmt.Sprintf("Nächstes passendes Ziel: **%s** (%.0f m).", best.Label, best.DistM)
+		bestSearch := buildSearchResult("poi", best.ID, best.Coord, best.Tags, intent.POIType)
+		resp := fmt.Sprintf("Nächstes passendes Ziel: **%s**", bestSearch.Label)
+		if bestSearch.Subtitle != "" {
+			resp += fmt.Sprintf(" (%s)", bestSearch.Subtitle)
+		}
+		resp += fmt.Sprintf(" (%.0f m).", best.DistM)
 		if routeObj != nil {
 			resp += fmt.Sprintf(" %.1f km, ca. %s.", routeObj.DistanceM/1000, formatDur(routeObj.DurationS))
 		}
