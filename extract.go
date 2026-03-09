@@ -1298,4 +1298,3 @@ func skipField(wire int, b []byte, i *int) error {
 		return fmt.Errorf("unsupported wire type: %d", wire)
 	}
 }
-

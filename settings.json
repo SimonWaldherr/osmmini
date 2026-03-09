@@ -1,27 +1,27 @@
 {
   "routing": {
     "engine": "dijkstra",
-    "objective": "duration",
-    "pro": true,
+    "objective": "distance",
+    "pro": false,
     "weights": {
-      "left_turn": 2.4,
+      "left_turn": 0,
       "right_turn": 0,
       "u_turn": 0,
       "crossing": 0,
-      "max_speed_kph": 150,
+      "max_speed_kph": 0,
       "vehicle_height_m": 0,
-      "vehicle_weight_t": 0,
-      "no_left_turn": false,
-      "traffic_light_penalty": 0
+      "vehicle_weight_t": 0
     },
-    "emergency_mode": false
+    "emergency_mode": true
   },
   "tiles": {
     "cache_dir": "tiles-cache",
-    "upstream": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-    "user_agent": "osmmini-routerd/1.0 (offline routing)"
-  }
-  ,
+    "upstream": "",
+    "user_agent": "osmmini-routerd/1.0 (offline routing)",
+    "map_type": "vector",
+    "style_url": "https://demotiles.maplibre.org/style.json",
+    "attribution": "© MapLibre"
+  },
   "default_highway_speeds": {
     "motorway": 150
   }

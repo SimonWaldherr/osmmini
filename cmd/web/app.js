@@ -13,6 +13,8 @@ try {
 
 const map = L.map('map').setView([48.7, 12.7], 10);
 let currentTileLayer = null;
+let userLocationMarker = null;
+let searchResultMarkers = [];
 
 // Dynamic script/css loader helpers (used for MapLibre GL lazy-loading)
 function _loadScript(src) {
@@ -89,6 +91,28 @@ function showToast(message, type = 'info', duration = 3000) {
   }, duration);
 }
 
+// Use browser geolocation to set 'from' input and center the map
+document.getElementById('useLocationBtn')?.addEventListener('click', async () => {
+  if (!navigator.geolocation) {
+    showToast('Geolocation wird von diesem Browser nicht unterstützt', 'error');
+    return;
+  }
+  showToast('Standort wird ermittelt…', 'info', 3000);
+  navigator.geolocation.getCurrentPosition((pos) => {
+    const lat = pos.coords.latitude;
+    const lon = pos.coords.longitude;
+    const fromInput = document.getElementById('from');
+    if (fromInput) fromInput.value = `${lat.toFixed(6)},${lon.toFixed(6)}`;
+    // set user marker
+    if (userLocationMarker) userLocationMarker.remove();
+    userLocationMarker = L.circleMarker([lat, lon], { radius:6, color:'#2ee6a7', fillColor:'#2ee6a7', fillOpacity:0.9 }).addTo(map).bindPopup('Ihr Standort').openPopup();
+    map.setView([lat, lon], 14);
+    showToast('Standort gesetzt', 'success', 1500);
+  }, (err) => {
+    showToast('Standort konnte nicht ermittelt werden: ' + (err.message||''), 'error', 4000);
+  }, { enableHighAccuracy: true, timeout: 10000 });
+});
+
 // Debounce helper for performance (defined early so UI code can reference it)
 function debounce(func, wait) {
   let timeout;
@@ -111,6 +135,7 @@ const stops = []; // map markers
 const waypoints = []; // input waypoints
 let stopSeq = 1;
 let waypointSeq = 1;
+let lastAIResponse = null;
 
 // Prevent Safari autofill on input fields
 function preventAutofill() {
@@ -638,6 +663,17 @@ function addWaypoint() {
   });
 }
 
+// helper: add a waypoint and set its input value
+function addWaypointWithValue(val) {
+  addWaypoint();
+  const wp = waypoints[waypoints.length - 1];
+  if (wp && wp.input) {
+    wp.input.value = val;
+    debouncedCompute();
+  }
+  return wp;
+}
+
 function removeWaypoint(id) {
   const idx = waypoints.findIndex(w => w.id === id);
   if (idx >= 0) {
@@ -707,6 +743,8 @@ function makeSuggest(containerId, inputOrId) {
           el.onclick = () => { input.value = primary || item.label || ''; hide(); compute(); input.focus(); };
           container.appendChild(el);
         });
+        // also show all returned results on the map
+        try { showSearchResultsOnMap(data); } catch(e) {}
         updateActive();
         show();
       } catch (err) {
@@ -750,6 +788,34 @@ function makeSuggest(containerId, inputOrId) {
   document.addEventListener('click', (ev) => {
     if (!container.contains(ev.target) && ev.target !== input) hide();
   });
+}
+
+function clearSearchResults() {
+  searchResultMarkers.forEach(m => m.remove());
+  searchResultMarkers = [];
+}
+
+function showSearchResultsOnMap(results) {
+  clearSearchResults();
+  if (!Array.isArray(results) || results.length === 0) return;
+  const bounds = [];
+  results.forEach((item, idx) => {
+    if (!item || !item.lat || !item.lon) return;
+    const m = L.marker([item.lat, item.lon], { title: item.label || '' }).addTo(map);
+    const tags = item.tags || {};
+    let popupHtml = `<strong>${escapeHtml(item.label || '')}</strong><br/>`;
+    if (tags['addr:street'] || tags['addr:housenumber']) popupHtml += `${escapeHtml(tags['addr:street']||'')} ${escapeHtml(tags['addr:housenumber']||'')}<br/>`;
+    popupHtml += `<small style="opacity:0.8">${escapeHtml((tags['addr:city']||''))}</small>`;
+    m.bindPopup(popupHtml);
+    m.on('click', () => { m.openPopup(); });
+    searchResultMarkers.push(m);
+    bounds.push([item.lat, item.lon]);
+  });
+  if (bounds.length === 1) {
+    map.panTo(bounds[0]);
+  } else if (bounds.length > 1) {
+    try { map.fitBounds(bounds, { padding: [40, 40] }); } catch(e) {}
+  }
 }
 
 // simple HTML escaper for suggestion labels
@@ -1287,10 +1353,37 @@ async function sendAIQuery() {
   
   try {
     const model = document.getElementById('aiModel').value || '';
+    // include map center as location hint if available
+    const payload = { prompt, model };
+    try {
+      if (window.map && typeof map.getCenter === 'function') {
+        const c = map.getCenter();
+        if (c && typeof c.lat === 'number' && typeof c.lng === 'number') {
+          payload.lat = c.lat;
+          payload.lon = c.lng;
+        }
+      }
+    } catch (e) {}
+    // Follow-up handling: if user asks duration and we have a recent route, answer locally
+    const lowerPrompt = (prompt || '').toLowerCase();
+    if ((lowerPrompt.includes('wie lange') || lowerPrompt.includes('dauert') || lowerPrompt.includes('wie lang')) && lastAIResponse && lastAIResponse.route) {
+      // show assistant quick reply with duration/distance
+      const meta = lastAIResponse.route;
+      const distKm = (meta.distance_m/1000).toFixed(2);
+      const durMin = Math.round(meta.duration_s/60);
+      const durText = durMin >= 60 ? Math.floor(durMin/60) + 'h ' + (durMin%60) + 'min' : durMin + ' min';
+      loadingMsg.innerHTML = `<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">local/assistant</div>Die Fahrt dauert ca. <strong>${durText}</strong> (${distKm} km).`;
+      renderPath(meta.path, meta);
+      setMapsLinks(meta.google_maps_url || meta.googleMapsURL || '', meta.apple_maps_url || meta.appleMapsURL || '');
+      sendBtn.disabled = false;
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      return;
+    }
+
     const res = await fetch('/api/v1/ai/query', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({prompt, model})
+      body: JSON.stringify(payload)
     });
     
     if (!res.ok) {
@@ -1299,8 +1392,50 @@ async function sendAIQuery() {
     }
     
     const data = await res.json();
-    loadingMsg.textContent = data.response;
+    // remember for follow-ups
+    try { lastAIResponse = data; } catch(e){}
     loadingMsg.innerHTML = `<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">${escapeHtml(data.provider)}/${escapeHtml(data.model)}</div>${escapeHtml(data.response)}`;
+    // If the AI returned a computed route, render it on the map and fill inputs
+    try {
+      if (data && data.route && data.route.path && data.route.path.length) {
+        renderPath(data.route.path, data.route);
+        // Fill from/to inputs so user can tweak/compute further
+        try {
+          const fromEl = document.getElementById('from');
+          const toEl = document.getElementById('to');
+          if (fromEl && data.from && data.from.query) fromEl.value = data.from.query;
+          if (toEl && data.to && data.to.query) toEl.value = data.to.query;
+        } catch (e) {}
+        setMapsLinks(data.route.google_maps_url || data.route.googleMapsURL || '', data.route.apple_maps_url || data.route.appleMapsURL || '');
+        showToast('KI: Route berechnet und angezeigt', 'success', 1800);
+      }
+      // If the AI returned suggestions (multiple POI matches), show them on the map
+      if (data && data.suggestions && Array.isArray(data.suggestions) && data.suggestions.length) {
+        // the map marker display expects objects with lat/lon/label
+        showSearchResultsOnMap(data.suggestions);
+        // if user asked for stops (via / mit / stop), auto-add suggestions as waypoints
+        const p = prompt.toLowerCase();
+        if (p.includes('mit') || p.includes('via') || p.includes('stopp') || p.includes('stopps') || p.includes('zwischen')) {
+          data.suggestions.forEach(s => {
+            const val = s.label || s.Label || (s.tags && s.tags.name) || '';
+            if (val) addWaypointWithValue(val);
+          });
+          showToast('KI: Vorschläge als Zwischenstopps hinzugefügt', 'success', 1800);
+        }
+      }
+      // If AI provided structured from/to/waypoints, apply them
+      try {
+        if (data && data.from) {
+          const fe = document.getElementById('from'); if (fe && data.from.query) fe.value = data.from.query;
+        }
+        if (data && data.to) {
+          const te = document.getElementById('to'); if (te && data.to.query) te.value = data.to.query;
+        }
+        if (data && data.waypoints && Array.isArray(data.waypoints)) {
+          data.waypoints.forEach(w => { if (w && w.query) addWaypointWithValue(w.query); });
+        }
+      } catch (e) {}
+    } catch (e) { console.warn('Failed to render AI route/suggestions', e); }
   } catch (e) {
     loadingMsg.textContent = '❌ ' + (e.message || 'Fehler');
     loadingMsg.style.color = '#ff6b6b';

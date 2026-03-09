@@ -51,14 +51,14 @@ const (
 type VehicleProfile string
 
 const (
-	ProfileCar          VehicleProfile = "car"           // standard passenger car
-	ProfileDelivery     VehicleProfile = "delivery"      // light delivery van (urban streets)
-	ProfileTruck        VehicleProfile = "truck"         // heavy goods vehicle (HGV)
-	ProfileTravel       VehicleProfile = "travel"        // long-distance / touring
-	ProfileFirefighting VehicleProfile = "firefighting"  // fire engine (ignores some restrictions)
-	ProfileEmergency    VehicleProfile = "emergency"     // ambulance / police
-	ProfileCycling      VehicleProfile = "cycling"       // bicycle
-	ProfileWalking      VehicleProfile = "walking"       // pedestrian
+	ProfileCar          VehicleProfile = "car"          // standard passenger car
+	ProfileDelivery     VehicleProfile = "delivery"     // light delivery van (urban streets)
+	ProfileTruck        VehicleProfile = "truck"        // heavy goods vehicle (HGV)
+	ProfileTravel       VehicleProfile = "travel"       // long-distance / touring
+	ProfileFirefighting VehicleProfile = "firefighting" // fire engine (ignores some restrictions)
+	ProfileEmergency    VehicleProfile = "emergency"    // ambulance / police
+	ProfileCycling      VehicleProfile = "cycling"      // bicycle
+	ProfileWalking      VehicleProfile = "walking"      // pedestrian
 )
 
 // VehicleProfileDef defines the pre-set routing parameters for a VehicleProfile.
@@ -163,12 +163,12 @@ type ProWeights struct {
 // When Profile is set the matching VehicleProfileDef supplies sensible
 // defaults; explicit fields in Weights override those defaults.
 type RouteOptions struct {
-	Engine    RouteEngine    `json:"engine,omitempty"`
-	Objective Objective      `json:"objective"`
-	Profile   VehicleProfile `json:"profile,omitempty"`
-	Pro       bool           `json:"pro"`
-	Weights   ProWeights     `json:"weights"`
-  EmergencyMode bool        `json:"emergency_mode,omitempty"`
+	Engine        RouteEngine    `json:"engine,omitempty"`
+	Objective     Objective      `json:"objective"`
+	Profile       VehicleProfile `json:"profile,omitempty"`
+	Pro           bool           `json:"pro"`
+	Weights       ProWeights     `json:"weights"`
+	EmergencyMode bool           `json:"emergency_mode,omitempty"`
 }
 
 func (o RouteOptions) withDefaults() RouteOptions {
@@ -1286,10 +1286,10 @@ type dijkstraItem struct {
 // pqWrapper adapts a []*dijkstraItem slice to heap.Interface for dijkstraNode.
 type pqWrapper struct{ s *[]*dijkstraItem }
 
-func (w pqWrapper) Len() int            { return len(*w.s) }
-func (w pqWrapper) Less(i, j int) bool  { return (*w.s)[i].dist < (*w.s)[j].dist }
-func (w pqWrapper) Swap(i, j int)       { (*w.s)[i], (*w.s)[j] = (*w.s)[j], (*w.s)[i] }
-func (w *pqWrapper) Push(x any) { *w.s = append(*w.s, x.(*dijkstraItem)) }
+func (w pqWrapper) Len() int           { return len(*w.s) }
+func (w pqWrapper) Less(i, j int) bool { return (*w.s)[i].dist < (*w.s)[j].dist }
+func (w pqWrapper) Swap(i, j int)      { (*w.s)[i], (*w.s)[j] = (*w.s)[j], (*w.s)[i] }
+func (w *pqWrapper) Push(x any)        { *w.s = append(*w.s, x.(*dijkstraItem)) }
 func (w *pqWrapper) Pop() any {
 	old := *w.s
 	n := len(old)

@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -46,10 +47,10 @@ type TileSettings struct {
 	CacheDir     string `json:"cache_dir"`
 	Upstream     string `json:"upstream"`
 	UserAgent    string `json:"user_agent"`
-	MapType      string `json:"map_type,omitempty"`      // "raster" (default), "vector", "wms"
-	StyleURL     string `json:"style_url,omitempty"`     // vector: MapLibre GL style URL
-	WMSLayers    string `json:"wms_layers,omitempty"`    // wms: comma-separated layer names
-	Attribution  string `json:"attribution,omitempty"`   // attribution text shown on the map
+	MapType      string `json:"map_type,omitempty"`       // "raster" (default), "vector", "wms"
+	StyleURL     string `json:"style_url,omitempty"`      // vector: MapLibre GL style URL
+	WMSLayers    string `json:"wms_layers,omitempty"`     // wms: comma-separated layer names
+	Attribution  string `json:"attribution,omitempty"`    // attribution text shown on the map
 	MemCacheSize int    `json:"mem_cache_size,omitempty"` // L1 in-memory tile cache capacity (0 = default 512)
 }
 
@@ -105,8 +106,8 @@ var BuiltinTilePresets = []TileSourcePreset{
 	},
 	{
 		ID: "geodaten_bavaria", Label: "Geodaten Bayern – BayernAtlas", MapType: "wms",
-		Upstream:    "https://geoservices.bayern.de/wms/v2/ogc_bayernatlas.cgi",
-		WMSLayers:   "by_dtk",
+		Upstream:    "https://geoservices.bayern.de/od/wms/dop/v1/dop20?",
+		WMSLayers:   "by_dop20c",
 		Attribution: "© Bayerische Vermessungsverwaltung", MaxZoom: 18,
 	},
 	{
@@ -478,13 +479,49 @@ func (tc *TileCache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Miss: fetch from upstream
-	up := cfg.Upstream
-	up = strings.ReplaceAll(up, "{z}", strconv.Itoa(z))
-	up = strings.ReplaceAll(up, "{x}", strconv.Itoa(x))
-	up = strings.ReplaceAll(up, "{y}", strconv.Itoa(y))
-
-	req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, up, nil)
+	// Miss: fetch from upstream. Support both tile template upstreams and
+	// WMS endpoints (when cfg.MapType == "wms"). For WMS we compute the
+	// EPSG:3857 bounding box for the tile and perform a GetMap request.
+	var req *http.Request
+	if cfg.MapType == "wms" {
+		// Compute EPSG:3857 bbox for the slippy tile
+		minx, miny, maxx, maxy := tileBBox3857(z, x, y)
+		layers := cfg.WMSLayers
+		// Build GetMap URL (WMS 1.3.0 using CRS=EPSG:3857)
+		// Many WMS servers also accept CRS param and width/height.
+		up := cfg.Upstream
+		// Ensure no trailing query markers
+		sep := "?"
+		if strings.Contains(up, "?") {
+			sep = "&"
+		}
+		wmsURL := fmt.Sprintf("%s%vSERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&CRS=EPSG:3857&LAYERS=%s&BBOX=%f,%f,%f,%f&WIDTH=256&HEIGHT=256&FORMAT=image/png",
+			up, sep, url.QueryEscape(layers), minx, miny, maxx, maxy)
+		var err error
+		req, err = http.NewRequestWithContext(r.Context(), http.MethodGet, wmsURL, nil)
+		if err != nil {
+			tc.mu.Lock()
+			tc.stats.errors++
+			tc.mu.Unlock()
+			http.Error(w, "tile upstream error", http.StatusBadGateway)
+			return
+		}
+	} else {
+		// Template-based upstream (e.g., {z}/{x}/{y}.png)
+		up := cfg.Upstream
+		up = strings.ReplaceAll(up, "{z}", strconv.Itoa(z))
+		up = strings.ReplaceAll(up, "{x}", strconv.Itoa(x))
+		up = strings.ReplaceAll(up, "{y}", strconv.Itoa(y))
+		var err error
+		req, err = http.NewRequestWithContext(r.Context(), http.MethodGet, up, nil)
+		if err != nil {
+			tc.mu.Lock()
+			tc.stats.errors++
+			tc.mu.Unlock()
+			http.Error(w, "tile upstream error", http.StatusBadGateway)
+			return
+		}
+	}
 	if cfg.UserAgent != "" {
 		req.Header.Set("User-Agent", cfg.UserAgent)
 	}
@@ -537,6 +574,35 @@ func readFileIfExists(path string) ([]byte, bool) {
 		return nil, false
 	}
 	return b, true
+}
+
+// tileBBox3857 returns the bounding box (minx,miny,maxx,maxy) in EPSG:3857
+// for the given slippy tile coordinates (z, x, y).
+func tileBBox3857(z, x, y int) (float64, float64, float64, float64) {
+	n := math.Pow(2, float64(z))
+	lonMin := float64(x)/n*360.0 - 180.0
+	lonMax := float64(x+1)/n*360.0 - 180.0
+
+	latMax := tileYToLat(y, z)
+	latMin := tileYToLat(y+1, z)
+
+	// convert degrees to WebMercator meters
+	const originShift = 20037508.342789244
+	minx := lonMin * originShift / 180.0
+	maxx := lonMax * originShift / 180.0
+
+	miny := math.Log(math.Tan((90.0+latMin)*math.Pi/360.0)) / (math.Pi / 180.0)
+	miny = miny * originShift / 180.0
+	maxy := math.Log(math.Tan((90.0+latMax)*math.Pi/360.0)) / (math.Pi / 180.0)
+	maxy = maxy * originShift / 180.0
+
+	return minx, miny, maxx, maxy
+}
+
+func tileYToLat(y, z int) float64 {
+	n := math.Pow(2, float64(z))
+	latRad := math.Atan(math.Sinh(math.Pi * (1 - 2*float64(y)/n)))
+	return latRad * 180.0 / math.Pi
 }
 
 // ---- API types ----
@@ -1937,15 +2003,30 @@ type aiStatusResponse struct {
 
 // aiQueryRequest is the body for POST /api/v1/ai/query.
 type aiQueryRequest struct {
-	Prompt string `json:"prompt"`
-	Model  string `json:"model,omitempty"`
+	Prompt string   `json:"prompt"`
+	Model  string   `json:"model,omitempty"`
+	Lat    *float64 `json:"lat,omitempty"`
+	Lon    *float64 `json:"lon,omitempty"`
+}
+
+// aiLocation is a lightweight location descriptor returned in AI responses.
+type aiLocation struct {
+	Query string   `json:"query,omitempty"`
+	Label string   `json:"label,omitempty"`
+	Lat   *float64 `json:"lat,omitempty"`
+	Lon   *float64 `json:"lon,omitempty"`
 }
 
 // aiQueryResponse is returned by POST /api/v1/ai/query.
 type aiQueryResponse struct {
-	Provider string `json:"provider"`
-	Model    string `json:"model"`
-	Response string `json:"response"`
+	Provider    string            `json:"provider"`
+	Model       string            `json:"model"`
+	Response    string            `json:"response"`
+	Route       *RouteResponse    `json:"route,omitempty"`
+	Suggestions []apiSearchResult `json:"suggestions,omitempty"`
+	From        *aiLocation       `json:"from,omitempty"`
+	To          *aiLocation       `json:"to,omitempty"`
+	Waypoints   []aiLocation      `json:"waypoints,omitempty"`
 }
 
 // probeAIProvider checks if a provider is reachable and fetches available models.
@@ -2052,6 +2133,238 @@ func (s *server) handleAIQuery(w http.ResponseWriter, r *http.Request) {
 		"darüber hinaus Greedy mit 2-opt), Linksabbiege-Vermeidung, Ampelstrafen, " +
 		"BOS/Einsatzmodus (Feuerwehr, Rettungsdienst), Fahrzeugbeschränkungen (Höhe, Gewicht). " +
 		"Antworte kurz und hilfreich auf Deutsch."
+
+	// Quick heuristic: if the user asks for the "nearest" X, try to answer
+	// directly from local OSM data instead of querying the LLM. This allows
+	// the assistant to return actual nearby POIs and compute a route when a
+	// reference location (lat/lon) is provided in the prompt.
+	lower := strings.ToLower(req.Prompt)
+	if strings.Contains(lower, "nächste") || strings.Contains(lower, "nächster") || strings.Contains(lower, "nearest") || strings.Contains(lower, "near me") || strings.Contains(lower, "in der nähe") {
+		// Determine query coordinates: prefer explicit lat/lon fields from the
+		// request, otherwise try to extract coordinates from the prompt text.
+		coordFound := false
+		var qlat, qlon float64
+		if req.Lat != nil && req.Lon != nil {
+			qlat, qlon = *req.Lat, *req.Lon
+			coordFound = true
+		}
+
+		// crude float pair regex for coords in prompt
+		re := regexp.MustCompile(`([-+]?[0-9]*\.?[0-9]+)\s*,?\s*([-+]?[0-9]*\.?[0-9]+)`)
+		if !coordFound {
+			if m := re.FindStringSubmatch(req.Prompt); len(m) == 3 {
+				if f1, err1 := strconv.ParseFloat(m[1], 64); err1 == nil {
+					if f2, err2 := strconv.ParseFloat(m[2], 64); err2 == nil {
+						// determine which is lat and lon by range
+						if f1 >= -90 && f1 <= 90 && f2 >= -180 && f2 <= 180 {
+							qlat, qlon = f1, f2
+							coordFound = true
+						} else if f2 >= -90 && f2 <= 90 && f1 >= -180 && f1 <= 180 {
+							qlat, qlon = f2, f1
+							coordFound = true
+						}
+					}
+				}
+			}
+		}
+		if !coordFound {
+			writeJSONError(w, http.StatusBadRequest, "Bitte geben Sie Ihren Standort (lat lon) an, z.B. '48.1351,11.5820', oder stellen Sie die Frage mit 'near me'.")
+			return
+		}
+
+		// Heuristic: extract place name by removing common phrasing and coords.
+		place := strings.TrimSpace(req.Prompt)
+		// common English/German phrases
+		pats := []string{"wo ist der nächste", "wo ist der nächster", "where is the nearest", "nearest", "nächste", "nächster", "in der nähe", "in der Nähe", "near me", "wo ist", "wo", "ist", "der", "die", "das"}
+		for _, p := range pats {
+			place = strings.ReplaceAll(strings.ToLower(place), strings.ToLower(p), "")
+		}
+		// strip coords
+		place = re.ReplaceAllString(place, "")
+		place = strings.Trim(place, " ?.!\n\r\t")
+		if place == "" {
+			writeJSONError(w, http.StatusBadRequest, "Bitte nennen Sie das Ziel (z. B. 'McDonald's') zusammen mit Ihrem Standort.")
+			return
+		}
+
+		// Normalize common brand/name variants (e.g., McDonald's)
+		norm := func(s string) string {
+			s = strings.ToLower(s)
+			s = strings.ReplaceAll(s, "'", "")
+			s = strings.ReplaceAll(s, "\u2019", "") // right single quote
+			s = strings.ReplaceAll(s, "\u2018", "") // left single quote
+			s = strings.ReplaceAll(s, "-", "")
+			s = strings.ReplaceAll(s, " ", "")
+			s = strings.ReplaceAll(s, "mcdonalds", "mcdonalds")
+			s = strings.ReplaceAll(s, "mcdonald", "mcdonalds")
+			s = strings.ReplaceAll(s, "mcdo", "mcdonalds")
+			return s
+		}
+		placeNorm := norm(place)
+
+		// First try to recognise simple POI types (lakes, forests, etc.)
+		matches := []osmmini.AddressEntry{}
+		loweredPlace := strings.ToLower(place)
+		isPOIHandled := false
+		if strings.Contains(loweredPlace, "see") || strings.Contains(loweredPlace, "lake") {
+			// lakes/ponds: natural=water OR water=lake OR name contains 'see'
+			for _, a := range s.addrs {
+				if a.Tags["natural"] == "water" || a.Tags["water"] == "lake" {
+					matches = append(matches, a)
+					continue
+				}
+				n := strings.ToLower(a.Tags["name"])
+				if n != "" && strings.Contains(n, "see") {
+					matches = append(matches, a)
+				}
+			}
+			isPOIHandled = true
+		}
+		if !isPOIHandled && (strings.Contains(loweredPlace, "wald") || strings.Contains(loweredPlace, "forest")) {
+			// forests: landuse=forest or natural=wood or name contains 'wald'
+			for _, a := range s.addrs {
+				if a.Tags["landuse"] == "forest" || a.Tags["natural"] == "wood" {
+					matches = append(matches, a)
+					continue
+				}
+				n := strings.ToLower(a.Tags["name"])
+				if n != "" && strings.Contains(n, "wald") {
+					matches = append(matches, a)
+				}
+			}
+			isPOIHandled = true
+		}
+		// If we didn't handle a POI keyword specifically, fall back to structured address search
+		if !isPOIHandled {
+			aq := osmmini.ParseAddressGuess(place)
+			matches = osmmini.SearchAddresses(s.addrs, aq, 50)
+		}
+
+		// If no structured matches, try fuzzy name/brand scan over addresses
+		if len(matches) == 0 {
+			for _, a := range s.addrs {
+				name := strings.ToLower(a.Tags["name"])
+				brand := strings.ToLower(a.Tags["brand"])
+				if name != "" && strings.Contains(strings.ReplaceAll(name, " ", ""), placeNorm) {
+					matches = append(matches, a)
+					continue
+				}
+				if brand != "" && strings.Contains(strings.ReplaceAll(brand, " ", ""), placeNorm) {
+					matches = append(matches, a)
+					continue
+				}
+				// also check amenity/brand combinations for fast_food
+				if a.Tags["amenity"] == "fast_food" && (strings.Contains(name, "mcdonald") || strings.Contains(brand, "mcdonald")) {
+					matches = append(matches, a)
+				}
+			}
+		}
+
+		// also search streets as fallback
+		if len(matches) == 0 {
+			streets := s.router.SearchStreets(place, 20)
+			for _, st := range streets {
+				matches = append(matches, osmmini.AddressEntry{ID: st.NodeID, Coord: st.Coord, Tags: osmmini.Tags{"street": st.Name}})
+			}
+		}
+		if len(matches) == 0 {
+			writeJSONError(w, http.StatusNotFound, "Kein passendes Ziel gefunden für: "+place)
+			return
+		}
+
+		// Build suggestions list (top matches) to return to the UI
+		suggestLimit := 6
+		if len(matches) < suggestLimit {
+			suggestLimit = len(matches)
+		}
+		suggestions := make([]apiSearchResult, 0, suggestLimit)
+		for i := 0; i < suggestLimit; i++ {
+			m := matches[i]
+			suggestions = append(suggestions, apiSearchResult{
+				ID:    m.ID,
+				Kind:  "address",
+				Label: formatAddressLabel(m.Tags),
+				Lat:   m.Coord.Lat,
+				Lon:   m.Coord.Lon,
+				Tags:  m.Tags,
+			})
+		}
+
+		// find nearest by haversine
+		bestIdx := -1
+		bestDist := math.MaxFloat64
+		for i, m := range matches {
+			d := haversineMeters(qlat, qlon, m.Coord.Lat, m.Coord.Lon)
+			if d < bestDist {
+				bestDist = d
+				bestIdx = i
+			}
+		}
+		if bestIdx == -1 {
+			writeJSONError(w, http.StatusNotFound, "Kein passendes Ziel gefunden")
+			return
+		}
+		best := matches[bestIdx]
+		label := formatAddressLabel(best.Tags)
+		// try to build a route from query coord to the POI node using server defaults
+		var routeObj *RouteResponse
+		startID, startDist, okF := s.router.NearestNode(qlat, qlon)
+		endID, endDist, okT := s.router.NearestNode(best.Coord.Lat, best.Coord.Lon)
+		if okF && okT {
+			opt := s.settings.Get().Routing
+			if res, err := s.router.RouteWithOptions(ctx, startID, endID, opt); err == nil && len(res.PathCoords) > 0 {
+				gURL := buildGoogleMapsURL([]osmmini.Coord{{Lat: qlat, Lon: qlon}, best.Coord}, 0)
+				aURL := buildAppleMapsURL([]osmmini.Coord{{Lat: qlat, Lon: qlon}, best.Coord})
+				steps := s.router.ManeuversForPath(res.Path, opt)
+				routeObj = &RouteResponse{
+					From:          RoutePoint{Input: fmt.Sprintf("%.6f %.6f", qlat, qlon), Label: "Start", Lat: qlat, Lon: qlon, Node: startID, SnapM: startDist},
+					To:            RoutePoint{Input: formatAddressLabel(best.Tags), Label: label, Lat: best.Coord.Lat, Lon: best.Coord.Lon, Node: endID, SnapM: endDist},
+					Engine:        string(res.Engine),
+					Objective:     string(res.Objective),
+					Profile:       string(opt.Profile),
+					Cost:          res.Cost,
+					DistanceM:     res.DistanceM,
+					DurationS:     res.DurationS,
+					Path:          res.PathCoords,
+					GoogleMapsURL: gURL,
+					AppleMapsURL:  aURL,
+					Steps:         steps,
+				}
+			}
+		}
+
+		// respond in German with found result and optional route
+		respTxt := fmt.Sprintf("Ich habe '%s' (Entfernung %.0f m) in der Nähe gefunden. Koordinaten: %.6f, %.6f.", label, bestDist, best.Coord.Lat, best.Coord.Lon)
+		if routeObj != nil {
+			respTxt += " Route berechnet."
+		} else {
+			// include a quick Google Maps link when no internal route could be computed
+			if g := buildGoogleMapsURL([]osmmini.Coord{{Lat: qlat, Lon: qlon}, best.Coord}, 0); g != "" {
+				respTxt += " Route: " + g
+			}
+		}
+		// build structured from/to for the UI
+		var fromLoc *aiLocation
+		var toLoc *aiLocation
+		if routeObj != nil {
+			fromLat := routeObj.From.Lat
+			fromLon := routeObj.From.Lon
+			toLat := routeObj.To.Lat
+			toLon := routeObj.To.Lon
+			fromLoc = &aiLocation{Query: routeObj.From.Input, Label: routeObj.From.Label, Lat: &fromLat, Lon: &fromLon}
+			toLoc = &aiLocation{Query: routeObj.To.Input, Label: routeObj.To.Label, Lat: &toLat, Lon: &toLon}
+		} else {
+			// even without internal route, provide minimal structured locations
+			qlatC := qlat
+			qlonC := qlon
+			fromLoc = &aiLocation{Query: fmt.Sprintf("%.6f,%.6f", qlatC, qlonC), Label: "Start", Lat: &qlatC, Lon: &qlonC}
+			tlat := best.Coord.Lat
+			tlon := best.Coord.Lon
+			toLoc = &aiLocation{Query: formatAddressLabel(best.Tags), Label: formatAddressLabel(best.Tags), Lat: &tlat, Lon: &tlon}
+		}
+		writeJSON(w, http.StatusOK, aiQueryResponse{Provider: "local", Model: "local-search", Response: respTxt, Route: routeObj, Suggestions: suggestions, From: fromLoc, To: toLoc})
+		return
+	}
 
 	// Try Ollama first, then LM Studio
 	providers := []struct {
@@ -2187,4 +2500,15 @@ func queryOpenAICompatible(ctx context.Context, baseURL, model, systemPrompt, us
 		return "", errors.New("no choices returned")
 	}
 	return result.Choices[0].Message.Content, nil
+}
+
+// haversineMeters returns distance in meters between two lat/lon points.
+func haversineMeters(lat1, lon1, lat2, lon2 float64) float64 {
+	const R = 6371000.0
+	toRad := func(d float64) float64 { return d * math.Pi / 180.0 }
+	dLat := toRad(lat2 - lat1)
+	dLon := toRad(lon2 - lon1)
+	a := math.Sin(dLat/2)*math.Sin(dLat/2) + math.Cos(toRad(lat1))*math.Cos(toRad(lat2))*math.Sin(dLon/2)*math.Sin(dLon/2)
+	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+	return R * c
 }
