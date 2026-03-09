@@ -1,6 +1,7 @@
 # OSMmini
 
-Lightweight offline routing server and web UI using OSM PBF extracts.
+Lightweight offline routing server and web UI using OSM PBF extracts.  
+Try [karte.bayern](https://karte.bayern) for my other navigation project specialized for Bavaria.
 
 ![](https://simonwaldherr.de/gh-pages/osmmini.png)
 
