@@ -2315,7 +2315,7 @@ func (s *server) searchLocationResults(raw string, limit int) []apiSearchResult 
 
 	aq := osmmini.ParseAddressGuess(raw)
 	out := make([]apiSearchResult, 0, limit)
-	seen := make(map[string]struct{}, limit)
+	seen := make(map[searchResultKey]struct{}, limit)
 
 	addrMatches := osmmini.SearchAddresses(s.addrs, aq, min(limit*2, 50))
 	for _, m := range addrMatches {
@@ -2357,11 +2357,21 @@ func (s *server) searchLocationResults(raw string, limit int) []apiSearchResult 
 	return out
 }
 
-func appendUniqueSearchResult(out []apiSearchResult, seen map[string]struct{}, res apiSearchResult, limit int) []apiSearchResult {
+type searchResultKey struct {
+	label string
+	lat   int64
+	lon   int64
+}
+
+func appendUniqueSearchResult(out []apiSearchResult, seen map[searchResultKey]struct{}, res apiSearchResult, limit int) []apiSearchResult {
 	if limit > 0 && len(out) >= limit {
 		return out
 	}
-	key := fmt.Sprintf("%s|%.6f|%.6f", normalizeForCompare(res.Label), res.Lat, res.Lon)
+	key := searchResultKey{
+		label: normalizeForCompare(res.Label),
+		lat:   int64(math.Round(res.Lat * 1e6)),
+		lon:   int64(math.Round(res.Lon * 1e6)),
+	}
 	if _, ok := seen[key]; ok {
 		return out
 	}

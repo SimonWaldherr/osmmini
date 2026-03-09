@@ -638,10 +638,10 @@ type AddressQuery struct {
 
 func ParseAddressGuess(raw string) AddressQuery {
 	raw = strings.TrimSpace(raw)
-	q := AddressQuery{Raw: raw}
 	if raw == "" {
-		return q
+		return AddressQuery{}
 	}
+	q := AddressQuery{Raw: raw}
 	if parts := strings.SplitN(raw, ",", 2); len(parts) == 2 {
 		q.Street = strings.TrimSpace(parts[0])
 		q.City = strings.TrimSpace(parts[1])
@@ -681,6 +681,8 @@ func ParseAddressGuess(raw string) AddressQuery {
 	}
 
 	if q.Street != "" || q.City != "" {
+		// Comma-separated input already gave us a strong street/city split, so it
+		// intentionally wins over the looser token-based fallback below.
 		return q
 	}
 
