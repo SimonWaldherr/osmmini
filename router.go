@@ -645,8 +645,16 @@ type AddressQuery struct {
 }
 
 func ParseAddressGuess(raw string) AddressQuery {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return AddressQuery{}
+	}
 	q := AddressQuery{Raw: raw}
-	fields := strings.Fields(raw)
+	if parts := strings.SplitN(raw, ",", 2); len(parts) == 2 {
+		q.Street = strings.TrimSpace(parts[0])
+		q.City = strings.TrimSpace(parts[1])
+	}
+	fields := strings.Fields(strings.NewReplacer(",", " ", ";", " ").Replace(raw))
 	for _, f := range fields {
 		if len(f) == 5 && allDigits(f) {
 			q.Postcode = f
@@ -680,7 +688,13 @@ func ParseAddressGuess(raw string) AddressQuery {
 		cleanedStreet = append(cleanedStreet, f)
 	}
 
-	if q.City == "" && len(cityParts) == 0 && len(cleanedStreet) > 1 {
+	if q.Street != "" || q.City != "" {
+		// Comma-separated input already gave us a strong street/city split, so it
+		// intentionally wins over the looser token-based fallback below.
+		return q
+	}
+
+	if q.City == "" && len(cityParts) == 0 && len(cleanedStreet) > 1 && (q.Housenumber != "" || q.Postcode != "") {
 		q.City = cleanedStreet[len(cleanedStreet)-1]
 		cleanedStreet = cleanedStreet[:len(cleanedStreet)-1]
 	}
@@ -709,6 +723,7 @@ func FindBestAddress(entries []AddressEntry, q AddressQuery) (AddressEntry, bool
 func matchScore(e AddressEntry, q AddressQuery) int {
 	score := 0
 	street := e.Tags["addr:street"]
+	raw := strings.TrimSpace(q.Raw)
 	if q.Street != "" && equalNorm(street, q.Street) {
 		score += 3
 	}
@@ -721,6 +736,34 @@ func matchScore(e AddressEntry, q AddressQuery) int {
 	if q.City != "" {
 		if equalNorm(e.Tags["addr:city"], q.City) || equalNorm(e.Tags["addr:place"], q.City) {
 			score += 1
+		}
+	}
+	if raw != "" {
+		switch {
+		case equalNorm(e.Tags["name"], raw):
+			score += 6
+		case containsNorm(e.Tags["name"], raw):
+			score += 3
+		}
+		switch {
+		case equalNorm(e.Tags["brand"], raw), equalNorm(e.Tags["operator"], raw):
+			score += 4
+		case containsNorm(e.Tags["brand"], raw), containsNorm(e.Tags["operator"], raw):
+			score += 2
+		}
+		switch {
+		case equalNorm(e.Tags["shop"], raw), equalNorm(e.Tags["office"], raw), equalNorm(e.Tags["amenity"], raw), equalNorm(e.Tags["tourism"], raw), equalNorm(e.Tags["leisure"], raw):
+			score += 3
+		case containsNorm(e.Tags["shop"], raw), containsNorm(e.Tags["office"], raw), containsNorm(e.Tags["amenity"], raw), containsNorm(e.Tags["tourism"], raw), containsNorm(e.Tags["leisure"], raw):
+			score += 1
+		}
+		if equalNorm(street, raw) {
+			score += 4
+		} else if containsNorm(street, raw) {
+			score += 1
+		}
+		if equalNorm(e.Tags["addr:city"], raw) || equalNorm(e.Tags["addr:place"], raw) {
+			score += 3
 		}
 	}
 	// If street/address matching didn't produce a high score, also try matching
