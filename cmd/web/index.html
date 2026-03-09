@@ -335,6 +335,31 @@
               <div id="speedDefaults" class="speed-defaults" style="display:none"></div>
             </div>
 
+            <!-- OpenAI / Remote API -->
+            <div class="settings-section">
+              <div class="section-header">
+                <span class="section-icon">🔑</span>
+                <h3>OpenAI / Remote-API</h3>
+              </div>
+              <p class="settings-hint">Optional. Leer lassen, um nur lokale Modelle (Ollama, LM Studio) zu nutzen.</p>
+              <div class="settings-grid" style="grid-template-columns:1fr;">
+                <div class="setting-item">
+                  <label class="setting-label" for="openaiApiKey">API-Key <span class="info-icon" title="OpenAI API-Key (sk-…) oder Key eines kompatiblen Anbieters (Groq, Mistral, Together AI…)">ⓘ</span></label>
+                  <div class="api-key-wrap">
+                    <input id="openaiApiKey" type="password" class="setting-input" placeholder="sk-…" autocomplete="off" spellcheck="false"/>
+                    <button id="toggleApiKeyVis" class="btn-icon-xs" type="button" title="Anzeigen/Verbergen" aria-label="API-Key anzeigen">
+                      <svg id="eyeOpen" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                      <svg id="eyeClosed" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+                    </button>
+                  </div>
+                </div>
+                <div class="setting-item">
+                  <label class="setting-label" for="openaiBaseUrl">Base URL <span class="info-icon" title="Leer lassen für api.openai.com. Alternativ z.B. https://api.groq.com/openai oder https://api.mistral.ai">ⓘ</span></label>
+                  <input id="openaiBaseUrl" type="text" class="setting-input" placeholder="https://api.openai.com  (Standard)"/>
+                </div>
+              </div>
+            </div>
+
             <div class="settings-actions">
               <button id="save" class="btn btn-primary">Speichern</button>
               <button id="resetSettings" class="btn btn-ghost">Zurücksetzen</button>

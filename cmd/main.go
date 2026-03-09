@@ -231,9 +231,21 @@ func normalizeForCompare(s string) string {
 // Use the HTTP API `PUT /api/v1/settings` to update them at runtime; some
 // changes (like default speeds used during graph import) require rebuilding
 // the graph or restarting the server to take full effect.
+// AISettings holds configuration for optional remote AI providers.
+// Local providers (Ollama, LM Studio) are always probed automatically.
+type AISettings struct {
+	// OpenAIAPIKey enables the OpenAI provider when non-empty.
+	OpenAIAPIKey string `json:"openai_api_key,omitempty"`
+	// OpenAIBaseURL overrides the default OpenAI API endpoint. Leave empty
+	// to use the official https://api.openai.com endpoint. Can also point to
+	// any other OpenAI-compatible API (e.g. Groq, Mistral, Together AI).
+	OpenAIBaseURL string `json:"openai_base_url,omitempty"`
+}
+
 type Settings struct {
 	Routing osmmini.RouteOptions `json:"routing"`
 	Tiles   TileSettings         `json:"tiles"`
+	AI      AISettings           `json:"ai,omitempty"`
 	// SavePOICache controls whether POI cache files (<pbf>.poi.json) are
 	// written when extracting POIs from a PBF. Set to false to disable.
 	SavePOICache bool `json:"save_poi_cache,omitempty"`
@@ -3280,12 +3292,14 @@ func buildAppleMapsURL(points []osmmini.Coord) string {
 
 // ---- AI Integration ----
 
-// aiProvider describes a detected LLM provider (Ollama or LM Studio).
+// aiProvider describes a detected LLM provider (Ollama, LM Studio, OpenAI, …).
 type aiProvider struct {
 	Name      string   `json:"name"`
 	URL       string   `json:"url"`
 	Available bool     `json:"available"`
 	Models    []string `json:"models,omitempty"`
+	// apiKey is used internally for authenticated providers; never serialised.
+	apiKey string `json:"-"`
 }
 
 // aiStatusResponse is returned by GET /api/v1/ai/status.
@@ -3402,9 +3416,19 @@ func (s *server) handleAIStatus(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
+	aiCfg := s.settings.Get().AI
 	providers := []aiProvider{
 		probeAIProvider(ctx, "ollama", "http://localhost:11434", "/api/tags"),
 		probeAIProvider(ctx, "lmstudio", "http://localhost:1234", "/v1/models"),
+	}
+	if aiCfg.OpenAIAPIKey != "" {
+		baseURL := aiCfg.OpenAIBaseURL
+		if baseURL == "" {
+			baseURL = "https://api.openai.com"
+		}
+		p := probeOpenAI(ctx, "openai", baseURL, aiCfg.OpenAIAPIKey)
+		p.apiKey = aiCfg.OpenAIAPIKey
+		providers = append(providers, p)
 	}
 
 	// Update the probe cache so handleAIQuery can reuse the result.
@@ -3857,21 +3881,28 @@ func (s *server) handleAIQuery(w http.ResponseWriter, r *http.Request) {
 	// If no cached result exists, probe now and populate the cache.
 	cachedProviders := s.aiProbe.get()
 	if cachedProviders == nil {
+		aiCfg := s.settings.Get().AI
 		probeCtx, probeCancel := context.WithTimeout(ctx, 5*time.Second)
 		cachedProviders = []aiProvider{
 			probeAIProvider(probeCtx, "ollama", "http://localhost:11434", "/api/tags"),
 			probeAIProvider(probeCtx, "lmstudio", "http://localhost:1234", "/v1/models"),
 		}
+		if aiCfg.OpenAIAPIKey != "" {
+			baseURL := aiCfg.OpenAIBaseURL
+			if baseURL == "" {
+				baseURL = "https://api.openai.com"
+			}
+			p := probeOpenAI(probeCtx, "openai", baseURL, aiCfg.OpenAIAPIKey)
+			p.apiKey = aiCfg.OpenAIAPIKey
+			cachedProviders = append(cachedProviders, p)
+		}
 		probeCancel()
 		s.aiProbe.set(cachedProviders)
 	}
 
-	// Try available providers. If a specific model is requested we pick the
-	// provider that knows about it; otherwise we use the first available one.
-	providerURLs := map[string]string{
-		"ollama":   "http://localhost:11434",
-		"lmstudio": "http://localhost:1234",
-	}
+	// Try available providers in order. Local providers (Ollama, LM Studio)
+	// come first; OpenAI/remote providers are appended after local ones.
+	// If a specific model is requested we pick the provider that has it.
 	for _, p := range cachedProviders {
 		if !p.Available || len(p.Models) == 0 {
 			continue
@@ -3894,17 +3925,16 @@ func (s *server) handleAIQuery(w http.ResponseWriter, r *http.Request) {
 			model = p.Models[0]
 		}
 
-		baseURL := providerURLs[p.Name]
-		if baseURL == "" {
+		if p.URL == "" {
 			continue
 		}
 
 		var respText string
 		var err error
 		if p.Name == "ollama" {
-			respText, err = queryOllama(ctx, baseURL, model, systemPrompt, req.Prompt)
+			respText, err = queryOllama(ctx, p.URL, model, systemPrompt, req.Prompt)
 		} else {
-			respText, err = queryOpenAICompatible(ctx, baseURL, model, systemPrompt, req.Prompt)
+			respText, err = queryOpenAICompatible(ctx, p.URL, model, systemPrompt, req.Prompt, p.apiKey)
 		}
 		if err != nil {
 			// Invalidate cache on error so the next request re-probes.
@@ -4953,8 +4983,9 @@ func queryOllama(ctx context.Context, baseURL, model, systemPrompt, userPrompt s
 	return result.Message.Content, nil
 }
 
-// queryOpenAICompatible sends a chat completion request to an OpenAI-compatible API (LM Studio).
-func queryOpenAICompatible(ctx context.Context, baseURL, model, systemPrompt, userPrompt string) (string, error) {
+// queryOpenAICompatible sends a chat completion request to an OpenAI-compatible
+// API. apiKey may be empty for local providers that don't require authentication.
+func queryOpenAICompatible(ctx context.Context, baseURL, model, systemPrompt, userPrompt, apiKey string) (string, error) {
 	payload := map[string]any{
 		"model": model,
 		"messages": []map[string]string{
@@ -4972,6 +5003,9 @@ func queryOpenAICompatible(ctx context.Context, baseURL, model, systemPrompt, us
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
 
 	client := &http.Client{Timeout: aiQueryTimeout}
 	resp, err := client.Do(req)
@@ -4980,7 +5014,17 @@ func queryOpenAICompatible(ctx context.Context, baseURL, model, systemPrompt, us
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("lm studio returned %d", resp.StatusCode)
+		body2, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		// Surface the API error message when available.
+		var apiErr struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(body2, &apiErr) == nil && apiErr.Error.Message != "" {
+			return "", fmt.Errorf("API error %d: %s", resp.StatusCode, apiErr.Error.Message)
+		}
+		return "", fmt.Errorf("API returned status %d", resp.StatusCode)
 	}
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxAIResponseBytes))
 	if err != nil {
@@ -5000,6 +5044,52 @@ func queryOpenAICompatible(ctx context.Context, baseURL, model, systemPrompt, us
 		return "", errors.New("no choices returned")
 	}
 	return result.Choices[0].Message.Content, nil
+}
+
+// probeOpenAI checks whether an OpenAI-compatible remote API is reachable
+// using the provided key and returns an aiProvider with the available models.
+func probeOpenAI(ctx context.Context, name, baseURL, apiKey string) aiProvider {
+	p := aiProvider{Name: name, URL: baseURL, Available: false}
+	if apiKey == "" {
+		return p
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/v1/models", nil)
+	if err != nil {
+		return p
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	resp, err := client.Do(req)
+	if err != nil {
+		return p
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return p
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxAIResponseBytes))
+	if err != nil {
+		return p
+	}
+	p.Available = true
+	var openaiResp struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &openaiResp); err == nil {
+		for _, m := range openaiResp.Data {
+			// Skip non-chat / embedding / utility models for cleaner list.
+			id := m.ID
+			if strings.Contains(id, "embedding") || strings.Contains(id, "tts") ||
+				strings.Contains(id, "whisper") || strings.Contains(id, "dall-e") ||
+				strings.Contains(id, "moderation") || strings.Contains(id, "search") {
+				continue
+			}
+			p.Models = append(p.Models, id)
+		}
+	}
+	return p
 }
 
 // haversineMeters returns distance in meters between two lat/lon points.

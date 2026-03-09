@@ -1272,6 +1272,12 @@ function initializeSettingsUI(s) {
     const atEl = document.getElementById('tileAttribution');
     if (atEl) atEl.value = tiles.attribution || '';
     updateMapTypeVisibility(mt);
+    // OpenAI / remote API settings
+    const ai = s.ai || {};
+    const keyEl = document.getElementById('openaiApiKey');
+    if (keyEl) keyEl.value = ai.openai_api_key || '';
+    const urlEl = document.getElementById('openaiBaseUrl');
+    if (urlEl) urlEl.value = ai.openai_base_url || '';
 }
 
 // Show/hide tile source fields based on selected map type
@@ -1434,10 +1440,18 @@ document.getElementById('save').onclick = async () => {
     if (wlEl) cur.tiles.wms_layers = wlEl.value;
     const atEl = document.getElementById('tileAttribution');
     if (atEl) cur.tiles.attribution = atEl.value;
+    // OpenAI / remote API key
+    cur.ai = cur.ai || {};
+    const keyEl = document.getElementById('openaiApiKey');
+    if (keyEl) cur.ai.openai_api_key = keyEl.value.trim();
+    const urlEl = document.getElementById('openaiBaseUrl');
+    if (urlEl) cur.ai.openai_base_url = urlEl.value.trim();
     await apiPutSettings(cur);
     apiCache.delete('settings'); // Invalidate cache
     // Refresh map tile layer with updated settings
     applyTileLayer(cur);
+    // Invalidate AI provider cache so new API key takes effect immediately.
+    try { await fetch('/api/v1/ai/status'); } catch (_e) {}
     btn.innerHTML = '✅ Gespeichert';
     showToast('Einstellungen erfolgreich gespeichert', 'success', 2000);
     setTimeout(() => { btn.innerHTML = origText; btn.disabled = false; }, 1500);
@@ -1447,6 +1461,18 @@ document.getElementById('save').onclick = async () => {
     setTimeout(() => { btn.innerHTML = origText; btn.disabled = false; }, 2000);
   }
 };
+
+// API key eye-toggle (show/hide password)
+document.getElementById('toggleApiKeyVis')?.addEventListener('click', () => {
+  const inp = document.getElementById('openaiApiKey');
+  const eyeOpen = document.getElementById('eyeOpen');
+  const eyeClosed = document.getElementById('eyeClosed');
+  if (!inp) return;
+  const show = inp.type === 'password';
+  inp.type = show ? 'text' : 'password';
+  if (eyeOpen)   eyeOpen.style.display   = show ? 'none' : 'block';
+  if (eyeClosed) eyeClosed.style.display = show ? 'block' : 'none';
+});
 
 // settings collapse/expand
 const settingsToggle = document.getElementById('settingsToggle');

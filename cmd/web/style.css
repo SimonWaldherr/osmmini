@@ -858,6 +858,35 @@ input:-webkit-autofill:focus {
 }
 .hidden { display: none !important; }
 
+/* ─── Settings hint text ─── */
+.settings-hint {
+  font-size: 11.5px;
+  color: var(--text-2);
+  margin: 0 0 10px;
+  line-height: 1.4;
+  opacity: 0.8;
+}
+
+/* API key input with toggle button */
+.api-key-wrap {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.api-key-wrap .setting-input { flex: 1; min-width: 0; font-family: monospace; letter-spacing: 0.5px; }
+.btn-icon-xs {
+  width: 30px; height: 30px;
+  display: inline-flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-2);
+  cursor: pointer;
+  transition: all var(--dur) var(--ease);
+}
+.btn-icon-xs:hover { background: var(--surface-hover); color: var(--text); }
+
 /* ─── Help / Shortcuts ─── */
 .shortcut-list { display: flex; flex-direction: column; gap: 6px; }
 .shortcut-item {
