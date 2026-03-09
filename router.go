@@ -509,6 +509,14 @@ func NewRouterFromGraph(coords map[int64]Coord, adj map[int64][]Edge) *Router {
 	}
 }
 
+// ExportGraph returns the underlying graph maps (coords and adjacency)
+// for serialization or transport (e.g., to produce a compact JSON for
+// WebAssembly clients). The returned maps are references into the
+// router's internal graph; callers should not modify them.
+func (r *Router) ExportGraph() (map[int64]Coord, map[int64][]Edge) {
+	return r.g.coords, r.g.adj
+}
+
 func (r *Router) Bounds() (CoordWindow, bool) {
 	if r.bounds == nil {
 		return CoordWindow{}, false
