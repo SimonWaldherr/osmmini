@@ -111,9 +111,17 @@ type Options struct {
 
 // Callbacks passed to Extract to receive parsed entities.
 type Callbacks struct {
-	Node            func(id int64, lat, lon float64) error
-	AddressNode     func(n Node) error
-	HighwayWay      func(w Way) error
-	AddressWay      func(w Way) error
+	Node        func(id int64, lat, lon float64) error
+	AddressNode func(n Node) error
+	HighwayWay  func(w Way) error
+	AddressWay  func(w Way) error
+	// TaggedWay is called for any way that has at least one tag that
+	// the caller requested via Options.KeepTag. This allows callers to
+	// receive POI/area ways (landuse, natural, amenity, shop, etc.).
+	TaggedWay       func(w Way) error
 	AddressRelation func(r Relation) error
+	// TaggedRelation is called for any relation that has at least one
+	// tag requested via Options.KeepTag. Useful for administrative
+	// boundaries and multipolygon relations representing areas.
+	TaggedRelation func(r Relation) error
 }

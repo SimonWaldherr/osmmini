@@ -1,6 +1,6 @@
 {
   "routing": {
-    "engine": "dijkstra",
+    "engine": "astar",
     "objective": "distance",
     "pro": false,
     "weights": {
@@ -11,16 +11,14 @@
       "max_speed_kph": 0,
       "vehicle_height_m": 0,
       "vehicle_weight_t": 0
-    },
-    "emergency_mode": true
+    }
   },
   "tiles": {
     "cache_dir": "tiles-cache",
-    "upstream": "",
+    "upstream": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
     "user_agent": "osmmini-routerd/1.0 (offline routing)",
-    "map_type": "vector",
-    "style_url": "https://demotiles.maplibre.org/style.json",
-    "attribution": "© MapLibre"
+    "map_type": "raster",
+    "attribution": "© OpenStreetMap contributors"
   },
   "default_highway_speeds": {
     "motorway": 150

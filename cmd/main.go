@@ -117,6 +117,114 @@ var BuiltinTilePresets = []TileSourcePreset{
 	},
 }
 
+// staticPOIMapping maps normalized query keywords to OSM tag filters
+// used for quick, language-aware POI lookup without LLMs.
+var staticPOIMapping = map[string]map[string]string{
+	// German
+	"mcdonald":    {"amenity": "fast_food", "brand": "McDonald's"},
+	"mcdonalds":   {"amenity": "fast_food", "brand": "McDonald's"},
+	"tankstelle":  {"amenity": "fuel"},
+	"benzin":      {"amenity": "fuel"},
+	"bahnhof":     {"railway": "station"},
+	"apotheke":    {"amenity": "pharmacy"},
+	"supermarkt":  {"shop": "supermarket"},
+	"bäckerei":    {"shop": "bakery"},
+	"baeckerei":   {"shop": "bakery"},
+	"parkplatz":   {"amenity": "parking"},
+	"bank":        {"amenity": "bank"},
+	"krankenhaus": {"amenity": "hospital"},
+	"schule":      {"amenity": "school"},
+	"museum":      {"tourism": "museum"},
+	"see":         {"natural": "water"},
+	"wald":        {"landuse": "forest"},
+	// English
+	"gas":           {"amenity": "fuel"},
+	"fuel":          {"amenity": "fuel"},
+	"train station": {"railway": "station"},
+	"pharmacy":      {"amenity": "pharmacy"},
+	"supermarket":   {"shop": "supermarket"},
+	"parking":       {"amenity": "parking"},
+	"hospital":      {"amenity": "hospital"},
+	"school":        {"amenity": "school"},
+	// museum already covered above (German/English), skip duplicate
+	"lake":   {"natural": "water"},
+	"forest": {"landuse": "forest"},
+}
+
+// brandAliasMap maps common user typos/aliases to a canonical normalized brand key
+var brandAliasMap = map[string]string{
+	"maci":        "mcdonalds",
+	"mcdo":        "mcdonalds",
+	"mcd":         "mcdonalds",
+	"mcdonald":    "mcdonalds",
+	"mcdonalds":   "mcdonalds",
+	"macdonalds":  "mcdonalds",
+	"maccdonalds": "mcdonalds",
+	"macca":       "mcdonalds",
+}
+
+// buildBrandAliases inspects the loaded POI index and generates simple
+// alias mappings for brands/names to improve fuzzy matching of user queries.
+func (s *server) buildBrandAliases() {
+	s.poiMu.RLock()
+	defer s.poiMu.RUnlock()
+
+	addAlias := func(raw string) {
+		if raw == "" {
+			return
+		}
+		canon := normalizeForCompare(raw)
+		if canon == "" {
+			return
+		}
+		// create a compact alias key (no spaces/punctuation)
+		alias := strings.ReplaceAll(canon, " ", "")
+		alias = strings.ReplaceAll(alias, "'", "")
+		alias = strings.ReplaceAll(alias, "\"", "")
+		alias = strings.ReplaceAll(alias, "-", "")
+		alias = strings.ReplaceAll(alias, ".", "")
+		if alias == "" {
+			return
+		}
+		// don't overwrite existing manual aliases
+		if _, exists := brandAliasMap[alias]; !exists {
+			brandAliasMap[alias] = canon
+		}
+	}
+
+	// scan ways and relations
+	for _, w := range s.poiWays {
+		addAlias(w.Tags["brand"])
+		addAlias(w.Tags["name"])
+	}
+	for _, r := range s.poiRels {
+		addAlias(r.Tags["brand"])
+		addAlias(r.Tags["name"])
+	}
+	// scan address entries
+	for _, a := range s.addrs {
+		addAlias(a.Tags["brand"])
+		addAlias(a.Tags["name"])
+	}
+}
+
+// normalizeForCompare returns a lowercased, ASCII-fied string without punctuation
+// suitable for simple fuzzy matching.
+func normalizeForCompare(s string) string {
+	s = strings.ToLower(s)
+	// replace German umlauts and common punctuation
+	repl := strings.NewReplacer("ä", "ae", "ö", "oe", "ü", "ue", "ß", "ss", "'", "", "\u2019", "", "\u2018", "", "-", " ", ",", " ", ".", " ")
+	s = repl.Replace(s)
+	// remove other punctuation
+	trimmed := make([]rune, 0, len(s))
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == ' ' {
+			trimmed = append(trimmed, r)
+		}
+	}
+	return strings.TrimSpace(string(trimmed))
+}
+
 // Settings holds the server configuration persisted in the settings.json
 // file. The server loads these settings early during startup so routing
 // defaults (e.g. highway speeds) can be applied before the graph is built.
@@ -616,6 +724,17 @@ type apiSearchResult struct {
 	Tags  osmmini.Tags `json:"tags,omitempty"`
 }
 
+type poiInfoResponse struct {
+	ID          int64        `json:"id"`
+	Kind        string       `json:"kind"`
+	Label       string       `json:"label"`
+	Lat         float64      `json:"lat"`
+	Lon         float64      `json:"lon"`
+	Tags        osmmini.Tags `json:"tags,omitempty"`
+	DistanceM   *float64     `json:"distance_m,omitempty"`
+	WikiSummary string       `json:"wiki_summary,omitempty"`
+}
+
 type Location struct {
 	Query string   `json:"query,omitempty"`
 	Lat   *float64 `json:"lat,omitempty"`
@@ -855,6 +974,19 @@ type server struct {
 
 	indexTmpl *template.Template
 	openAPI   []byte
+	// pbfPath is the path to the OSM PBF used to build the router. It is
+	// retained so we can perform on-demand extraction for POIs/areas.
+	pbfPath string
+
+	// POI / area index populated at startup (best-effort). These maps are
+	// populated by loadPOIIndex and protected by poiMu.
+	poiMu    sync.RWMutex
+	poiNodes map[int64]osmmini.Coord
+	poiWays  map[int64]osmmini.Way
+	poiRels  map[int64]osmmini.Relation
+	// small in-memory cache for Wikipedia summaries (key: lang:title)
+	wikiMu    sync.RWMutex
+	wikiCache map[string]string
 }
 
 func main() {
@@ -931,6 +1063,12 @@ func main() {
 		enforceWindow: *enforceWindow,
 		indexTmpl:     indexTmpl,
 		openAPI:       openapiBytes,
+		pbfPath:       *pbf,
+	}
+
+	// Best-effort: load POI / area index (may be slow; non-fatal)
+	if err := srv.loadPOIIndex(*pbf); err != nil {
+		log.Printf("warning: POI index failed: %v", err)
 	}
 
 	httpSrv := &http.Server{
@@ -976,12 +1114,391 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/api/v1/trip/solve", s.handleTripSolve)
 	mux.HandleFunc("/api/v1/ai/status", s.handleAIStatus)
 	mux.HandleFunc("/api/v1/ai/query", s.handleAIQuery)
+	mux.HandleFunc("/api/v1/poi/", s.handlePOIInfo)
 
 	// UI
 	mux.HandleFunc("/", s.handleIndex)
 
 	return withLogging(withCORS(mux))
 }
+
+// loadPOIIndex performs a best-effort extraction of tagged ways and relations
+// from the PBF so area and POI queries can be answered. It's intentionally
+// permissive in the tags it keeps to capture landuse/natural/amenity/shop.
+func (s *server) loadPOIIndex(pbfPath string) error {
+	if pbfPath == "" {
+		return nil
+	}
+	nodes := make(map[int64]osmmini.Coord)
+	ways := make(map[int64]osmmini.Way)
+	rels := make(map[int64]osmmini.Relation)
+
+	keepTags := map[string]bool{
+		"name": true, "amenity": true, "shop": true, "brand": true,
+		"natural": true, "landuse": true, "leisure": true, "tourism": true,
+		"boundary": true, "admin_level": true,
+	}
+
+	opts := osmmini.Options{
+		EmitWayNodeIDs:      true,
+		EmitRelationMembers: true,
+		KeepTag: func(k string) bool {
+			return keepTags[k]
+		},
+	}
+
+	cb := osmmini.Callbacks{
+		Node: func(id int64, lat, lon float64) error {
+			nodes[id] = osmmini.Coord{Lat: lat, Lon: lon}
+			return nil
+		},
+		TaggedWay: func(w osmmini.Way) error {
+			ways[w.ID] = w
+			return nil
+		},
+		TaggedRelation: func(r osmmini.Relation) error {
+			rels[r.ID] = r
+			return nil
+		},
+	}
+
+	// ExtractFile can be slow on large PBFs; run with a background context
+	// and a modest timeout to avoid blocking startup indefinitely.
+	// Try loading from a cache file first
+	cachePath := pbfPath + ".poi.json"
+	if loadErr := s.loadPOICache(cachePath, nodes, ways, rels); loadErr == nil {
+		// loaded from cache
+		s.poiMu.Lock()
+		s.poiNodes = nodes
+		s.poiWays = ways
+		s.poiRels = rels
+		s.wikiMu.Lock()
+		s.wikiCache = make(map[string]string)
+		s.wikiMu.Unlock()
+		s.poiMu.Unlock()
+		// build brand aliases from indexed POIs to improve fuzzy matching
+		s.buildBrandAliases()
+		return nil
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- osmmini.ExtractFile(pbfPath, opts, cb)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			return err
+		}
+	case <-time.After(30 * time.Second):
+		// give up after 30s — this is best-effort indexing
+		return nil
+	}
+
+	// persist cache asynchronously (best-effort)
+	go func() {
+		_ = s.savePOICache(cachePath, nodes, ways, rels)
+	}()
+
+	s.poiMu.Lock()
+	s.poiNodes = nodes
+	s.poiWays = ways
+	s.poiRels = rels
+	s.poiMu.Unlock()
+	return nil
+}
+
+// loadPOICache attempts to populate the provided maps from a JSON cache file.
+func (s *server) loadPOICache(path string, nodes map[int64]osmmini.Coord, ways map[int64]osmmini.Way, rels map[int64]osmmini.Relation) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var payload struct {
+		Nodes map[int64]osmmini.Coord    `json:"nodes"`
+		Ways  map[int64]osmmini.Way      `json:"ways"`
+		Rels  map[int64]osmmini.Relation `json:"rels"`
+	}
+	if err := json.Unmarshal(b, &payload); err != nil {
+		return err
+	}
+	for k, v := range payload.Nodes {
+		nodes[k] = v
+	}
+	for k, v := range payload.Ways {
+		ways[k] = v
+	}
+	for k, v := range payload.Rels {
+		rels[k] = v
+	}
+	return nil
+}
+
+// savePOICache writes the POI index to a JSON cache file (best-effort).
+func (s *server) savePOICache(path string, nodes map[int64]osmmini.Coord, ways map[int64]osmmini.Way, rels map[int64]osmmini.Relation) error {
+	payload := struct {
+		Nodes map[int64]osmmini.Coord    `json:"nodes"`
+		Ways  map[int64]osmmini.Way      `json:"ways"`
+		Rels  map[int64]osmmini.Relation `json:"rels"`
+	}{Nodes: nodes, Ways: ways, Rels: rels}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// fetchWikiSummary fetches a short summary for a wiki title (lang, title)
+// and caches the result in-memory. Returns empty string on failure.
+func (s *server) fetchWikiSummary(ctx context.Context, lang, title string) string {
+	if lang == "" {
+		lang = "en"
+	}
+	key := lang + ":" + title
+	s.wikiMu.RLock()
+	if v, ok := s.wikiCache[key]; ok {
+		s.wikiMu.RUnlock()
+		return v
+	}
+	s.wikiMu.RUnlock()
+
+	titleEsc := url.PathEscape(title)
+	u := fmt.Sprintf("https://%s.wikipedia.org/api/rest_v1/page/summary/%s", lang, titleEsc)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	client := &http.Client{Timeout: 4 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil || resp == nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	var out struct {
+		Extract string `json:"extract"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 8*1024)).Decode(&out); err != nil {
+		return ""
+	}
+	s.wikiMu.Lock()
+	s.wikiCache[key] = out.Extract
+	s.wikiMu.Unlock()
+	return out.Extract
+}
+
+// latLonToWebMercator converts WGS84 degrees to WebMercator meters.
+func latLonToWebMercator(lat, lon float64) (float64, float64) {
+	const originShift = 20037508.342789244
+	x := lon * originShift / 180.0
+	y := math.Log(math.Tan((90.0+lat)*math.Pi/360.0)) / (math.Pi / 180.0)
+	y = y * originShift / 180.0
+	return x, y
+}
+
+// polygonAreaMeters computes polygon area (signed) in square meters using
+// the shoelace formula on WebMercator-projected coordinates.
+func polygonAreaMeters(coords []osmmini.Coord) float64 {
+	if len(coords) < 3 {
+		return 0
+	}
+	area := 0.0
+	// project coords
+	pts := make([][2]float64, len(coords))
+	for i, c := range coords {
+		x, y := latLonToWebMercator(c.Lat, c.Lon)
+		pts[i][0] = x
+		pts[i][1] = y
+	}
+	for i := 0; i < len(pts); i++ {
+		j := (i + 1) % len(pts)
+		area += pts[i][0]*pts[j][1] - pts[j][0]*pts[i][1]
+	}
+	return math.Abs(area) * 0.5
+}
+
+// pointInPolygon performs a winding-number / raycast test in lat/lon space.
+// coords must form a closed ring (first and last equal) or will be treated cyclically.
+func pointInPolygon(pt osmmini.Coord, poly []osmmini.Coord) bool {
+	inside := false
+	j := len(poly) - 1
+	for i := 0; i < len(poly); i++ {
+		xi, yi := poly[i].Lon, poly[i].Lat
+		xj, yj := poly[j].Lon, poly[j].Lat
+		intersect := ((yi > pt.Lat) != (yj > pt.Lat)) &&
+			(pt.Lon < (xj-xi)*(pt.Lat-yi)/(yj-yi+1e-12)+xi)
+		if intersect {
+			inside = !inside
+		}
+		j = i
+	}
+	return inside
+}
+
+// computeAreaForAdmin finds administrative relations matching name (case-insensitive)
+// and sums area of forest/wood multipolygons inside them. Returns total area m^2
+// and an optional representative polygon (outer ring) if available.
+func (s *server) computeAreaForAdmin(ctx context.Context, adminName string) (float64, []osmmini.Coord, error) {
+	s.poiMu.RLock()
+	nodes := s.poiNodes
+	ways := s.poiWays
+	rels := s.poiRels
+	s.poiMu.RUnlock()
+
+	if len(rels) == 0 {
+		return 0, nil, fmt.Errorf("no POI data indexed")
+	}
+
+	nameLow := normalizeForCompare(adminName)
+	var matchedRel osmmini.Relation
+	found := false
+	for _, r := range rels {
+		if r.Tags["boundary"] == "administrative" {
+			n := normalizeForCompare(r.Tags["name"])
+			if n != "" && strings.Contains(n, nameLow) {
+				matchedRel = r
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		return 0, nil, fmt.Errorf("administrative area not found: %s", adminName)
+	}
+
+	// collect member ways
+	memberWays := make([]osmmini.Way, 0)
+	for _, m := range matchedRel.Members {
+		if m.Type == osmmini.MemberWay {
+			if w, ok := ways[m.ID]; ok {
+				memberWays = append(memberWays, w)
+			}
+		}
+	}
+
+	rings := assembleRingsFromWays(memberWays, nodes)
+
+	totalArea := 0.0
+	for _, ring := range rings {
+		isForest := false
+		for _, w := range memberWays {
+			if w.Tags["landuse"] == "forest" || w.Tags["natural"] == "wood" {
+				isForest = true
+				break
+			}
+		}
+		a := polygonAreaOnSphere(ring)
+		if isForest || len(rings) == 1 {
+			totalArea += a
+		}
+	}
+
+	var rep []osmmini.Coord
+	maxA := 0.0
+	for _, r := range rings {
+		a := polygonAreaOnSphere(r)
+		if a > maxA {
+			maxA = a
+			rep = r
+		}
+	}
+	return totalArea, rep, nil
+}
+
+// assembleRingsFromWays stitches ways into closed rings when possible.
+func assembleRingsFromWays(ways []osmmini.Way, nodes map[int64]osmmini.Coord) [][]osmmini.Coord {
+	// map start/end node -> list of ways indices
+	startMap := make(map[int64][]int)
+	endMap := make(map[int64][]int)
+	for i, w := range ways {
+		if len(w.NodeIDs) == 0 {
+			continue
+		}
+		start := w.NodeIDs[0]
+		end := w.NodeIDs[len(w.NodeIDs)-1]
+		startMap[start] = append(startMap[start], i)
+		endMap[end] = append(endMap[end], i)
+	}
+
+	used := make([]bool, len(ways))
+	rings := make([][]osmmini.Coord, 0)
+
+	for i := range ways {
+		if used[i] || len(ways[i].NodeIDs) == 0 {
+			continue
+		}
+		// start a chain
+		chain := append([]int{}, i)
+		used[i] = true
+		// forward chain
+		curEnd := ways[i].NodeIDs[len(ways[i].NodeIDs)-1]
+		for {
+			nextIdx := -1
+			if lst, ok := startMap[curEnd]; ok {
+				for _, cand := range lst {
+					if !used[cand] {
+						nextIdx = cand
+						break
+					}
+				}
+			}
+			if nextIdx == -1 {
+				break
+			}
+			used[nextIdx] = true
+			chain = append(chain, nextIdx)
+			curEnd = ways[nextIdx].NodeIDs[len(ways[nextIdx].NodeIDs)-1]
+		}
+		// try to close chain: if chain start equals chain end, build ring
+		firstStart := ways[chain[0]].NodeIDs[0]
+		lastEnd := ways[chain[len(chain)-1]].NodeIDs[len(ways[chain[len(chain)-1]].NodeIDs)-1]
+		if firstStart == lastEnd {
+			// build coords
+			coords := make([]osmmini.Coord, 0)
+			for _, idx := range chain {
+				for _, nid := range ways[idx].NodeIDs {
+					if c, ok := nodes[nid]; ok {
+						coords = append(coords, c)
+					}
+				}
+			}
+			// ensure closed
+			if len(coords) > 2 && (coords[0] != coords[len(coords)-1]) {
+				coords = append(coords, coords[0])
+			}
+			if len(coords) > 2 {
+				rings = append(rings, coords)
+			}
+		}
+	}
+	return rings
+}
+
+// polygonAreaOnSphere computes area in square meters using spherical excess
+// approximation. Coordinates should form a closed ring.
+func polygonAreaOnSphere(coords []osmmini.Coord) float64 {
+	if len(coords) < 3 {
+		return 0
+	}
+	// use algorithm from "Some Algorithms for Polygons on a Sphere" (Robert Chamberlain)
+	R := 6378137.0
+	total := 0.0
+	for i := 0; i < len(coords)-1; i++ {
+		lon1 := deg2rad(coords[i].Lon)
+		lat1 := deg2rad(coords[i].Lat)
+		lon2 := deg2rad(coords[i+1].Lon)
+		lat2 := deg2rad(coords[i+1].Lat)
+		total += (lon2 - lon1) * (2 + math.Sin(lat1) + math.Sin(lat2))
+	}
+	area := math.Abs(total) * (R * R) / 2.0
+	return area
+}
+
+// deg2rad converts degrees to radians.
+func deg2rad(d float64) float64 { return d * math.Pi / 180.0 }
 
 // createHybridFileServer returns a handler that serves from localDir if it exists,
 // otherwise falls back to embedded files.
@@ -2007,6 +2524,12 @@ type aiQueryRequest struct {
 	Model  string   `json:"model,omitempty"`
 	Lat    *float64 `json:"lat,omitempty"`
 	Lon    *float64 `json:"lon,omitempty"`
+	// map center coordinates (hint)
+	MapLat *float64 `json:"map_lat,omitempty"`
+	MapLon *float64 `json:"map_lon,omitempty"`
+	// explicit user geolocation when available
+	UserLat *float64 `json:"user_lat,omitempty"`
+	UserLon *float64 `json:"user_lon,omitempty"`
 }
 
 // aiLocation is a lightweight location descriptor returned in AI responses.
@@ -2139,17 +2662,57 @@ func (s *server) handleAIQuery(w http.ResponseWriter, r *http.Request) {
 	// the assistant to return actual nearby POIs and compute a route when a
 	// reference location (lat/lon) is provided in the prompt.
 	lower := strings.ToLower(req.Prompt)
+
+	// Area / polygon queries (e.g. "Welche Waldfläche hat der Landkreis Dingolfing-Landau?")
+	if (strings.Contains(lower, "fläche") || strings.Contains(lower, "waldfläche") || strings.Contains(lower, "fläche hat")) && (strings.Contains(lower, "landkreis") || strings.Contains(lower, "kreis") || strings.Contains(lower, "stadt")) {
+		// try to extract admin name
+		rex := regexp.MustCompile(`(?i)(?:landkreis|kreisfreie stadt|kreis|stadt)\s+([A-Za-zÄÖÜäöüß\-\s]+)`)
+		if m := rex.FindStringSubmatch(req.Prompt); len(m) >= 2 {
+			admin := strings.TrimSpace(m[1])
+			if admin != "" {
+				areaM2, poly, err := s.computeAreaForAdmin(ctx, admin)
+				if err != nil {
+					writeJSONError(w, http.StatusNotFound, "Fläche nicht gefunden: "+err.Error())
+					return
+				}
+				km2 := areaM2 / 1e6
+				respTxt := fmt.Sprintf("Die geschätzte Waldfläche im Landkreis %s beträgt %.3f km² (%.0f m²).", admin, km2, areaM2)
+				// include centroid link if polygon available
+				if len(poly) > 0 {
+					// compute centroid
+					cx, cy := 0.0, 0.0
+					for _, c := range poly {
+						cx += c.Lat
+						cy += c.Lon
+					}
+					cx /= float64(len(poly))
+					cy /= float64(len(poly))
+					gurl := buildGoogleMapsURL([]osmmini.Coord{{Lat: cx, Lon: cy}}, 12)
+					respTxt += " Ansicht: " + gurl
+				}
+				writeJSON(w, http.StatusOK, aiQueryResponse{Provider: "local", Model: "area-estimate", Response: respTxt})
+				return
+			}
+		}
+	}
 	if strings.Contains(lower, "nächste") || strings.Contains(lower, "nächster") || strings.Contains(lower, "nearest") || strings.Contains(lower, "near me") || strings.Contains(lower, "in der nähe") {
-		// Determine query coordinates: prefer explicit lat/lon fields from the
-		// request, otherwise try to extract coordinates from the prompt text.
+		// Determine query coordinates. Prefer explicit user geolocation, then
+		// the request `lat`/`lon`, then provided map center, then try parsing
+		// coordinates from the prompt text.
 		coordFound := false
 		var qlat, qlon float64
-		if req.Lat != nil && req.Lon != nil {
+		if req.UserLat != nil && req.UserLon != nil {
+			qlat, qlon = *req.UserLat, *req.UserLon
+			coordFound = true
+		} else if req.Lat != nil && req.Lon != nil {
 			qlat, qlon = *req.Lat, *req.Lon
+			coordFound = true
+		} else if req.MapLat != nil && req.MapLon != nil {
+			qlat, qlon = *req.MapLat, *req.MapLon
 			coordFound = true
 		}
 
-		// crude float pair regex for coords in prompt
+		// crude float pair regex for coords in prompt (fallback)
 		re := regexp.MustCompile(`([-+]?[0-9]*\.?[0-9]+)\s*,?\s*([-+]?[0-9]*\.?[0-9]+)`)
 		if !coordFound {
 			if m := re.FindStringSubmatch(req.Prompt); len(m) == 3 {
@@ -2187,20 +2750,8 @@ func (s *server) handleAIQuery(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Normalize common brand/name variants (e.g., McDonald's)
-		norm := func(s string) string {
-			s = strings.ToLower(s)
-			s = strings.ReplaceAll(s, "'", "")
-			s = strings.ReplaceAll(s, "\u2019", "") // right single quote
-			s = strings.ReplaceAll(s, "\u2018", "") // left single quote
-			s = strings.ReplaceAll(s, "-", "")
-			s = strings.ReplaceAll(s, " ", "")
-			s = strings.ReplaceAll(s, "mcdonalds", "mcdonalds")
-			s = strings.ReplaceAll(s, "mcdonald", "mcdonalds")
-			s = strings.ReplaceAll(s, "mcdo", "mcdonalds")
-			return s
-		}
-		placeNorm := norm(place)
+		// normalized place string for fuzzy matching
+		// use normalizeForCompare below when scanning names/brands
 
 		// First try to recognise simple POI types (lakes, forests, etc.)
 		matches := []osmmini.AddressEntry{}
@@ -2234,6 +2785,56 @@ func (s *server) handleAIQuery(w http.ResponseWriter, r *http.Request) {
 			}
 			isPOIHandled = true
 		}
+		// additional POI shortcuts using indexed POI ways (best-effort)
+		if !isPOIHandled {
+			// map of keyword -> (tagKey, tagValue)
+			poiMap := map[string][2]string{
+				"tankstelle":  {"amenity", "fuel"},
+				"benzin":      {"amenity", "fuel"},
+				"bahnhof":     {"railway", "station"},
+				"apotheke":    {"amenity", "pharmacy"},
+				"supermarkt":  {"shop", "supermarket"},
+				"bäckerei":    {"shop", "bakery"},
+				"parkplatz":   {"amenity", "parking"},
+				"bank":        {"amenity", "bank"},
+				"krankenhaus": {"amenity", "hospital"},
+				"schule":      {"amenity", "school"},
+				"museum":      {"tourism", "museum"},
+			}
+			for k, tv := range poiMap {
+				if strings.Contains(loweredPlace, k) {
+					// scan indexed ways for matching tag
+					s.poiMu.RLock()
+					for _, w := range s.poiWays {
+						if v, ok := w.Tags[tv[0]]; ok {
+							if tv[1] == "" || strings.EqualFold(v, tv[1]) {
+								// build centroid from nodes
+								var cx, cy float64
+								var cnt int
+								for _, nid := range w.NodeIDs {
+									if c, ok := s.poiNodes[nid]; ok {
+										cx += c.Lat
+										cy += c.Lon
+										cnt++
+									}
+								}
+								if cnt == 0 {
+									continue
+								}
+								centroid := osmmini.Coord{Lat: cx / float64(cnt), Lon: cy / float64(cnt)}
+								matches = append(matches, osmmini.AddressEntry{ID: w.ID, Coord: centroid, Tags: w.Tags})
+								if len(matches) >= 100 {
+									break
+								}
+							}
+						}
+					}
+					s.poiMu.RUnlock()
+					isPOIHandled = true
+					break
+				}
+			}
+		}
 		// If we didn't handle a POI keyword specifically, fall back to structured address search
 		if !isPOIHandled {
 			aq := osmmini.ParseAddressGuess(place)
@@ -2242,20 +2843,36 @@ func (s *server) handleAIQuery(w http.ResponseWriter, r *http.Request) {
 
 		// If no structured matches, try fuzzy name/brand scan over addresses
 		if len(matches) == 0 {
+			placeNormCmp := normalizeForCompare(place)
 			for _, a := range s.addrs {
-				name := strings.ToLower(a.Tags["name"])
-				brand := strings.ToLower(a.Tags["brand"])
-				if name != "" && strings.Contains(strings.ReplaceAll(name, " ", ""), placeNorm) {
+				nameNorm := normalizeForCompare(a.Tags["name"])
+				brandNorm := normalizeForCompare(a.Tags["brand"])
+				// direct containment checks on normalized forms
+				if nameNorm != "" && placeNormCmp != "" && (strings.Contains(nameNorm, placeNormCmp) || strings.Contains(placeNormCmp, nameNorm)) {
 					matches = append(matches, a)
 					continue
 				}
-				if brand != "" && strings.Contains(strings.ReplaceAll(brand, " ", ""), placeNorm) {
+				if brandNorm != "" && placeNormCmp != "" && (strings.Contains(brandNorm, placeNormCmp) || strings.Contains(placeNormCmp, brandNorm)) {
 					matches = append(matches, a)
 					continue
 				}
-				// also check amenity/brand combinations for fast_food
-				if a.Tags["amenity"] == "fast_food" && (strings.Contains(name, "mcdonald") || strings.Contains(brand, "mcdonald")) {
-					matches = append(matches, a)
+				// alias lookup (e.g., user typed 'maci')
+				if canon, ok := brandAliasMap[placeNormCmp]; ok {
+					if brandNorm != "" && strings.Contains(brandNorm, canon) {
+						matches = append(matches, a)
+						continue
+					}
+					if a.Tags["amenity"] == "fast_food" && (strings.Contains(nameNorm, canon) || strings.Contains(brandNorm, canon)) {
+						matches = append(matches, a)
+						continue
+					}
+				}
+				// heuristic: if user typed something short like 'maci', and the POI is fast_food, consider it
+				if len(placeNormCmp) <= 6 && a.Tags["amenity"] == "fast_food" {
+					if strings.Contains(nameNorm, "mcdonald") || strings.Contains(brandNorm, "mcdonald") {
+						matches = append(matches, a)
+						continue
+					}
 				}
 			}
 		}
@@ -2407,6 +3024,131 @@ func (s *server) handleAIQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSONError(w, http.StatusServiceUnavailable, "Kein KI-Provider verfügbar. Bitte Ollama oder LM Studio starten.")
+}
+
+// handlePOIInfo returns detailed information for a POI by id.
+// Path: /api/v1/poi/{id}
+func (s *server) handlePOIInfo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	// path is /api/v1/poi/{id}
+	idStr := strings.TrimPrefix(r.URL.Path, "/api/v1/poi/")
+	if idStr == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing id")
+		return
+	}
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+
+	s.poiMu.RLock()
+	// prefer way, then node, then relation
+	if wv, ok := s.poiWays[id]; ok {
+		// compute centroid
+		var cx, cy float64
+		var cnt int
+		for _, nid := range wv.NodeIDs {
+			if c, ok := s.poiNodes[nid]; ok {
+				cx += c.Lat
+				cy += c.Lon
+				cnt++
+			}
+		}
+		lat, lon := 0.0, 0.0
+		if cnt > 0 {
+			lat = cx / float64(cnt)
+			lon = cy / float64(cnt)
+		}
+		resp := poiInfoResponse{ID: id, Kind: "way", Label: wv.Tags["name"], Lat: lat, Lon: lon, Tags: wv.Tags}
+		s.poiMu.RUnlock()
+		// optional distance
+		if qlatS := r.URL.Query().Get("lat"); qlatS != "" {
+			if qlonS := r.URL.Query().Get("lon"); qlonS != "" {
+				if qlat, err1 := strconv.ParseFloat(qlatS, 64); err1 == nil {
+					if qlon, err2 := strconv.ParseFloat(qlonS, 64); err2 == nil {
+						d := haversineMeters(qlat, qlon, resp.Lat, resp.Lon)
+						resp.DistanceM = &d
+					}
+				}
+			}
+		}
+		// wikipedia summary if available
+		if tag, ok := resp.Tags["wikipedia"]; ok && tag != "" {
+			lang := ""
+			title := tag
+			if strings.Contains(tag, ":") {
+				parts := strings.SplitN(tag, ":", 2)
+				lang = parts[0]
+				title = parts[1]
+			}
+			if summary := s.fetchWikiSummary(r.Context(), lang, title); summary != "" {
+				resp.WikiSummary = summary
+			}
+		}
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	if nv, ok := s.poiNodes[id]; ok {
+		// node may not have tags in node index; search in ways/relations for tag info
+		// build minimal response
+		resp := poiInfoResponse{ID: id, Kind: "node", Label: "", Lat: nv.Lat, Lon: nv.Lon, Tags: nil}
+		s.poiMu.RUnlock()
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	if rv, ok := s.poiRels[id]; ok {
+		// relation: return centroid of member ways/nodes when possible
+		s.poiMu.RUnlock()
+		// try to assemble centroid from members
+		var sumLat, sumLon float64
+		var cnt int
+		for _, m := range rv.Members {
+			if m.Type == osmmini.MemberWay {
+				if wv, ok := s.poiWays[m.ID]; ok {
+					for _, nid := range wv.NodeIDs {
+						if c, ok := s.poiNodes[nid]; ok {
+							sumLat += c.Lat
+							sumLon += c.Lon
+							cnt++
+						}
+					}
+				}
+			} else if m.Type == osmmini.MemberNode {
+				if c, ok := s.poiNodes[m.ID]; ok {
+					sumLat += c.Lat
+					sumLon += c.Lon
+					cnt++
+				}
+			}
+		}
+		lat, lon := 0.0, 0.0
+		if cnt > 0 {
+			lat = sumLat / float64(cnt)
+			lon = sumLon / float64(cnt)
+		}
+		resp := poiInfoResponse{ID: id, Kind: "relation", Label: rv.Tags["name"], Lat: lat, Lon: lon, Tags: rv.Tags}
+		// optional wiki
+		if tag, ok := resp.Tags["wikipedia"]; ok && tag != "" {
+			lang := ""
+			title := tag
+			if strings.Contains(tag, ":") {
+				parts := strings.SplitN(tag, ":", 2)
+				lang = parts[0]
+				title = parts[1]
+			}
+			if summary := s.fetchWikiSummary(r.Context(), lang, title); summary != "" {
+				resp.WikiSummary = summary
+			}
+		}
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	s.poiMu.RUnlock()
+	writeJSONError(w, http.StatusNotFound, "POI not found")
 }
 
 // queryOllama sends a chat completion request to an Ollama instance.

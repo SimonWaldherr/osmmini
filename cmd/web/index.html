@@ -344,12 +344,23 @@
         // Try local CSS first, then CDN
         loadCss(localCss).catch(()=>loadCss(cdnCss)).catch(()=>{});
 
-        // Load Leaflet (local preferred) then app.js
+        // Load Leaflet (local preferred) then MarkerCluster then app.js
         loadScript(localJs).catch(()=>loadScript(cdnJs)).then(() => {
-          const app = document.createElement('script');
-          app.src = '/static/app.js?v={{.Version}}';
-          app.defer = true;
-          document.head.appendChild(app);
+          // markercluster CSS/JS (optional; used if available)
+          const mcCss1 = '/static/leaflet/MarkerCluster.css';
+          const mcCss2 = '/static/leaflet/MarkerCluster.Default.css';
+          const mcJsLocal = '/static/leaflet/leaflet.markercluster.js';
+          const mcJsCDN = 'https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js';
+          // try to load markercluster CSS (local first)
+          loadCss(mcCss1).catch(()=>loadCss('https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css')).catch(()=>{});
+          loadCss(mcCss2).catch(()=>loadCss('https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css')).catch(()=>{});
+          // try to load markercluster JS, then app
+          loadScript(mcJsLocal).catch(()=>loadScript(mcJsCDN)).finally(()=>{
+            const app = document.createElement('script');
+            app.src = '/static/app.js?v={{.Version}}';
+            app.defer = true;
+            document.head.appendChild(app);
+          });
         }).catch(() => {
           // if both leaflet loads fail, still load app.js so it can show errors
           const app = document.createElement('script');

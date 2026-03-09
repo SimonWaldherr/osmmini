@@ -873,7 +873,11 @@ func processWay(raw []byte, ctx blockCtx, wantHighway, wantAddrWay bool, opts Op
 	}
 
 	if !isHighway && !isAddr {
-		return nil
+		// Even when not highway/address, we may still want ways that have
+		// arbitrary tags requested by the caller (e.g., landuse, amenity).
+		// Defer to buildTags to determine if any tags pass KeepTag and
+		// emit via TaggedWay callback when present.
+		// continue below to build tags for that purpose.
 	}
 
 	tags, err := buildTags(keysSegs, valsSegs, ctx.st, opts.KeepTag)
@@ -898,6 +902,13 @@ func processWay(raw []byte, ctx blockCtx, wantHighway, wantAddrWay bool, opts Op
 	}
 	if isAddr && cb.AddressWay != nil {
 		if err := cb.AddressWay(w); err != nil {
+			return err
+		}
+	}
+	// If the way carries any tags that the caller asked to keep, expose it
+	// to TaggedWay so higher-level code can index POIs or area ways.
+	if cb.TaggedWay != nil && len(tags) > 0 {
+		if err := cb.TaggedWay(w); err != nil {
 			return err
 		}
 	}
@@ -997,21 +1008,28 @@ func processRelation(raw []byte, ctx blockCtx, opts Options, cb Callbacks) error
 		}
 	}
 
-	if cb.AddressRelation == nil || len(keysSegs) == 0 {
+	// Allow emitting relations either when the caller wants address relations
+	// or when the caller registered TaggedRelation to receive arbitrary
+	// relations that match KeepTag.
+	if len(keysSegs) == 0 {
 		return nil
 	}
 
+	// Determine whether relation has addr keys (old behavior) but always
+	// attempt to build tags when TaggedRelation is requested.
 	isAddr, err := scanKeys(keysSegs, ctx.st, false, true)
 	if err != nil {
 		return err
-	}
-	if !isAddr {
-		return nil
 	}
 
 	tags, err := buildTags(keysSegs, valsSegs, ctx.st, opts.KeepTag)
 	if err != nil {
 		return err
+	}
+
+	// If neither address relation nor tagged relation is wanted, skip.
+	if !isAddr && cb.TaggedRelation == nil && cb.AddressRelation == nil {
+		return nil
 	}
 
 	var members []Member

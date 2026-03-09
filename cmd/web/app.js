@@ -14,7 +14,9 @@ try {
 const map = L.map('map').setView([48.7, 12.7], 10);
 let currentTileLayer = null;
 let userLocationMarker = null;
+let userLocation = null; // {lat, lon} from browser geolocation (explicit user permission)
 let searchResultMarkers = [];
+let searchResultCluster = null;
 
 // Dynamic script/css loader helpers (used for MapLibre GL lazy-loading)
 function _loadScript(src) {
@@ -101,6 +103,7 @@ document.getElementById('useLocationBtn')?.addEventListener('click', async () =>
   navigator.geolocation.getCurrentPosition((pos) => {
     const lat = pos.coords.latitude;
     const lon = pos.coords.longitude;
+    userLocation = { lat, lon };
     const fromInput = document.getElementById('from');
     if (fromInput) fromInput.value = `${lat.toFixed(6)},${lon.toFixed(6)}`;
     // set user marker
@@ -112,6 +115,14 @@ document.getElementById('useLocationBtn')?.addEventListener('click', async () =>
     showToast('Standort konnte nicht ermittelt werden: ' + (err.message||''), 'error', 4000);
   }, { enableHighAccuracy: true, timeout: 10000 });
 });
+
+// helper: detect if prompt explicitly refers to the current map view/area
+function promptReferencesMap(prompt) {
+  if (!prompt) return false;
+  const p = prompt.toLowerCase();
+  const phrases = ['in der nähe der aktuellen karte', 'in diesem bereich', 'in dieser karte', 'auf der karte', 'aktuelle karte', 'dieser bereich', 'in der nähe der karte'];
+  return phrases.some(ph => p.includes(ph));
+}
 
 // Debounce helper for performance (defined early so UI code can reference it)
 function debounce(func, wait) {
@@ -791,6 +802,10 @@ function makeSuggest(containerId, inputOrId) {
 }
 
 function clearSearchResults() {
+  if (searchResultCluster && typeof searchResultCluster.clearLayers === 'function') {
+    try { searchResultCluster.clearLayers(); } catch(e) {}
+    searchResultCluster = null;
+  }
   searchResultMarkers.forEach(m => m.remove());
   searchResultMarkers = [];
 }
@@ -799,18 +814,110 @@ function showSearchResultsOnMap(results) {
   clearSearchResults();
   if (!Array.isArray(results) || results.length === 0) return;
   const bounds = [];
+  // Use marker clustering when available for large result sets, with custom icon
+  const useCluster = !!(window.L && typeof L.markerClusterGroup === 'function');
+  if (useCluster) {
+    searchResultCluster = L.markerClusterGroup({
+      spiderfyOnMaxZoom: true,
+      showCoverageOnHover: false,
+      maxClusterRadius: 40,
+      iconCreateFunction: function(cluster) {
+        const count = cluster.getChildCount();
+        const size = count < 10 ? 'small' : (count < 50 ? 'medium' : 'large');
+        const html = `<div class="cluster-icon ${size}"><span>${count}</span></div>`;
+        return L.divIcon({ html, className: 'custom-cluster', iconSize: L.point(40, 40) });
+      }
+    });
+  }
   results.forEach((item, idx) => {
     if (!item || !item.lat || !item.lon) return;
-    const m = L.marker([item.lat, item.lon], { title: item.label || '' }).addTo(map);
+    const m = L.marker([item.lat, item.lon], { title: item.label || '' });
     const tags = item.tags || {};
     let popupHtml = `<strong>${escapeHtml(item.label || '')}</strong><br/>`;
     if (tags['addr:street'] || tags['addr:housenumber']) popupHtml += `${escapeHtml(tags['addr:street']||'')} ${escapeHtml(tags['addr:housenumber']||'')}<br/>`;
     popupHtml += `<small style="opacity:0.8">${escapeHtml((tags['addr:city']||''))}</small>`;
-    m.bindPopup(popupHtml);
+    // add an action button to popup to quickly add this result as waypoint
+    const popupWithButton = popupHtml + `<div style="margin-top:6px;text-align:right;">
+      <button class="btn btn-sm btn-outline info-btn">Mehr Info</button>
+      <button class="btn btn-sm btn-outline add-waypoint-btn">Als Zwischenstopp</button>
+    </div>`;
+    m.bindPopup(popupWithButton);
+    m.on('popupopen', (ev) => {
+      const btn = ev.popup.getElement().querySelector('.add-waypoint-btn');
+      const infoBtn = ev.popup.getElement().querySelector('.info-btn');
+      if (btn) {
+        btn.addEventListener('click', () => {
+          const lbl = item.label || (item.tags && item.tags.name) || '';
+          if (lbl) addWaypointWithValue(lbl);
+          ev.popup._close();
+        });
+      }
+      if (infoBtn) {
+        infoBtn.addEventListener('click', async () => {
+          const orig = ev.popup.getContent();
+          // show loading
+          ev.popup.setContent('<div>Informationen werden geladen…</div>');
+          try {
+            const qlat = userLocation ? userLocation.lat : null;
+            const qlon = userLocation ? userLocation.lon : null;
+            const qs = (qlat !== null && qlon !== null) ? `?lat=${qlat}&lon=${qlon}` : '';
+            const res = await fetch(`/api/v1/poi/${item.id}${qs}`);
+            if (!res.ok) throw new Error('fetch failed');
+            const data = await res.json();
+            // build info html
+            let infoHtml = `<strong>${escapeHtml(data.label || '')}</strong><br/>`;
+            if (data.tags) {
+              const keys = Object.keys(data.tags).sort();
+              infoHtml += '<div style="margin-top:6px; font-size:13px;">';
+              keys.forEach(k => {
+                const v = data.tags[k];
+                infoHtml += `<div><strong>${escapeHtml(k)}:</strong> ${escapeHtml(v)}</div>`;
+              });
+              infoHtml += '</div>';
+            }
+            if (data.wiki_summary) {
+              infoHtml += `<div style="margin-top:8px; font-size:13px; color:#333;">${escapeHtml(data.wiki_summary)}</div>`;
+            }
+            if (data.distance_m) {
+              infoHtml += `<div style="margin-top:6px; font-size:12px; color:#666;">Entfernung: ${Math.round(data.distance_m)} m</div>`;
+            }
+            infoHtml += `<div style="margin-top:8px;text-align:right;"><button class=\"btn btn-sm btn-primary route-btn\">Route berechnen</button> <button class=\"btn btn-sm btn-outline back-btn\">Zurück</button></div>`;
+            ev.popup.setContent(infoHtml);
+            // wire buttons
+            setTimeout(() => {
+              const el = ev.popup.getElement();
+              if (!el) return;
+              const rbtn = el.querySelector('.route-btn');
+              const bbtn = el.querySelector('.back-btn');
+              if (rbtn) rbtn.addEventListener('click', () => {
+                const to = `${data.lat},${data.lon}`;
+                document.getElementById('to').value = to;
+                ev.popup._close();
+                compute();
+              });
+              if (bbtn) bbtn.addEventListener('click', () => {
+                ev.popup.setContent(orig);
+              });
+            }, 50);
+          } catch (e) {
+            ev.popup.setContent('<div>Informationen konnten nicht geladen werden.</div>');
+            setTimeout(() => ev.popup.setContent(orig), 2000);
+          }
+        });
+      }
+    });
     m.on('click', () => { m.openPopup(); });
+    if (searchResultCluster) {
+      searchResultCluster.addLayer(m);
+    } else {
+      m.addTo(map);
+    }
     searchResultMarkers.push(m);
     bounds.push([item.lat, item.lon]);
   });
+  if (searchResultCluster) {
+    map.addLayer(searchResultCluster);
+  }
   if (bounds.length === 1) {
     map.panTo(bounds[0]);
   } else if (bounds.length > 1) {
@@ -1356,12 +1463,23 @@ async function sendAIQuery() {
     // include map center as location hint if available
     const payload = { prompt, model };
     try {
+      // Always include current map center as a hint
       if (window.map && typeof map.getCenter === 'function') {
         const c = map.getCenter();
         if (c && typeof c.lat === 'number' && typeof c.lng === 'number') {
-          payload.lat = c.lat;
-          payload.lon = c.lng;
+          payload.map_lat = c.lat;
+          payload.map_lon = c.lng;
+          // Do NOT set `lat`/`lon` from map center to avoid misrepresenting user's location.
+          // `lat`/`lon` are set only when explicit browser geolocation (`userLocation`) is available.
         }
+      }
+      // Also include explicit browser geolocation when available
+      if (userLocation && typeof userLocation.lat === 'number' && typeof userLocation.lon === 'number') {
+        payload.user_lat = userLocation.lat;
+        payload.user_lon = userLocation.lon;
+        // prefer user coords for backward-compat `lat`/`lon`
+        payload.lat = userLocation.lat;
+        payload.lon = userLocation.lon;
       }
     } catch (e) {}
     // Follow-up handling: if user asks duration and we have a recent route, answer locally
@@ -1416,11 +1534,20 @@ async function sendAIQuery() {
         // if user asked for stops (via / mit / stop), auto-add suggestions as waypoints
         const p = prompt.toLowerCase();
         if (p.includes('mit') || p.includes('via') || p.includes('stopp') || p.includes('stopps') || p.includes('zwischen')) {
-          data.suggestions.forEach(s => {
-            const val = s.label || s.Label || (s.tags && s.tags.name) || '';
-            if (val) addWaypointWithValue(val);
-          });
-          showToast('KI: Vorschläge als Zwischenstopps hinzugefügt', 'success', 1800);
+          const toAdd = data.suggestions.map(s => s.label || s.Label || (s.tags && s.tags.name) || '').filter(Boolean);
+          if (toAdd.length === 0) {
+            /* nothing */
+          } else if (toAdd.length > 6) {
+            if (confirm(`Die KI möchte ${toAdd.length} Zwischenstopps hinzufügen. Wirklich hinzufügen?`)) {
+              toAdd.forEach(v => addWaypointWithValue(v));
+              showToast('KI: Vorschläge als Zwischenstopps hinzugefügt', 'success', 1800);
+            } else {
+              showToast('KI: Zwischenstopps verworfen', 'info', 1400);
+            }
+          } else {
+            toAdd.forEach(v => addWaypointWithValue(v));
+            showToast('KI: Vorschläge als Zwischenstopps hinzugefügt', 'success', 1800);
+          }
         }
       }
       // If AI provided structured from/to/waypoints, apply them
@@ -1432,7 +1559,14 @@ async function sendAIQuery() {
           const te = document.getElementById('to'); if (te && data.to.query) te.value = data.to.query;
         }
         if (data && data.waypoints && Array.isArray(data.waypoints)) {
-          data.waypoints.forEach(w => { if (w && w.query) addWaypointWithValue(w.query); });
+          const qws = data.waypoints.map(w => w && w.query).filter(Boolean);
+          if (qws.length > 6) {
+            if (confirm(`Die KI hat ${qws.length} vorgeschlagene Zwischenstopps. Wirklich hinzufügen?`)) {
+              qws.forEach(v => addWaypointWithValue(v));
+            }
+          } else {
+            qws.forEach(v => addWaypointWithValue(v));
+          }
         }
       } catch (e) {}
     } catch (e) { console.warn('Failed to render AI route/suggestions', e); }
