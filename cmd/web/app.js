@@ -438,10 +438,10 @@ function renderDisambiguationButtons(details) {
     btn.className = 'btn';
     btn.style.padding = '6px 10px';
     btn.style.fontSize = '12px';
-    btn.textContent = sug.label || `${(sug.lat || 0).toFixed(5)}, ${(sug.lon || 0).toFixed(5)}`;
-    btn.title = sug.kind || 'Treffer';
+    btn.textContent = getResultInputValue(sug) || `${(sug.lat || 0).toFixed(5)}, ${(sug.lon || 0).toFixed(5)}`;
+    btn.title = [sug.kind || 'Treffer', getResultSecondary(sug)].filter(Boolean).join(' • ');
     btn.addEventListener('click', async () => {
-      const val = sug.label || `${sug.lat},${sug.lon}`;
+      const val = getResultInputValue(sug) || `${sug.lat},${sug.lon}`;
       const el = document.getElementById(target);
       if (el) el.value = val;
       try {
@@ -1027,15 +1027,8 @@ function makeSuggest(containerId, inputOrId) {
           const el = document.createElement('div');
           el.className = 'item';
           el.dataset.index = String(i);
-          // build rich label: prefer POI/company name, then street label
-          const tags = item.tags || {};
-          const primary = tags.name || item.label || tags.brand || tags.operator || '';
-          const secondaryParts = [];
-          if (tags.shop) secondaryParts.push(tags.shop);
-          if (tags.amenity) secondaryParts.push(tags.amenity);
-          if (tags['addr:street']) secondaryParts.push(tags['addr:street']);
-          if (tags['addr:city']) secondaryParts.push(tags['addr:city']);
-          const secondary = secondaryParts.join(' \u2022 ');
+          const primary = getResultPrimary(item);
+          const secondary = getResultSecondary(item);
 
           // highlight matches and show primary + secondary using DOM (safe, no XSS)
           const curQ = input.value.trim();
@@ -1059,7 +1052,7 @@ function makeSuggest(containerId, inputOrId) {
           el.setAttribute('aria-selected', 'false');
           el.addEventListener('mouseover', () => { selectedIndex = i; updateActive(); });
           el.onclick = () => {
-            const val = primary || item.label || '';
+            const val = getResultInputValue(item) || primary || '';
             input.value = val;
             // update clear-button visibility
             const wrap = input.closest('.input-clear-wrap');
@@ -1149,10 +1142,9 @@ function showSearchResultsOnMap(results) {
   results.forEach((item, idx) => {
     if (!item || !item.lat || !item.lon) return;
     const m = L.marker([item.lat, item.lon], { title: item.label || '' });
-    const tags = item.tags || {};
+    const secondary = getResultSecondary(item);
     let popupHtml = `<strong>${escapeHtml(item.label || '')}</strong><br/>`;
-    if (tags['addr:street'] || tags['addr:housenumber']) popupHtml += `${escapeHtml(tags['addr:street']||'')} ${escapeHtml(tags['addr:housenumber']||'')}<br/>`;
-    popupHtml += `<small style="opacity:0.8">${escapeHtml((tags['addr:city']||''))}</small>`;
+    if (secondary) popupHtml += `<small style="opacity:0.8">${escapeHtml(secondary)}</small>`;
     // add an action button to popup to quickly add this result as waypoint
     const popupWithButton = popupHtml + `<div style="margin-top:6px;text-align:right;">
       <button class="btn btn-sm btn-outline info-btn">Mehr Info</button>
@@ -1164,7 +1156,7 @@ function showSearchResultsOnMap(results) {
       const infoBtn = ev.popup.getElement().querySelector('.info-btn');
       if (btn) {
         btn.addEventListener('click', () => {
-          const lbl = item.label || (item.tags && item.tags.name) || '';
+          const lbl = getResultInputValue(item) || '';
           if (lbl) addWaypointWithValue(lbl);
           ev.popup._close();
         });
@@ -1207,7 +1199,7 @@ function showSearchResultsOnMap(results) {
               const rbtn = el.querySelector('.route-btn');
               const bbtn = el.querySelector('.back-btn');
               if (rbtn) rbtn.addEventListener('click', () => {
-                const to = `${data.lat},${data.lon}`;
+                const to = data.label || item.label || `${data.lat},${data.lon}`;
                 document.getElementById('to').value = to;
                 ev.popup._close();
                 compute();
@@ -1240,6 +1232,32 @@ function showSearchResultsOnMap(results) {
   } else if (bounds.length > 1) {
     try { map.fitBounds(bounds, { padding: [40, 40] }); } catch(e) {}
   }
+}
+
+function getResultPrimary(item) {
+  const tags = item && item.tags ? item.tags : {};
+  return tags.name || tags.brand || tags.operator || (item && item.label) || '';
+}
+
+function getResultSecondary(item) {
+  if (!item) return '';
+  const parts = [];
+  if (item.subtitle) parts.push(item.subtitle);
+  if (item.match) parts.push(item.match);
+  if (parts.length) return parts.join(' • ');
+
+  const tags = item.tags || {};
+  const fallback = [];
+  if (tags.shop) fallback.push(tags.shop);
+  if (tags.amenity) fallback.push(tags.amenity);
+  if (tags['addr:street']) fallback.push(tags['addr:street']);
+  if (tags['addr:city']) fallback.push(tags['addr:city']);
+  return fallback.join(' • ');
+}
+
+function getResultInputValue(item) {
+  if (!item) return '';
+  return item.label || getResultPrimary(item) || '';
 }
 
 // simple HTML escaper for suggestion labels
@@ -2115,8 +2133,8 @@ async function sendAIQuery() {
         try {
           const fromEl = document.getElementById('from');
           const toEl = document.getElementById('to');
-          if (fromEl && data.from && (data.from.query || data.from.label)) fromEl.value = data.from.query || data.from.label;
-          if (toEl && data.to && (data.to.query || data.to.label)) toEl.value = data.to.query || data.to.label;
+          if (fromEl && data.from && (data.from.query || data.from.label)) fromEl.value = data.from.label || data.from.query;
+          if (toEl && data.to && (data.to.query || data.to.label)) toEl.value = data.to.label || data.to.query;
         } catch (e) {}
         setMapsLinks(data.route.google_maps_url || data.route.googleMapsURL || '', data.route.apple_maps_url || data.route.appleMapsURL || '');
         // Append a compact route summary badge to the message
@@ -2138,7 +2156,7 @@ async function sendAIQuery() {
         // if user asked for stops (via / mit / stop), auto-add suggestions as waypoints
         const p = prompt.toLowerCase();
         if (p.includes('mit') || p.includes('via') || p.includes('stopp') || p.includes('stopps') || p.includes('zwischen')) {
-          const toAdd = data.suggestions.map(s => s.label || s.Label || (s.tags && s.tags.name) || '').filter(Boolean);
+          const toAdd = data.suggestions.map(s => getResultInputValue(s) || s.Label || '').filter(Boolean);
           if (toAdd.length === 0) {
             /* nothing */
           } else if (toAdd.length > 6) {
@@ -2157,13 +2175,13 @@ async function sendAIQuery() {
       // If AI provided structured from/to/waypoints, apply them
       try {
         if (data && data.from) {
-          const fe = document.getElementById('from'); if (fe && data.from.query) fe.value = data.from.query;
+          const fe = document.getElementById('from'); if (fe && (data.from.label || data.from.query)) fe.value = data.from.label || data.from.query;
         }
         if (data && data.to) {
-          const te = document.getElementById('to'); if (te && data.to.query) te.value = data.to.query;
+          const te = document.getElementById('to'); if (te && (data.to.label || data.to.query)) te.value = data.to.label || data.to.query;
         }
         if (data && data.waypoints && Array.isArray(data.waypoints)) {
-          const qws = data.waypoints.map(w => w && w.query).filter(Boolean);
+          const qws = data.waypoints.map(w => w && (w.label || w.query)).filter(Boolean);
           if (qws.length > 6) {
             if (confirm(`Die KI hat ${qws.length} vorgeschlagene Zwischenstopps. Wirklich hinzufügen?`)) {
               qws.forEach(v => addWaypointWithValue(v));
