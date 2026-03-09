@@ -11,6 +11,14 @@ try {
   console.warn('Failed to load preloaded settings:', e);
 }
 
+// Sync the has-value class on an input's .input-clear-wrap parent so the
+// inline clear button shows/hides correctly after programmatic value changes.
+function syncInputClearState(inputId) {
+  const el = document.getElementById(inputId);
+  if (!el) return;
+  el.closest('.input-clear-wrap')?.classList.toggle('has-value', !!el.value);
+}
+
 const map = L.map('map').setView([48.7, 12.7], 10);
 let currentTileLayer = null;
 let userLocationMarker = null;
@@ -105,7 +113,10 @@ document.getElementById('useLocationBtn')?.addEventListener('click', async () =>
     const lon = pos.coords.longitude;
     userLocation = { lat, lon };
     const fromInput = document.getElementById('from');
-    if (fromInput) fromInput.value = `${lat.toFixed(6)},${lon.toFixed(6)}`;
+    if (fromInput) {
+      fromInput.value = `${lat.toFixed(6)},${lon.toFixed(6)}`;
+      syncInputClearState('from');
+    }
     // set user marker
     if (userLocationMarker) userLocationMarker.remove();
     userLocationMarker = L.circleMarker([lat, lon], { radius:6, color:'#2ee6a7', fillColor:'#2ee6a7', fillOpacity:0.9 }).addTo(map).bindPopup('Ihr Standort').openPopup();
@@ -156,6 +167,10 @@ function preventAutofill() {
     const container = document.getElementById(containerId);
     if (!container) return null;
     
+    // Wrap input + clear button in a flex container
+    const wrap = document.createElement('div');
+    wrap.className = 'input-clear-wrap';
+
     const input = document.createElement('input');
     input.id = fieldId;
     input.type = 'text';
@@ -166,15 +181,37 @@ function preventAutofill() {
     input.setAttribute('autocapitalize', 'off');
     input.setAttribute('spellcheck', 'false');
     input.setAttribute('data-lpignore', 'true');
-    input.setAttribute('inputmode', 'none'); // Disable mobile keyboard suggestions
+    input.setAttribute('inputmode', 'search');
+    input.setAttribute('aria-label', placeholder);
+
+    const clearBtn = document.createElement('button');
+    clearBtn.type = 'button';
+    clearBtn.className = 'btn-input-clear';
+    clearBtn.title = 'Eingabe löschen';
+    clearBtn.setAttribute('aria-label', 'Eingabe löschen');
+    clearBtn.textContent = '✕';
+    clearBtn.addEventListener('click', () => {
+      input.value = '';
+      wrap.classList.remove('has-value');
+      input.focus();
+      // Hide suggestions
+      const suggestEl = container.closest('.route-input-wrap')?.querySelector('.suggest');
+      if (suggestEl) suggestEl.style.display = 'none';
+    });
+
+    wrap.appendChild(input);
+    wrap.appendChild(clearBtn);
+    container.appendChild(wrap);
     
-    container.appendChild(input);
-    
-    // Use a workaround: reset value on suspicious autofill attempts
+    // Update has-value class and autofill detection
     let lastValue = '';
     let autofillTimer = null;
+    function updateClearVisible() {
+      wrap.classList.toggle('has-value', !!input.value);
+    }
     input.addEventListener('input', (e) => {
       lastValue = e.target.value;
+      updateClearVisible();
     });
     input.addEventListener('focus', () => {
       // Only watch while the input is focused; clear on blur to avoid leaking.
@@ -187,6 +224,7 @@ function preventAutofill() {
             input.value = lastValue;
           }
         }
+        updateClearVisible();
       }, 100);
     });
     input.addEventListener('blur', () => {
@@ -194,13 +232,14 @@ function preventAutofill() {
         clearInterval(autofillTimer);
         autofillTimer = null;
       }
+      updateClearVisible();
     });
     
     return input;
   }
   
-  const fromInput = createDynamicInput('from-container', 'from', 'Adresse oder lat lon');
-  const toInput = createDynamicInput('to-container', 'to', 'Adresse oder lat lon');
+  const fromInput = createDynamicInput('from-container', 'from', 'Start: Adresse oder Koordinaten');
+  const toInput = createDynamicInput('to-container', 'to', 'Ziel: Adresse oder Koordinaten');
 }
 
 // Call this immediately
@@ -217,9 +256,11 @@ function initTheme() {
 }
 
 function updateThemeButton() {
-  const btn = document.getElementById('themeToggle');
   const isDark = !document.documentElement.classList.contains('light-mode');
-  btn.textContent = isDark ? '☀️' : '🌙';
+  const moon = document.getElementById('themeIconMoon');
+  const sun  = document.getElementById('themeIconSun');
+  if (moon) moon.style.display = isDark ? 'block' : 'none';
+  if (sun)  sun.style.display  = isDark ? 'none'  : 'block';
 }
 
 function toggleTheme() {
@@ -461,6 +502,9 @@ function renderPath(path, meta){
 async function compute() {
   const from = document.getElementById('from').value.trim();
   const to = document.getElementById('to').value.trim();
+  // Sync clear-button visibility for main inputs (covers programmatic value sets)
+  syncInputClearState('from');
+  syncInputClearState('to');
   const options = routeOptionsFromUI();
   document.getElementById('status').textContent = 'Berechne...';
   setMapsLinks('', '');
@@ -603,21 +647,38 @@ function renderManeuvers(steps) {
 }
 
 document.getElementById('go').addEventListener('click', e=>{ e.preventDefault(); compute(); });
-document.getElementById('clear').addEventListener('click', () => { 
+document.getElementById('clear').addEventListener('click', () => {
+  // Clear map markers and route polyline
   while(stops.length){ const s=stops.pop(); s.marker.remove(); } 
   stopSeq=1; 
   renderStopList(); 
   if(polyline) polyline.remove();
   if(startMarker) startMarker.remove();
   if(endMarker) endMarker.remove();
+  clearSearchResults();
+  // Clear input fields
+  const fromEl = document.getElementById('from');
+  const toEl   = document.getElementById('to');
+  if (fromEl) {
+    fromEl.value = '';
+    fromEl.closest('.input-clear-wrap')?.classList.remove('has-value');
+  }
+  if (toEl) {
+    toEl.value = '';
+    toEl.closest('.input-clear-wrap')?.classList.remove('has-value');
+  }
+  // Clear waypoints
+  [...waypoints].forEach(w => removeWaypoint(w.id));
   document.getElementById('status').textContent = 'Bereit';
   document.getElementById('distance').textContent = '';
   const detailsEl = document.getElementById('routeDetails');
   const actionsEl = document.getElementById('routeActions');
+  const maneuversEl = document.getElementById('maneuvers');
   if (detailsEl) detailsEl.style.display = 'none';
   if (actionsEl) actionsEl.style.display = 'none';
+  if (maneuversEl) maneuversEl.style.display = 'none';
   setMapsLinks('', '');
-  showToast('Karte zurückgesetzt', 'info', 1500);
+  showToast('Zurückgesetzt', 'info', 1500);
 });
 
 // Route control buttons
@@ -780,10 +841,10 @@ async function executeAgentActions(actions, session_id) {
     // Populate the form fields
     try {
       if (fromVal) {
-        const fe = document.getElementById('from'); if (fe) fe.value = fromVal;
+        const fe = document.getElementById('from'); if (fe) { fe.value = fromVal; syncInputClearState('from'); }
       }
       if (toVal) {
-        const te = document.getElementById('to'); if (te) te.value = toVal;
+        const te = document.getElementById('to'); if (te) { te.value = toVal; syncInputClearState('to'); }
       }
       showToast('Agent: Formular mit Quelle und Ziel ausgefüllt', 'success', 2200);
 
@@ -841,8 +902,6 @@ map.on('click', ev=>{
 makeSuggest('from-suggest','from'); 
 makeSuggest('to-suggest','to');
 
-addWaypoint();
-
 function addWaypoint() {
   const id = 'WP' + (waypointSeq++);
   const container = document.getElementById('waypointsContainer');
@@ -851,27 +910,34 @@ function addWaypoint() {
   wrapper.className = 'waypoint';
   wrapper.id = 'waypoint-' + id;
   
+  // Wrap input + suggest in a flex group for proper positioning
   const inputGroup = document.createElement('div');
-  inputGroup.className = 'input-group';
+  inputGroup.className = 'input-group route-input-wrap';
   inputGroup.style.flex = '1';
   inputGroup.style.marginBottom = '0';
-  
-  const input = document.createElement('input');
-  input.type = 'text';
-  input.placeholder = 'Zwischenstopp ' + waypoints.length;
-  input.autocomplete = 'off';
+  inputGroup.style.position = 'relative';
   
   const suggestDiv = document.createElement('div');
   suggestDiv.className = 'suggest';
   suggestDiv.id = id + '-suggest';
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.placeholder = 'Zwischenstopp: Adresse oder Koordinaten';
+  input.setAttribute('autocomplete', 'off');
+  input.setAttribute('autocorrect', 'off');
+  input.setAttribute('spellcheck', 'false');
+  input.setAttribute('inputmode', 'search');
+  input.setAttribute('aria-label', 'Zwischenstopp ' + id);
   
-  inputGroup.appendChild(input);
   inputGroup.appendChild(suggestDiv);
+  inputGroup.appendChild(input);
   
   const removeBtn = document.createElement('button');
   removeBtn.textContent = '✕';
   removeBtn.className = 'btn-remove';
   removeBtn.title = 'Entfernen';
+  removeBtn.setAttribute('aria-label', 'Zwischenstopp entfernen');
   removeBtn.onclick = () => removeWaypoint(id);
   
   wrapper.appendChild(inputGroup);
@@ -890,6 +956,8 @@ function addWaypoint() {
       compute();
     }
   });
+
+  input.focus();
 }
 
 // helper: add a waypoint and set its input value
@@ -922,31 +990,40 @@ function makeSuggest(containerId, inputOrId) {
   let ctrl = null;
   let selectedIndex = -1;
 
-  function hide() { container.style.display = 'none'; }
+  function hide() { container.style.display = 'none'; container.innerHTML = ''; }
   function show() { if (container.innerHTML.trim()) container.style.display = 'block'; }
 
   let lastQuery = '';
   input.addEventListener('input', () => {
     const q = input.value.trim();
     if (timeout) clearTimeout(timeout);
-    if (ctrl) ctrl.abort();
+    if (ctrl) { ctrl.abort(); ctrl = null; }
     if (q.length < 2) { hide(); return; }
     if (q === lastQuery) return; // Skip duplicate queries
     lastQuery = q;
+
+    // Show loading indicator immediately using DOM APIs (no innerHTML)
+    container.innerHTML = '';
+    const loadingItem = document.createElement('div');
+    loadingItem.className = 'item suggest-loading';
+    loadingItem.textContent = 'Suche\u2026';
+    container.appendChild(loadingItem);
+    container.style.display = 'block';
+    selectedIndex = -1;
 
     timeout = setTimeout(async () => {
       const mySeq = ++seq;
       ctrl = new AbortController();
       try {
-        const res = await fetch('/api/v1/search?limit=5&q=' + encodeURIComponent(q), { signal: ctrl.signal });
-        if (!res.ok) return;
+        const res = await fetch('/api/v1/search?limit=6&q=' + encodeURIComponent(q), { signal: ctrl.signal });
+        if (!res.ok) { hide(); return; }
         const data = await res.json();
         if (mySeq !== seq) return;
         container.innerHTML = '';
         selectedIndex = -1;
         if (!Array.isArray(data) || data.length === 0) { hide(); return; }
 
-        data.slice(0,5).forEach((item, i) => {
+        data.slice(0, 6).forEach((item, i) => {
           const el = document.createElement('div');
           el.className = 'item';
           el.dataset.index = String(i);
@@ -958,18 +1035,39 @@ function makeSuggest(containerId, inputOrId) {
           if (tags.amenity) secondaryParts.push(tags.amenity);
           if (tags['addr:street']) secondaryParts.push(tags['addr:street']);
           if (tags['addr:city']) secondaryParts.push(tags['addr:city']);
-          const secondary = secondaryParts.join(' • ');
+          const secondary = secondaryParts.join(' \u2022 ');
 
-          // highlight matches and show primary + secondary
-          const q = input.value.trim();
-          const primHtml = q ? highlight(primary || item.label || '', q) : escapeHtml(primary || item.label || '');
-          const secHtml = q ? highlight(secondary, q) : escapeHtml(secondary);
-          el.innerHTML = `<div style="display:flex;flex-direction:column;">
-                            <div style="font-weight:600;">${primHtml}</div>
-                            <div style="font-size:12px; color:rgba(200,220,255,0.6); margin-top:4px;">${secHtml}</div>
-                          </div>`;
+          // highlight matches and show primary + secondary using DOM (safe, no XSS)
+          const curQ = input.value.trim();
+          const col = document.createElement('div');
+          col.className = 'suggest-item-col';
+
+          const primEl = document.createElement('div');
+          primEl.className = 'suggest-item-primary';
+          primEl.innerHTML = curQ ? highlight(primary || item.label || '', curQ) : escapeHtml(primary || item.label || '');
+          col.appendChild(primEl);
+
+          if (secondary) {
+            const secEl = document.createElement('div');
+            secEl.className = 'suggest-item-secondary';
+            secEl.innerHTML = curQ ? highlight(secondary, curQ) : escapeHtml(secondary);
+            col.appendChild(secEl);
+          }
+
+          el.appendChild(col);
+          el.setAttribute('role', 'option');
+          el.setAttribute('aria-selected', 'false');
           el.addEventListener('mouseover', () => { selectedIndex = i; updateActive(); });
-          el.onclick = () => { input.value = primary || item.label || ''; hide(); compute(); input.focus(); };
+          el.onclick = () => {
+            const val = primary || item.label || '';
+            input.value = val;
+            // update clear-button visibility
+            const wrap = input.closest('.input-clear-wrap');
+            if (wrap) wrap.classList.toggle('has-value', !!val);
+            hide();
+            compute();
+            input.focus();
+          };
           container.appendChild(el);
         });
         // also show all returned results on the map
@@ -985,7 +1083,8 @@ function makeSuggest(containerId, inputOrId) {
 
   // keyboard navigation for suggestions
   input.addEventListener('keydown', (ev) => {
-    const items = Array.from(container.querySelectorAll('.item'));
+    if (ev.key === 'Escape') { hide(); return; }
+    const items = Array.from(container.querySelectorAll('.item:not(.suggest-loading)'));
     if (!items.length) return;
     if (ev.key === 'ArrowDown') {
       ev.preventDefault();
@@ -999,15 +1098,15 @@ function makeSuggest(containerId, inputOrId) {
       if (selectedIndex >= 0 && items[selectedIndex]) {
         ev.preventDefault(); items[selectedIndex].click();
       }
-    } else if (ev.key === 'Escape') {
-      hide();
     }
   });
 
   function updateActive() {
-    const items = Array.from(container.querySelectorAll('.item'));
+    const items = Array.from(container.querySelectorAll('.item:not(.suggest-loading)'));
     items.forEach((it, idx) => {
-      if (idx === selectedIndex) it.classList.add('active'); else it.classList.remove('active');
+      const active = idx === selectedIndex;
+      it.classList.toggle('active', active);
+      it.setAttribute('aria-selected', active ? 'true' : 'false');
     });
     // ensure active item is visible
     const active = container.querySelector('.item.active');
@@ -1615,11 +1714,13 @@ document.getElementById('noLeftTurn').addEventListener('change', (ev) => {
 const aiToggle = document.getElementById('aiToggle');
 const aiBody = document.getElementById('aiBody');
 const aiCard = document.getElementById('aiCard');
+const aiCardHeader = document.getElementById('aiCardHeader');
 if (aiToggle) {
   function setAIOpen(open){
     aiBody.style.display = open ? 'block' : 'none';
     aiCard.classList.toggle('collapsed', !open);
     aiToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (aiCardHeader) aiCardHeader.setAttribute('aria-expanded', open ? 'true' : 'false');
     aiToggle.textContent = open ? '‹' : '›';
     localStorage.setItem('aiOpen', open ? '1' : '0');
     if (open && !aiCard.dataset.checked) {
@@ -1627,7 +1728,21 @@ if (aiToggle) {
       checkAIStatus();
     }
   }
-  aiToggle.addEventListener('click', ()=>{ setAIOpen(aiBody.style.display==='none'); });
+  // Clicking the toggle button or anywhere on the header toggles the panel
+  aiToggle.addEventListener('click', (e) => { e.stopPropagation(); setAIOpen(aiBody.style.display === 'none'); });
+  if (aiCardHeader) {
+    aiCardHeader.addEventListener('click', (e) => {
+      if (e.target === aiToggle) return; // button handles its own click
+      setAIOpen(aiBody.style.display === 'none');
+    });
+    // Keyboard accessibility for the header
+    aiCardHeader.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        setAIOpen(aiBody.style.display === 'none');
+      }
+    });
+  }
   if(localStorage.getItem('aiOpen') === null) setAIOpen(false); else setAIOpen(localStorage.getItem('aiOpen')==='1');
 }
 
@@ -1647,6 +1762,17 @@ function setAISessionId(sid) {
     localStorage.setItem('ai_session_id', sid);
   }
 }
+
+// Clear chat history
+document.getElementById('aiClearChat')?.addEventListener('click', () => {
+  const messagesEl = document.getElementById('aiMessages');
+  if (messagesEl) messagesEl.innerHTML = '';
+  // reset session so next message starts a fresh context
+  _aiSessionId = '';
+  localStorage.removeItem('ai_session_id');
+  lastAIResponse = null;
+  showToast('Chatverlauf gelöscht', 'info', 1500);
+});
 
 async function checkAIStatus() {
   const statusEl = document.getElementById('aiStatus');

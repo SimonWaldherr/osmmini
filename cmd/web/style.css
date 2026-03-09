@@ -497,12 +497,42 @@ input:-webkit-autofill:focus {
   caret-color: var(--text);
 }
 
+/* Input wrapper with inline clear button */
+.input-clear-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.input-clear-wrap .dynamic-input {
+  padding-right: 30px;
+}
+.btn-input-clear {
+  position: absolute;
+  right: 8px;
+  width: 18px; height: 18px;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  border: none;
+  background: var(--text-3);
+  color: var(--bg);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+  flex-shrink: 0;
+  transition: all var(--dur) var(--ease);
+}
+.btn-input-clear:hover { background: var(--text-2); }
+.input-clear-wrap.has-value .btn-input-clear { display: inline-flex; }
+
 /* ─── Suggestions ─── */
 .suggest {
   display: none;
   position: absolute;
   left: 0; right: 0;
-  bottom: calc(100% + 2px);
+  top: calc(100% + 2px);
   background: var(--suggest-bg);
   border: 1px solid var(--border-focus);
   border-radius: 10px;
@@ -512,6 +542,7 @@ input:-webkit-autofill:focus {
   box-shadow: 0 8px 32px rgba(0,0,0,0.4);
   scrollbar-width: thin;
   scrollbar-color: var(--border) transparent;
+  animation: fadeSlide var(--dur) var(--ease) both;
 }
 :root.light-mode .suggest { box-shadow: 0 8px 32px rgba(0,0,0,0.15); }
 .suggest:not(:empty) { display: block; }
@@ -531,6 +562,29 @@ input:-webkit-autofill:focus {
   padding: 0 2px;
   border-radius: 2px;
 }
+.suggest .item.suggest-loading {
+  color: var(--text-2);
+  font-style: italic;
+  cursor: default;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.suggest .item.suggest-loading::before {
+  content: '';
+  display: inline-block;
+  width: 12px; height: 12px;
+  border: 2px solid rgba(77,163,255,0.2);
+  border-top-color: var(--primary);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+
+/* Suggest item layout */
+.suggest-item-col { display: flex; flex-direction: column; }
+.suggest-item-primary { font-weight: 600; }
+.suggest-item-secondary { font-size: 12px; color: var(--text-2); margin-top: 3px; }
 
 /* ─── Buttons ─── */
 .btn {
@@ -646,6 +700,28 @@ input:-webkit-autofill:focus {
 :root.light-mode .ai-assistant {
   background: rgba(0,0,0,0.025);
 }
+
+.ai-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.btn-ai-clear {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-2);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all var(--dur) var(--ease);
+}
+.btn-ai-clear:hover { background: rgba(239,68,68,0.08); border-color: rgba(239,68,68,0.3); color: var(--error); }
 
 .ai-input-row {
   display: flex;
