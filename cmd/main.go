@@ -2443,6 +2443,100 @@ func (s *server) searchPOIMatches(raw string, limit int) []apiSearchResult {
 	return out
 }
 
+// findNearestPlaceLabel attempts to find a human-friendly label (address or POI)
+// near the given lat/lon within maxDistM meters. Returns label and true if found.
+func (s *server) findNearestPlaceLabel(lat, lon float64, maxDistM float64) (string, bool) {
+	bestLabel := ""
+	bestDist := math.MaxFloat64
+
+	// check addresses first (usually highest-quality)
+	for _, a := range s.addrs {
+		d := haversineMeters(lat, lon, a.Coord.Lat, a.Coord.Lon)
+		if d < bestDist && d <= maxDistM {
+			lbl := formatAddressLabel(a.Tags)
+			if lbl == "" {
+				lbl = firstNonEmpty(a.Tags["name"], a.Tags["brand"])
+			}
+			if lbl == "" {
+				lbl = "Adresse"
+			}
+			bestDist = d
+			bestLabel = lbl
+		}
+	}
+
+	// check POI ways (centroid of nodes)
+	s.poiMu.RLock()
+	for _, w := range s.poiWays {
+		var cx, cy float64
+		var cnt int
+		for _, nid := range w.NodeIDs {
+			if c, ok := s.poiNodes[nid]; ok {
+				cx += c.Lat
+				cy += c.Lon
+				cnt++
+			}
+		}
+		if cnt == 0 {
+			continue
+		}
+		coord := osmmini.Coord{Lat: cx / float64(cnt), Lon: cy / float64(cnt)}
+		d := haversineMeters(lat, lon, coord.Lat, coord.Lon)
+		if d < bestDist && d <= maxDistM {
+			lbl := firstNonEmpty(w.Tags["name"], w.Tags["brand"], formatAddressLabel(w.Tags))
+			if lbl == "" {
+				lbl = primarySearchCategory(w.Tags)
+			}
+			bestDist = d
+			bestLabel = lbl
+		}
+	}
+	// also check simple relation centroids (try to approximate)
+	for _, rel := range s.poiRels {
+		var rx, ry float64
+		var rcnt int
+		for _, m := range rel.Members {
+			if m.Type == osmmini.MemberWay {
+				if w, ok := s.poiWays[m.ID]; ok {
+					var cx, cy float64
+					var cnt int
+					for _, nid := range w.NodeIDs {
+						if c, ok := s.poiNodes[nid]; ok {
+							cx += c.Lat
+							cy += c.Lon
+							cnt++
+						}
+					}
+					if cnt > 0 {
+						rx += cx / float64(cnt)
+						ry += cy / float64(cnt)
+						rcnt++
+					}
+				}
+			}
+		}
+		if rcnt == 0 {
+			continue
+		}
+		coord := osmmini.Coord{Lat: rx / float64(rcnt), Lon: ry / float64(rcnt)}
+		d := haversineMeters(lat, lon, coord.Lat, coord.Lon)
+		if d < bestDist && d <= maxDistM {
+			lbl := firstNonEmpty(rel.Tags["name"], rel.Tags["brand"])
+			if lbl == "" {
+				lbl = primarySearchCategory(rel.Tags)
+			}
+			bestDist = d
+			bestLabel = lbl
+		}
+	}
+	s.poiMu.RUnlock()
+
+	if bestLabel != "" {
+		return bestLabel, true
+	}
+	return "", false
+}
+
 func scorePOIResult(tags osmmini.Tags, query string, tokens []string) int {
 	if query == "" {
 		return 0
@@ -3308,7 +3402,9 @@ func (s *server) resolveLocation(loc Location) (osmmini.Coord, string, string, e
 		if s.enforceWindow && s.window != nil && !s.window.Contains(c) {
 			return osmmini.Coord{}, "", "", errors.New("outside configured window")
 		}
-		return c, "Koordinate", fmt.Sprintf("%.6f %.6f", lat, lon), nil
+		// Use a human-readable coordinate label instead of the generic "Koordinate"
+		label := fmt.Sprintf("%.6f, %.6f", lat, lon)
+		return c, label, fmt.Sprintf("%.6f %.6f", lat, lon), nil
 	}
 
 	raw := strings.TrimSpace(loc.Query)
@@ -3319,7 +3415,13 @@ func (s *server) resolveLocation(loc Location) (osmmini.Coord, string, string, e
 		if s.enforceWindow && s.window != nil && !s.window.Contains(c) {
 			return osmmini.Coord{}, "", "", errors.New("outside configured window")
 		}
-		return c, "Koordinate", raw, nil
+		// try to reverse-lookup a nearby address or POI to use a helpful label
+		if lbl, ok := s.findNearestPlaceLabel(c.Lat, c.Lon, 500); ok {
+			return c, lbl, raw, nil
+		}
+		// fallback: show the parsed coordinates as the label
+		label := fmt.Sprintf("%.6f, %.6f", c.Lat, c.Lon)
+		return c, label, raw, nil
 	}
 
 	q := osmmini.ParseAddressGuess(raw)
@@ -3373,6 +3475,18 @@ func (s *server) resolveLocation(loc Location) (osmmini.Coord, string, string, e
 			return c, q.Street, raw, nil
 		}
 	}
+
+	// Try POI matches as a fallback (e.g., "Kloster Weltenburg")
+	if pois := s.searchLocationResults(raw, 6); len(pois) > 0 {
+		// pick the first POI/address/street match
+		p := pois[0]
+		c := osmmini.Coord{Lat: p.Lat, Lon: p.Lon}
+		if s.enforceWindow && s.window != nil && !s.window.Contains(c) {
+			return osmmini.Coord{}, "", "", errors.New("outside configured window")
+		}
+		return c, p.Label, raw, nil
+	}
+	// final fallback: no result
 	return osmmini.Coord{}, "", "", fmt.Errorf("not found: %s", raw)
 }
 

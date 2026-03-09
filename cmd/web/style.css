@@ -96,6 +96,9 @@ a { color: var(--primary); text-decoration: none; }
   flex-direction: column;
   gap: 10px;
   padding: 14px 14px 20px;
+  /* allow internal scrolling when many cards are expanded */
+  height: 100vh;
+  max-height: 100vh;
   overflow-y: auto;
   overflow-x: hidden;
   z-index: 10;
@@ -177,7 +180,9 @@ a { color: var(--primary); text-decoration: none; }
   border: 1px solid var(--border);
   border-radius: var(--card-r);
   backdrop-filter: blur(12px);
-  overflow: hidden;
+  overflow: visible;
+  /* keep cards from stretching so sidebar scroll works predictably */
+  flex: 0 0 auto;
   transition: border-color var(--dur) var(--ease);
 }
 .card-header {
@@ -1023,7 +1028,7 @@ input:-webkit-autofill:focus {
 /* ─── Performance ─── */
 * { -webkit-tap-highlight-color: transparent; }
 .card { contain: layout style; }
-.sidebar { will-change: scroll-position; }
+.sidebar { will-change: scroll-position; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
 
 /* ─── Scrollbar (webkit) ─── */
 ::-webkit-scrollbar { width: 5px; height: 5px; }
