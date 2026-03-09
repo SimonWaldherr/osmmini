@@ -1,5 +1,7 @@
 # OSMmini
 
+[![DOI](https://zenodo.org/badge/1116409323.svg)](https://doi.org/10.5281/zenodo.18929953)
+
 Lightweight offline routing server and web UI using OSM PBF extracts.  
 Try [karte.bayern](https://karte.bayern) for my other navigation project specialized for Bavaria.
 
