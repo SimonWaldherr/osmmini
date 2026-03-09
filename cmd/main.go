@@ -234,6 +234,9 @@ func normalizeForCompare(s string) string {
 type Settings struct {
 	Routing osmmini.RouteOptions `json:"routing"`
 	Tiles   TileSettings         `json:"tiles"`
+	// SavePOICache controls whether POI cache files (<pbf>.poi.json) are
+	// written when extracting POIs from a PBF. Set to false to disable.
+	SavePOICache bool `json:"save_poi_cache,omitempty"`
 	// DefaultHighwaySpeeds allows overriding fallback speeds per highway type
 	DefaultHighwaySpeeds map[string]float64 `json:"default_highway_speeds,omitempty"`
 	// AllowedHighwayTypes controls which highway types are imported/allowed
@@ -270,6 +273,8 @@ func DefaultSettings(cacheDir, upstream string) Settings {
 			Attribution:  "© OpenStreetMap contributors",
 			MemCacheSize: tileMemCacheDefaultMaxItems,
 		},
+		// persist POI cache files by default
+		SavePOICache: true,
 		// DefaultHighwaySpeeds: fallback speeds (kph) per highway type.
 		// These are the built-in defaults used when no "default_highway_speeds"
 		// are provided in the settings file. At startup the server loads the
@@ -962,6 +967,40 @@ func (c *RouteCache) Size() int {
 
 // ---- Server ----
 
+// aiProbeCache holds a cached AI provider status result with a short TTL
+// so handleAIQuery doesn't need to re-probe providers on every request.
+type aiProbeCache struct {
+	mu        sync.Mutex
+	providers []aiProvider
+	expiresAt time.Time
+}
+
+// get returns cached providers if still valid, nil otherwise.
+func (c *aiProbeCache) get() []aiProvider {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if time.Now().Before(c.expiresAt) {
+		return c.providers
+	}
+	return nil
+}
+
+// set stores providers with a 30-second TTL.
+func (c *aiProbeCache) set(providers []aiProvider) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.providers = providers
+	c.expiresAt = time.Now().Add(30 * time.Second)
+}
+
+// invalidate clears the cache so the next get() returns nil.
+func (c *aiProbeCache) invalidate() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.providers = nil
+	c.expiresAt = time.Time{}
+}
+
 type server struct {
 	router        *osmmini.Router
 	addrs         []osmmini.AddressEntry
@@ -987,6 +1026,17 @@ type server struct {
 	// small in-memory cache for Wikipedia summaries (key: lang:title)
 	wikiMu    sync.RWMutex
 	wikiCache map[string]string
+	// AI session store for multi-turn context (session id -> messages)
+	aiMu       sync.Mutex
+	aiSessions map[string][]aiMessage
+	// aiProbe caches AI provider availability to avoid re-probing on every query
+	aiProbe aiProbeCache
+}
+
+type aiMessage struct {
+	Role    string    `json:"role"`
+	Content string    `json:"content"`
+	Ts      time.Time `json:"ts"`
 }
 
 func main() {
@@ -1114,6 +1164,8 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/api/v1/trip/solve", s.handleTripSolve)
 	mux.HandleFunc("/api/v1/ai/status", s.handleAIStatus)
 	mux.HandleFunc("/api/v1/ai/query", s.handleAIQuery)
+	mux.HandleFunc("/api/v1/agent/query", s.handleAgentQuery)
+	mux.HandleFunc("/api/v1/agent/execute", s.handleAgentExecute)
 	mux.HandleFunc("/api/v1/poi/", s.handlePOIInfo)
 
 	// UI
@@ -1178,6 +1230,12 @@ func (s *server) loadPOIIndex(pbfPath string) error {
 		s.poiMu.Unlock()
 		// build brand aliases from indexed POIs to improve fuzzy matching
 		s.buildBrandAliases()
+		// ensure aiSessions map initialized
+		s.aiMu.Lock()
+		if s.aiSessions == nil {
+			s.aiSessions = make(map[string][]aiMessage)
+		}
+		s.aiMu.Unlock()
 		return nil
 	}
 
@@ -1196,9 +1254,11 @@ func (s *server) loadPOIIndex(pbfPath string) error {
 	}
 
 	// persist cache asynchronously (best-effort)
-	go func() {
-		_ = s.savePOICache(cachePath, nodes, ways, rels)
-	}()
+	if s.settings.Get().SavePOICache {
+		go func() {
+			_ = s.savePOICache(cachePath, nodes, ways, rels)
+		}()
+	}
 
 	s.poiMu.Lock()
 	s.poiNodes = nodes
@@ -1288,6 +1348,45 @@ func (s *server) fetchWikiSummary(ctx context.Context, lang, title string) strin
 	s.wikiCache[key] = out.Extract
 	s.wikiMu.Unlock()
 	return out.Extract
+}
+
+// session helpers
+func (s *server) appendSessionMessage(sessionID, role, content string) string {
+	if sessionID == "" {
+		return ""
+	}
+	s.aiMu.Lock()
+	defer s.aiMu.Unlock()
+	if s.aiSessions == nil {
+		s.aiSessions = make(map[string][]aiMessage)
+	}
+	msgs := s.aiSessions[sessionID]
+	msgs = append(msgs, aiMessage{Role: role, Content: content, Ts: time.Now()})
+	// keep last 40 messages
+	if len(msgs) > 40 {
+		msgs = msgs[len(msgs)-40:]
+	}
+	s.aiSessions[sessionID] = msgs
+	return sessionID
+}
+
+func (s *server) getSessionContext(sessionID string) []aiMessage {
+	if sessionID == "" {
+		return nil
+	}
+	s.aiMu.Lock()
+	defer s.aiMu.Unlock()
+	if s.aiSessions == nil {
+		return nil
+	}
+	msgs := s.aiSessions[sessionID]
+	if len(msgs) == 0 {
+		return nil
+	}
+	// return a copy
+	out := make([]aiMessage, len(msgs))
+	copy(out, msgs)
+	return out
 }
 
 // latLonToWebMercator converts WGS84 degrees to WebMercator meters.
@@ -1570,6 +1669,14 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
+func writeJSONErrorDetails(w http.ResponseWriter, status int, msg string, details map[string]any) {
+	out := map[string]any{"error": msg}
+	for k, v := range details {
+		out[k] = v
+	}
+	writeJSON(w, status, out)
+}
+
 func readJSON(w http.ResponseWriter, r *http.Request, dst any, maxBytes int64) error {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 	defer r.Body.Close()
@@ -1606,6 +1713,474 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		"Version":  buildVersion,
 		"Settings": string(settingsJSON),
 	})
+}
+
+// handleAgentQuery implements a lightweight local retrieval -> action controller
+// for agent-style queries. It returns structured JSON actions conforming to
+// docs/agentic-maps/LLM_ACTION_SCHEMA.json. This is intentionally local-only
+// (no external LLM) and handles common "nearest X" queries.
+func (s *server) handleAgentQuery(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req aiQueryRequest
+	if err := readJSON(w, r, &req, maxAIResponseBytes); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	prompt := strings.TrimSpace(req.Prompt)
+	if prompt == "" {
+		writeJSONError(w, http.StatusBadRequest, "prompt required")
+		return
+	}
+
+	lower := strings.ToLower(prompt)
+
+	// only implement a simple nearest-X handler here; other queries fall back
+	// to a noop action with a hint reply.
+	if strings.Contains(lower, "nächste") || strings.Contains(lower, "nächster") || strings.Contains(lower, "nearest") || strings.Contains(lower, "near me") || strings.Contains(lower, "in der nähe") {
+		// determine query coords (prefer explicit user geolocation)
+		coordFound := false
+		var qlat, qlon float64
+		if req.UserLat != nil && req.UserLon != nil {
+			qlat, qlon = *req.UserLat, *req.UserLon
+			coordFound = true
+		} else if req.Lat != nil && req.Lon != nil {
+			qlat, qlon = *req.Lat, *req.Lon
+			coordFound = true
+		} else if req.MapLat != nil && req.MapLon != nil {
+			qlat, qlon = *req.MapLat, *req.MapLon
+			coordFound = true
+		}
+
+		if !coordFound {
+			// ask user for location via ask_user action
+			actions := []any{map[string]any{"type": "ask_user", "params": map[string]any{"prompt": "Bitte gib deinen Standort an (lat,lon) oder erlaube Standortfreigabe."}}}
+			writeJSON(w, http.StatusOK, map[string]any{"actions": actions, "reply": "Wo bist du gerade? Bitte Standort angeben oder Standortfreigabe erlauben.", "session_id": req.Session})
+			return
+		}
+
+		// extract place term by removing common phrases and coords
+		place := strings.TrimSpace(prompt)
+		pats := []string{"wo ist der nächste", "wo ist der nächster", "where is the nearest", "nearest", "nächste", "nächster", "in der nähe", "in der Nähe", "near me", "wo ist", "wo", "ist", "der", "die", "das"}
+		for _, p := range pats {
+			place = strings.ReplaceAll(strings.ToLower(place), strings.ToLower(p), "")
+		}
+		// strip simple coord patterns
+		re := regexp.MustCompile(`([-+]?[0-9]*\.?[0-9]+)\s*,?\s*([-+]?[0-9]*\.?[0-9]+)`)
+		place = re.ReplaceAllString(place, "")
+		place = strings.Trim(place, " ?.!")
+
+		// fallback: if empty place, ask user
+		if place == "" {
+			actions := []any{map[string]any{"type": "ask_user", "params": map[string]any{"prompt": "Welches Ziel suchst du? (z. B. 'McDonald's')"}}}
+			writeJSON(w, http.StatusOK, map[string]any{"actions": actions, "reply": "Welches Ziel meinst du? Zum Beispiel 'McDonald's'.", "session_id": req.Session})
+			return
+		}
+
+		// search addresses using existing helpers
+		matches := []osmmini.AddressEntry{}
+		aq := osmmini.ParseAddressGuess(place)
+		matches = osmmini.SearchAddresses(s.addrs, aq, 200)
+
+		// fuzzy fallback over address names/brands
+		if len(matches) == 0 {
+			placeNorm := normalizeForCompare(place)
+			s.poiMu.RLock()
+			for _, a := range s.addrs {
+				nameNorm := normalizeForCompare(a.Tags["name"])
+				brandNorm := normalizeForCompare(a.Tags["brand"])
+				if nameNorm != "" && strings.Contains(nameNorm, placeNorm) {
+					matches = append(matches, a)
+					continue
+				}
+				if brandNorm != "" && strings.Contains(brandNorm, placeNorm) {
+					matches = append(matches, a)
+					continue
+				}
+				if canon, ok := brandAliasMap[placeNorm]; ok {
+					if brandNorm != "" && strings.Contains(brandNorm, canon) {
+						matches = append(matches, a)
+						continue
+					}
+				}
+				// heuristic for short queries (e.g., 'maci') and fast_food
+				if len(placeNorm) <= 6 && a.Tags["amenity"] == "fast_food" {
+					if strings.Contains(nameNorm, "mcdonald") || strings.Contains(brandNorm, "mcdonald") {
+						matches = append(matches, a)
+						continue
+					}
+				}
+			}
+			s.poiMu.RUnlock()
+		}
+
+		if len(matches) == 0 {
+			// no match found
+			actions := []any{map[string]any{"type": "noop"}}
+			writeJSON(w, http.StatusOK, map[string]any{"actions": actions, "reply": "Kein passendes Ziel gefunden für: " + place, "session_id": req.Session})
+			return
+		}
+
+		// choose nearest
+		bestIdx := -1
+		bestDist := math.MaxFloat64
+		for i, m := range matches {
+			d := haversineMeters(qlat, qlon, m.Coord.Lat, m.Coord.Lon)
+			if d < bestDist {
+				bestDist = d
+				bestIdx = i
+			}
+		}
+		if bestIdx == -1 {
+			writeJSONError(w, http.StatusNotFound, "Kein passendes Ziel gefunden")
+			return
+		}
+		best := matches[bestIdx]
+
+		// Build structured actions: highlight, show_info, compute_route
+		actions := []any{
+			map[string]any{"type": "highlight_poi", "params": map[string]any{"id": best.ID}},
+			map[string]any{"type": "show_info", "params": map[string]any{"id": best.ID}},
+			map[string]any{"type": "compute_route", "params": map[string]any{"from": map[string]float64{"lat": qlat, "lon": qlon}, "to": map[string]any{"id": best.ID}}},
+		}
+
+		reply := fmt.Sprintf("Ich habe '%s' (Entfernung %.0f m) gefunden.", formatAddressLabel(best.Tags), bestDist)
+		// create/echo session id
+		sid := req.Session
+		if sid == "" {
+			sid = fmt.Sprintf("s-%d", time.Now().UnixNano())
+		}
+		_ = s.appendSessionMessage(sid, "user", prompt)
+		_ = s.appendSessionMessage(sid, "assistant", reply)
+
+		writeJSON(w, http.StatusOK, map[string]any{"actions": actions, "reply": reply, "session_id": sid})
+		return
+	}
+
+	// fallback: noop with hint the agent can't handle this locally
+	writeJSON(w, http.StatusOK, map[string]any{"actions": []any{map[string]any{"type": "noop"}}, "reply": "Ich kann diese Anfrage derzeit nicht lokal beantworten. Bitte formuliere die Frage anders oder nutze die AI-Abfrage.", "session_id": req.Session})
+}
+
+// handleAgentExecute validates and optionally executes an action bundle
+// posted by the client or produced by an LLM. Validation is intentionally
+// lightweight (checks action types + required params) and prevents
+// obviously malformed or dangerous payloads from being executed.
+func (s *server) handleAgentExecute(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req map[string]any
+	if err := readJSON(w, r, &req, 1<<20); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+
+	// extract fields
+	actionsRaw, _ := req["actions"]
+	sessionID, _ := req["session_id"].(string)
+	confirm, _ := req["confirm"].(bool)
+	dryRun, _ := req["dry_run"].(bool)
+
+	actionsSlice, ok := actionsRaw.([]any)
+	if !ok {
+		writeJSONError(w, http.StatusBadRequest, "missing or invalid actions array")
+		return
+	}
+
+	// validate actions
+	validated := make([]map[string]any, 0, len(actionsSlice))
+	for i, a := range actionsSlice {
+		m, ok := a.(map[string]any)
+		if !ok {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("action %d: invalid action object", i))
+			return
+		}
+		t, ok := m["type"].(string)
+		if !ok || t == "" {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("action %d: missing type", i))
+			return
+		}
+		params, _ := m["params"].(map[string]any)
+
+		// simple required-field checks per action type
+		switch t {
+		case "highlight_poi", "show_info":
+			// require id
+			if params == nil {
+				writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("action %d: params required for %s", i, t))
+				return
+			}
+			if _, ok := params["id"]; !ok {
+				writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("action %d: missing id param for %s", i, t))
+				return
+			}
+		case "compute_route":
+			if params == nil {
+				writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("action %d: params required for %s", i, t))
+				return
+			}
+			if _, ok := params["to"]; !ok {
+				writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("action %d: missing to param for compute_route", i))
+				return
+			}
+		case "ask_user", "noop", "zoom_to", "add_waypoint":
+			// no strong validation here
+		default:
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("action %d: unknown action type: %s", i, t))
+			return
+		}
+		// normalize: ensure params present
+		if params == nil {
+			params = map[string]any{}
+			m["params"] = params
+		}
+		validated = append(validated, m)
+	}
+
+	// If only dry run requested or not confirmed, return validation result
+	if dryRun || !confirm {
+		resp := map[string]any{"validated_actions": validated, "session_id": sessionID, "requires_confirm": !confirm}
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+
+	// execute actions sequentially; collect results for client
+	results := make([]any, 0, len(validated))
+	for _, act := range validated {
+		t := act["type"].(string)
+		params := act["params"].(map[string]any)
+		switch t {
+		case "highlight_poi":
+			// client-side visual; server returns poi info for client to render
+			idf := params["id"]
+			var idint int64
+			switch v := idf.(type) {
+			case float64:
+				idint = int64(v)
+			case int64:
+				idint = v
+			case int:
+				idint = int64(v)
+			case string:
+				if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
+					idint = parsed
+				}
+			}
+			if idint == 0 {
+				results = append(results, map[string]any{"error": "invalid id"})
+				continue
+			}
+			// fetch POI summary to return to client
+			s.poiMu.RLock()
+			var out any
+			if wv, ok := s.poiWays[idint]; ok {
+				out = map[string]any{"id": idint, "kind": "way", "tags": wv.Tags}
+			} else if nv, ok := s.poiNodes[idint]; ok {
+				out = map[string]any{"id": idint, "kind": "node", "lat": nv.Lat, "lon": nv.Lon}
+			} else if rv, ok := s.poiRels[idint]; ok {
+				out = map[string]any{"id": idint, "kind": "rel", "tags": rv.Tags}
+			} else {
+				out = map[string]any{"error": "not found"}
+			}
+			s.poiMu.RUnlock()
+			results = append(results, map[string]any{"type": t, "result": out})
+		case "show_info":
+			// return full POI info like GET /api/v1/poi/{id}
+			idf := params["id"]
+			var idint int64
+			switch v := idf.(type) {
+			case float64:
+				idint = int64(v)
+			case int64:
+				idint = v
+			case int:
+				idint = int64(v)
+			case string:
+				if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
+					idint = parsed
+				}
+			}
+			if idint == 0 {
+				results = append(results, map[string]any{"error": "invalid id"})
+				continue
+			}
+			// reuse existing handler logic to build poiInfoResponse-ish map
+			s.poiMu.RLock()
+			if wv, ok := s.poiWays[idint]; ok {
+				// compute centroid quickly
+				var cx, cy float64
+				var cnt int
+				for _, nid := range wv.NodeIDs {
+					if c, ok := s.poiNodes[nid]; ok {
+						cx += c.Lat
+						cy += c.Lon
+						cnt++
+					}
+				}
+				lat, lon := 0.0, 0.0
+				if cnt > 0 {
+					lat = cx / float64(cnt)
+					lon = cy / float64(cnt)
+				}
+				out := map[string]any{"id": idint, "kind": "way", "label": wv.Tags["name"], "lat": lat, "lon": lon, "tags": wv.Tags}
+				s.poiMu.RUnlock()
+				results = append(results, map[string]any{"type": t, "result": out})
+				continue
+			}
+			if nv, ok := s.poiNodes[idint]; ok {
+				out := map[string]any{"id": idint, "kind": "node", "lat": nv.Lat, "lon": nv.Lon}
+				s.poiMu.RUnlock()
+				results = append(results, map[string]any{"type": t, "result": out})
+				continue
+			}
+			if rv, ok := s.poiRels[idint]; ok {
+				s.poiMu.RUnlock()
+				// simple relation handling
+				out := map[string]any{"id": idint, "kind": "rel", "tags": rv.Tags}
+				results = append(results, map[string]any{"type": t, "result": out})
+				continue
+			}
+			s.poiMu.RUnlock()
+			results = append(results, map[string]any{"error": "not found"})
+		case "compute_route":
+			// params: from (lat/lon or query), to (id or lat/lon or query), options (optional)
+			// build RouteRequest and reuse routing internals similar to handleRoute
+			pr := RouteRequest{}
+			if pf, ok := params["from"]; ok {
+				if pm, ok2 := pf.(map[string]any); ok2 {
+					if latv, ok3 := pm["lat"].(float64); ok3 {
+						if lonv, ok4 := pm["lon"].(float64); ok4 {
+							pr.From.Lat = &latv
+							pr.From.Lon = &lonv
+						}
+					}
+					if q, okq := pm["query"].(string); okq {
+						pr.From.Query = q
+					}
+				}
+			}
+			if pt, ok := params["to"]; ok {
+				if pm, ok2 := pt.(map[string]any); ok2 {
+					if idv, okid := pm["id"]; okid {
+						// try to resolve id to coords
+						var idint int64
+						switch v := idv.(type) {
+						case float64:
+							idint = int64(v)
+						case int64:
+							idint = v
+						case int:
+							idint = int64(v)
+						case string:
+							if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
+								idint = parsed
+							}
+						}
+						if idint != 0 {
+							s.poiMu.RLock()
+							if wv, ok := s.poiWays[idint]; ok {
+								var cx, cy float64
+								var cnt int
+								for _, nid := range wv.NodeIDs {
+									if c, ok := s.poiNodes[nid]; ok {
+										cx += c.Lat
+										cy += c.Lon
+										cnt++
+									}
+								}
+								if cnt > 0 {
+									lat := cx / float64(cnt)
+									lon := cy / float64(cnt)
+									pr.To.Lat = &lat
+									pr.To.Lon = &lon
+								}
+							} else if nv, ok := s.poiNodes[idint]; ok {
+								lat := nv.Lat
+								lon := nv.Lon
+								pr.To.Lat = &lat
+								pr.To.Lon = &lon
+							}
+							s.poiMu.RUnlock()
+						}
+					} else {
+						if latv, ok3 := pm["lat"].(float64); ok3 {
+							if lonv, ok4 := pm["lon"].(float64); ok4 {
+								pr.To.Lat = &latv
+								pr.To.Lon = &lonv
+							}
+						}
+						if q, okq := pm["query"].(string); okq {
+							pr.To.Query = q
+						}
+					}
+				}
+			}
+			// set options if present
+			if optv, ok := params["options"].(map[string]any); ok && optv != nil {
+				// very small subset: profile
+				var ro osmmini.RouteOptions
+				if profile, ok := optv["profile"].(string); ok {
+					ro.Profile = osmmini.VehicleProfile(profile)
+				}
+				pr.Options = &ro
+			}
+
+			// try to resolve via existing helpers
+			fromCoord, _, _, err1 := s.resolveLocation(pr.From)
+			if err1 != nil {
+				results = append(results, map[string]any{"type": t, "error": "from: " + err1.Error()})
+				continue
+			}
+			toCoord, _, _, err2 := s.resolveLocation(pr.To)
+			if err2 != nil {
+				results = append(results, map[string]any{"type": t, "error": "to: " + err2.Error()})
+				continue
+			}
+
+			startID, _, ok := s.router.NearestNode(fromCoord.Lat, fromCoord.Lon)
+			if !ok {
+				results = append(results, map[string]any{"type": t, "error": "no start node found"})
+				continue
+			}
+			endID, _, ok := s.router.NearestNode(toCoord.Lat, toCoord.Lon)
+			if !ok {
+				results = append(results, map[string]any{"type": t, "error": "no end node found"})
+				continue
+			}
+
+			opt := s.settings.Get().Routing
+			if pr.Options != nil {
+				opt = *pr.Options
+			}
+			res, err := s.router.RouteWithOptions(r.Context(), startID, endID, opt)
+			if err != nil {
+				results = append(results, map[string]any{"type": t, "error": err.Error()})
+				continue
+			}
+			// build minimal response payload similar to RouteResponse
+			rr := map[string]any{
+				"engine":     string(res.Engine),
+				"objective":  string(res.Objective),
+				"distance_m": res.DistanceM,
+				"duration_s": res.DurationS,
+				"path":       res.PathCoords,
+			}
+			results = append(results, map[string]any{"type": t, "result": rr})
+		default:
+			results = append(results, map[string]any{"type": act["type"], "note": "no-op on server"})
+		}
+	}
+
+	// persist session messages if provided
+	if sessionID != "" {
+		_ = s.appendSessionMessage(sessionID, "assistant", fmt.Sprintf("executed %d actions", len(validated)))
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"executed": true, "results": results, "session_id": sessionID})
 }
 
 func (s *server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
@@ -1732,6 +2307,59 @@ func (s *server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			Tags:  m.Tags,
 		})
 	}
+
+	// Also search named POI ways (amenity, shop, tourism, etc.) if we still
+	// have room and the POI index is available.
+	if remain := limit - len(out); remain > 0 {
+		qNorm := normalizeForCompare(q)
+		s.poiMu.RLock()
+		for _, w := range s.poiWays {
+			if len(out) >= limit {
+				break
+			}
+			name := w.Tags["name"]
+			brand := w.Tags["brand"]
+			if name == "" && brand == "" {
+				continue
+			}
+			nameNorm := normalizeForCompare(name)
+			brandNorm := normalizeForCompare(brand)
+			if qNorm == "" || (!strings.Contains(nameNorm, qNorm) && !strings.Contains(brandNorm, qNorm)) {
+				continue
+			}
+			// compute centroid
+			var cx, cy float64
+			var cnt int
+			for _, nid := range w.NodeIDs {
+				if c, ok := s.poiNodes[nid]; ok {
+					cx += c.Lat
+					cy += c.Lon
+					cnt++
+				}
+			}
+			if cnt == 0 {
+				continue
+			}
+			coord := osmmini.Coord{Lat: cx / float64(cnt), Lon: cy / float64(cnt)}
+			if s.window != nil && !s.window.Contains(coord) {
+				continue
+			}
+			label := name
+			if label == "" {
+				label = brand
+			}
+			out = append(out, apiSearchResult{
+				ID:    w.ID,
+				Kind:  "poi",
+				Label: label,
+				Lat:   coord.Lat,
+				Lon:   coord.Lon,
+				Tags:  w.Tags,
+			})
+		}
+		s.poiMu.RUnlock()
+	}
+
 	remain := limit - len(out)
 	if remain > 0 {
 		streetMatches := s.router.SearchStreets(q, remain)
@@ -1771,11 +2399,31 @@ func (s *server) handleRoute(w http.ResponseWriter, r *http.Request) {
 
 	fromCoord, fromLabel, fromInput, err := s.resolveLocation(req.From)
 	if err != nil {
+		var lr *locationResolveError
+		if errors.As(err, &lr) {
+			writeJSONErrorDetails(w, http.StatusBadRequest, "from: "+lr.Error(), map[string]any{
+				"target":      "from",
+				"query":       lr.Query,
+				"ambiguous":   lr.Ambiguous,
+				"suggestions": lr.Suggestions,
+			})
+			return
+		}
 		writeJSONError(w, http.StatusBadRequest, "from: "+err.Error())
 		return
 	}
 	toCoord, toLabel, toInput, err := s.resolveLocation(req.To)
 	if err != nil {
+		var lr *locationResolveError
+		if errors.As(err, &lr) {
+			writeJSONErrorDetails(w, http.StatusBadRequest, "to: "+lr.Error(), map[string]any{
+				"target":      "to",
+				"query":       lr.Query,
+				"ambiguous":   lr.Ambiguous,
+				"suggestions": lr.Suggestions,
+			})
+			return
+		}
 		writeJSONError(w, http.StatusBadRequest, "to: "+err.Error())
 		return
 	}
@@ -2323,6 +2971,92 @@ func (s *server) tsp2opt(ctx context.Context, startNode, endNode int64, stops []
 
 // ---- Location resolve + window enforcement ----
 
+type locationResolveError struct {
+	Message     string
+	Query       string
+	Ambiguous   bool
+	Suggestions []apiSearchResult
+}
+
+func (e *locationResolveError) Error() string {
+	if e == nil {
+		return "location resolution failed"
+	}
+	return e.Message
+}
+
+func airportHint(raw string) bool {
+	n := normalizeForCompare(raw)
+	return strings.Contains(n, "flughafen") || strings.Contains(n, "airport")
+}
+
+func munichHint(raw string) bool {
+	n := normalizeForCompare(raw)
+	return strings.Contains(n, "muenchen") || strings.Contains(n, "munchen")
+}
+
+func containsMunichInTags(tags osmmini.Tags) bool {
+	hay := normalizeForCompare(strings.Join([]string{
+		tags["name"],
+		tags["addr:city"],
+		tags["addr:place"],
+		tags["operator"],
+		tags["brand"],
+		tags["aeroway"],
+	}, " "))
+	return strings.Contains(hay, "muenchen") || strings.Contains(hay, "munchen")
+}
+
+func (s *server) buildLocationSuggestions(raw string, limit int) []apiSearchResult {
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 12 {
+		limit = 12
+	}
+
+	aq := osmmini.ParseAddressGuess(raw)
+	addrMatches := osmmini.SearchAddresses(s.addrs, aq, limit)
+	out := make([]apiSearchResult, 0, limit)
+	for _, m := range addrMatches {
+		if s.window != nil && !s.window.Contains(m.Coord) {
+			continue
+		}
+		out = append(out, apiSearchResult{
+			ID:    m.ID,
+			Kind:  "address",
+			Label: formatAddressLabel(m.Tags),
+			Lat:   m.Coord.Lat,
+			Lon:   m.Coord.Lon,
+			Tags:  m.Tags,
+		})
+		if len(out) >= limit {
+			return out
+		}
+	}
+	remain := limit - len(out)
+	if remain > 0 {
+		streets := s.router.SearchStreets(raw, remain)
+		for _, st := range streets {
+			if s.window != nil && !s.window.Contains(st.Coord) {
+				continue
+			}
+			out = append(out, apiSearchResult{
+				ID:    st.NodeID,
+				Kind:  "street",
+				Label: st.Name,
+				Lat:   st.Coord.Lat,
+				Lon:   st.Coord.Lon,
+				Tags:  osmmini.Tags{"street": st.Name},
+			})
+			if len(out) >= limit {
+				break
+			}
+		}
+	}
+	return out
+}
+
 func (s *server) resolveLocation(loc Location) (osmmini.Coord, string, string, error) {
 	if loc.Lat != nil && loc.Lon != nil {
 		lat, lon := *loc.Lat, *loc.Lon
@@ -2348,6 +3082,48 @@ func (s *server) resolveLocation(loc Location) (osmmini.Coord, string, string, e
 	}
 
 	q := osmmini.ParseAddressGuess(raw)
+	if airportHint(raw) && munichHint(raw) {
+		airportCandidates := osmmini.SearchAddresses(s.addrs, q, 20)
+		munichCandidates := make([]osmmini.AddressEntry, 0, len(airportCandidates))
+		for _, c := range airportCandidates {
+			if containsMunichInTags(c.Tags) {
+				munichCandidates = append(munichCandidates, c)
+			}
+		}
+		if len(munichCandidates) == 1 {
+			c := munichCandidates[0]
+			if s.enforceWindow && s.window != nil && !s.window.Contains(c.Coord) {
+				return osmmini.Coord{}, "", "", errors.New("outside configured window")
+			}
+			return c.Coord, formatAddressLabel(c.Tags), raw, nil
+		}
+		if len(munichCandidates) > 1 {
+			suggestions := make([]apiSearchResult, 0, min(6, len(munichCandidates)))
+			for i := 0; i < len(munichCandidates) && i < 6; i++ {
+				c := munichCandidates[i]
+				suggestions = append(suggestions, apiSearchResult{
+					ID:    c.ID,
+					Kind:  "address",
+					Label: formatAddressLabel(c.Tags),
+					Lat:   c.Coord.Lat,
+					Lon:   c.Coord.Lon,
+					Tags:  c.Tags,
+				})
+			}
+			return osmmini.Coord{}, "", "", &locationResolveError{
+				Message:     "mehrdeutiges Ziel, bitte auswählen",
+				Query:       raw,
+				Ambiguous:   true,
+				Suggestions: suggestions,
+			}
+		}
+		return osmmini.Coord{}, "", "", &locationResolveError{
+			Message:     "Kein passendes Ziel gefunden",
+			Query:       raw,
+			Ambiguous:   false,
+			Suggestions: s.buildLocationSuggestions(raw, 6),
+		}
+	}
 	if addr, ok := osmmini.FindBestAddress(s.addrs, q); ok {
 		if s.enforceWindow && s.window != nil && !s.window.Contains(addr.Coord) {
 			return osmmini.Coord{}, "", "", errors.New("outside configured window")
@@ -2530,6 +3306,20 @@ type aiQueryRequest struct {
 	// explicit user geolocation when available
 	UserLat *float64 `json:"user_lat,omitempty"`
 	UserLon *float64 `json:"user_lon,omitempty"`
+	// optional session id to enable multi-turn context
+	Session string `json:"session,omitempty"`
+	// optional current route context (from/to + stats)
+	RouteFrom     string  `json:"route_from,omitempty"`
+	RouteTo       string  `json:"route_to,omitempty"`
+	RouteDistM    float64 `json:"route_dist_m,omitempty"`
+	RouteDurS     float64 `json:"route_dur_s,omitempty"`
+	RouteEngine    string  `json:"route_engine,omitempty"`
+	RouteObjective string  `json:"route_objective,omitempty"`
+	// bounding box of the current route path (for poi_on_route queries)
+	RouteBBoxMinLat float64 `json:"route_bbox_min_lat,omitempty"`
+	RouteBBoxMinLon float64 `json:"route_bbox_min_lon,omitempty"`
+	RouteBBoxMaxLat float64 `json:"route_bbox_max_lat,omitempty"`
+	RouteBBoxMaxLon float64 `json:"route_bbox_max_lon,omitempty"`
 }
 
 // aiLocation is a lightweight location descriptor returned in AI responses.
@@ -2550,6 +3340,7 @@ type aiQueryResponse struct {
 	From        *aiLocation       `json:"from,omitempty"`
 	To          *aiLocation       `json:"to,omitempty"`
 	Waypoints   []aiLocation      `json:"waypoints,omitempty"`
+	SessionID   string            `json:"session_id,omitempty"`
 }
 
 // probeAIProvider checks if a provider is reachable and fetches available models.
@@ -2616,6 +3407,9 @@ func (s *server) handleAIStatus(w http.ResponseWriter, r *http.Request) {
 		probeAIProvider(ctx, "lmstudio", "http://localhost:1234", "/v1/models"),
 	}
 
+	// Update the probe cache so handleAIQuery can reuse the result.
+	s.aiProbe.set(providers)
+
 	anyAvailable := false
 	for _, p := range providers {
 		if p.Available {
@@ -2649,13 +3443,68 @@ func (s *server) handleAIQuery(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), aiQueryTimeout)
 	defer cancel()
 
-	// Build system prompt with context about available routing features
-	systemPrompt := "Du bist ein Routing-Assistent für OSMmini, ein Offline-Routing-System. " +
+	// Try to classify and handle the intent locally before hitting the LLM.
+	intent := classifyPromptIntent(req.Prompt)
+	if intent.Type != intentUnknown {
+		if s.handleIntentLocally(ctx, w, req, intent) {
+			return
+		}
+	}
+
+	// Build system prompt with context about available routing features and
+	// the user's current map state so the LLM can give accurate answers.
+	var sysB strings.Builder
+	sysB.WriteString("Du bist ein Routing-Assistent für OSMmini, ein Offline-Routing-System. " +
 		"Du kannst Fragen zu Routenplanung, Navigation und Verkehr beantworten. " +
 		"Verfügbare Features: A*-, Dijkstra- und CH-Routing, TSP-Optimierung (bis 16 Stops exakt, " +
 		"darüber hinaus Greedy mit 2-opt), Linksabbiege-Vermeidung, Ampelstrafen, " +
 		"BOS/Einsatzmodus (Feuerwehr, Rettungsdienst), Fahrzeugbeschränkungen (Höhe, Gewicht). " +
-		"Antworte kurz und hilfreich auf Deutsch."
+		"Antworte kurz und hilfreich auf Deutsch.")
+	// Add user's location context when available
+	if req.UserLat != nil && req.UserLon != nil {
+		fmt.Fprintf(&sysB, " Nutzerstandort: %.5f,%.5f.", *req.UserLat, *req.UserLon)
+	} else if req.MapLat != nil && req.MapLon != nil {
+		fmt.Fprintf(&sysB, " Aktuelle Kartenansicht: %.5f,%.5f.", *req.MapLat, *req.MapLon)
+	}
+	// Add current route context if provided
+	if req.RouteFrom != "" || req.RouteTo != "" {
+		sysB.WriteString(" Aktuelle Route:")
+		if req.RouteFrom != "" {
+			fmt.Fprintf(&sysB, " von '%s'", req.RouteFrom)
+		}
+		if req.RouteTo != "" {
+			fmt.Fprintf(&sysB, " nach '%s'", req.RouteTo)
+		}
+		if req.RouteDistM > 0 {
+			fmt.Fprintf(&sysB, " (%.1f km", req.RouteDistM/1000)
+			if req.RouteDurS > 0 {
+				fmt.Fprintf(&sysB, ", %.0f min", req.RouteDurS/60)
+			}
+			sysB.WriteString(")")
+		}
+		if req.RouteEngine != "" {
+			fmt.Fprintf(&sysB, " [%s/%s]", req.RouteEngine, req.RouteObjective)
+		}
+		sysB.WriteString(".")
+	}
+	// Critical: instruct the LLM to emit a structured action block whenever
+	// a route should actually be computed. The backend will parse this block,
+	// resolve the locations, run the router, and return the route to the UI.
+	// The block must appear verbatim at the very end of the response so it
+	// can be extracted reliably without disturbing the human-readable text.
+	sysB.WriteString(
+		"\n\nREGEL – ROUTE-ACTION-BLOCK: Sobald ein Ziel bekannt ist (auch beim ersten Mal, ohne " +
+			"auf Bestätigung zu warten!), MUSST du am ENDE deiner Antwort exakt diesen Block ausgeben:\n" +
+			"```route-action\n{\"action\":\"compute_route\",\"from\":\"STARTPUNKT\",\"to\":\"ZIELORT\"}\n```\n" +
+			"Ersetze STARTPUNKT mit den bekannten Nutzerkoordinaten (lat,lon). " +
+			"Ersetze ZIELORT mit dem echten Ortsnamen (z.B. 'Flughafen München'). " +
+			"Benutze NIEMALS Platzhalter wie <Zielort> oder <Startort> – nur echte Werte. " +
+			"Wenn Nutzerkoordinaten bekannt sind und ein Ziel genannt wird: SOFORT den Block ausgeben, " +
+			"OHNE nach Bestätigung zu fragen. " +
+			"OHNE diesen Block wird KEINE Route auf der Karte angezeigt. " +
+			"Gib KEINE fiktiven Entfernungen oder Zeiten an – diese berechnet das System selbst.",
+	)
+	systemPrompt := sysB.String()
 
 	// Quick heuristic: if the user asks for the "nearest" X, try to answer
 	// directly from local OSM data instead of querying the LLM. This allows
@@ -2983,42 +3832,140 @@ func (s *server) handleAIQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Try Ollama first, then LM Studio
-	providers := []struct {
-		name    string
-		baseURL string
-		models  string
-	}{
-		{"ollama", "http://localhost:11434", "/api/tags"},
-		{"lmstudio", "http://localhost:1234", "/v1/models"},
+	// Include session history (if any) into the system prompt to enable
+	// multi-turn follow-ups where the user refers to previous results
+	if req.Session != "" {
+		hist := s.getSessionContext(req.Session)
+		if len(hist) > 0 {
+			var b strings.Builder
+			b.WriteString("Vorherige Konversation (letzte Nachrichten):\n")
+			for _, m := range hist {
+				role := strings.ToUpper(m.Role[:1]) + m.Role[1:]
+				// truncate long messages
+				content := m.Content
+				if len(content) > 400 {
+					content = content[:400] + "..."
+				}
+				b.WriteString(fmt.Sprintf("%s: %s\n", role, content))
+			}
+			systemPrompt += "\n" + b.String()
+		}
 	}
 
-	for _, prov := range providers {
-		p := probeAIProvider(ctx, prov.name, prov.baseURL, prov.models)
+	// Determine which providers are available. Re-use a recently cached probe
+	// result to avoid re-probing on every query (the cache has a 30s TTL).
+	// If no cached result exists, probe now and populate the cache.
+	cachedProviders := s.aiProbe.get()
+	if cachedProviders == nil {
+		probeCtx, probeCancel := context.WithTimeout(ctx, 5*time.Second)
+		cachedProviders = []aiProvider{
+			probeAIProvider(probeCtx, "ollama", "http://localhost:11434", "/api/tags"),
+			probeAIProvider(probeCtx, "lmstudio", "http://localhost:1234", "/v1/models"),
+		}
+		probeCancel()
+		s.aiProbe.set(cachedProviders)
+	}
+
+	// Try available providers. If a specific model is requested we pick the
+	// provider that knows about it; otherwise we use the first available one.
+	providerURLs := map[string]string{
+		"ollama":   "http://localhost:11434",
+		"lmstudio": "http://localhost:1234",
+	}
+	for _, p := range cachedProviders {
 		if !p.Available || len(p.Models) == 0 {
 			continue
 		}
 
+		// If a specific model was requested, skip providers that don't have it.
 		model := req.Model
-		if model == "" {
+		if model != "" {
+			found := false
+			for _, m := range p.Models {
+				if m == model {
+					found = true
+					break
+				}
+			}
+			if !found {
+				continue
+			}
+		} else {
 			model = p.Models[0]
+		}
+
+		baseURL := providerURLs[p.Name]
+		if baseURL == "" {
+			continue
 		}
 
 		var respText string
 		var err error
-		if prov.name == "ollama" {
-			respText, err = queryOllama(ctx, prov.baseURL, model, systemPrompt, req.Prompt)
+		if p.Name == "ollama" {
+			respText, err = queryOllama(ctx, baseURL, model, systemPrompt, req.Prompt)
 		} else {
-			respText, err = queryOpenAICompatible(ctx, prov.baseURL, model, systemPrompt, req.Prompt)
+			respText, err = queryOpenAICompatible(ctx, baseURL, model, systemPrompt, req.Prompt)
 		}
 		if err != nil {
+			// Invalidate cache on error so the next request re-probes.
+			s.aiProbe.invalidate()
 			continue
 		}
 
+		// Parse a route-action block from the LLM response. When found, resolve
+		// the locations, compute the route, and attach it to the response so the
+		// UI renders it immediately without any additional user interaction.
+		var routeObj *RouteResponse
+		var fromAI, toAI *aiLocation
+		fromStr, toStr, cleanText, hasAction := extractRouteAction(respText)
+		if hasAction {
+			// Always strip the block from the displayed text, even if routing fails.
+			respText = cleanText
+			// Skip obvious LLM placeholders like "<Zielort>" or "<Startort>".
+			if strings.HasPrefix(strings.TrimSpace(toStr), "<") {
+				toStr = ""
+			}
+			if strings.HasPrefix(strings.TrimSpace(fromStr), "<") {
+				fromStr = ""
+			}
+		}
+		if hasAction && toStr != "" {
+			// If from is empty, fall back to the user's coordinates.
+			if fromStr == "" {
+				if req.UserLat != nil && req.UserLon != nil {
+					fromStr = fmt.Sprintf("%.6f,%.6f", *req.UserLat, *req.UserLon)
+				} else if req.MapLat != nil && req.MapLon != nil {
+					fromStr = fmt.Sprintf("%.6f,%.6f", *req.MapLat, *req.MapLon)
+				}
+			}
+			opt := s.settings.Get().Routing
+			if rr, fa, ta, rerr := s.computeRouteFromLocQuery(ctx, fromStr, toStr, opt); rerr == nil {
+				routeObj = rr
+				fromAI = fa
+				toAI = ta
+			} else {
+				log.Printf("ai route-action failed (from=%q to=%q): %v", fromStr, toStr, rerr)
+				// Append a brief note to the response so the user knows what happened.
+				respText += fmt.Sprintf("\n\n⚠️ Route konnte nicht berechnet werden: %v", rerr)
+			}
+		}
+
+		// persist session messages if session present (user + assistant)
+		sid := req.Session
+		if sid == "" {
+			sid = fmt.Sprintf("s-%d", time.Now().UnixNano())
+		}
+		_ = s.appendSessionMessage(sid, "user", req.Prompt)
+		_ = s.appendSessionMessage(sid, "assistant", respText)
+
 		writeJSON(w, http.StatusOK, aiQueryResponse{
-			Provider: prov.name,
-			Model:    model,
-			Response: respText,
+			Provider:  p.Name,
+			Model:     model,
+			Response:  respText,
+			Route:     routeObj,
+			From:      fromAI,
+			To:        toAI,
+			SessionID: sid,
 		})
 		return
 	}
@@ -3149,6 +4096,817 @@ func (s *server) handlePOIInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	s.poiMu.RUnlock()
 	writeJSONError(w, http.StatusNotFound, "POI not found")
+}
+
+// ---- Intent classifier ----
+
+// promptIntentType classifies the user's intent so the system can answer
+// locally without involving an LLM.
+type promptIntentType int
+
+const (
+	intentUnknown    promptIntentType = iota
+	intentNavigate                    // "Navigation nach Dingolfing"
+	intentPOINear                     // "Tankstellen in der Nähe"
+	intentPOIOnRoute                  // "Tankstelle auf der Route"
+	intentMultiStop                   // "Flughafen mit Zwischenstopp an Tankstelle"
+	intentDuration                    // "Wie lange dauert es von X nach Y"
+	intentLeisure                     // "An der Isar spazieren gehen"
+)
+
+// promptIntent holds the classified intent and extracted parameters.
+type promptIntent struct {
+	Type        promptIntentType
+	Destination string // primary destination (navigate / duration / multi-stop)
+	Origin      string // explicit origin for duration queries
+	POIType     string // keyword the user typed (for UI messages)
+	POITagKey   string // resolved OSM tag key
+	POITagVal   string // resolved OSM tag value
+}
+
+// poiKeywordTags maps German and English POI keywords to OSM tag key/value pairs.
+var poiKeywordTags = map[string][2]string{
+	"tankstelle":     {"amenity", "fuel"},
+	"tankstellen":    {"amenity", "fuel"},
+	"benzin":         {"amenity", "fuel"},
+	"diesel":         {"amenity", "fuel"},
+	"gas station":    {"amenity", "fuel"},
+	"fuel":           {"amenity", "fuel"},
+	"bahnhof":        {"railway", "station"},
+	"haltestelle":    {"highway", "bus_stop"},
+	"bushaltestelle": {"highway", "bus_stop"},
+	"apotheke":       {"amenity", "pharmacy"},
+	"pharmacy":       {"amenity", "pharmacy"},
+	"supermarkt":     {"shop", "supermarket"},
+	"supermarket":    {"shop", "supermarket"},
+	"edeka":          {"shop", "supermarket"},
+	"lidl":           {"shop", "supermarket"},
+	"aldi":           {"shop", "supermarket"},
+	"rewe":           {"shop", "supermarket"},
+	"bäckerei":       {"shop", "bakery"},
+	"bakery":         {"shop", "bakery"},
+	"parkplatz":      {"amenity", "parking"},
+	"parking":        {"amenity", "parking"},
+	"bank":           {"amenity", "bank"},
+	"geldautomat":    {"amenity", "atm"},
+	"atm":            {"amenity", "atm"},
+	"krankenhaus":    {"amenity", "hospital"},
+	"hospital":       {"amenity", "hospital"},
+	"schule":         {"amenity", "school"},
+	"school":         {"amenity", "school"},
+	"museum":         {"tourism", "museum"},
+	"hotel":          {"tourism", "hotel"},
+	"gasthaus":       {"amenity", "restaurant"},
+	"restaurant":     {"amenity", "restaurant"},
+	"gaststätte":     {"amenity", "restaurant"},
+	"café":           {"amenity", "cafe"},
+	"cafe":           {"amenity", "cafe"},
+	"kaffee":         {"amenity", "cafe"},
+	"mcdonald":       {"amenity", "fast_food"},
+	"mcdonalds":      {"amenity", "fast_food"},
+	"burger king":    {"amenity", "fast_food"},
+	"fastfood":       {"amenity", "fast_food"},
+	"imbiss":         {"amenity", "fast_food"},
+	"arzt":           {"amenity", "doctors"},
+	"zahnarzt":       {"amenity", "dentist"},
+	"post":           {"amenity", "post_office"},
+	"postamt":        {"amenity", "post_office"},
+	"friseur":        {"shop", "hairdresser"},
+	"spielplatz":     {"leisure", "playground"},
+	"schwimmbad":     {"leisure", "swimming_pool"},
+	"freibad":        {"leisure", "swimming_pool"},
+	"hallenbad":      {"leisure", "sports_centre"},
+	"sportplatz":     {"leisure", "pitch"},
+	"park":           {"leisure", "park"},
+	"therme":         {"leisure", "spa"},
+	"sauna":          {"leisure", "sauna"},
+	"wald":           {"natural", "wood"},
+	"wäldchen":       {"natural", "wood"},
+	"forest":         {"landuse", "forest"},
+	"see":            {"natural", "water"},
+	"lake":           {"natural", "water"},
+	"fluss":          {"waterway", "river"},
+	"river":          {"waterway", "river"},
+	"isar":           {"waterway", "river"},
+	"kirche":         {"amenity", "place_of_worship"},
+	"church":         {"amenity", "place_of_worship"},
+	"rathaus":        {"amenity", "townhall"},
+	"bibliothek":     {"amenity", "library"},
+	"library":        {"amenity", "library"},
+	"zoo":            {"tourism", "zoo"},
+	"tierpark":       {"tourism", "zoo"},
+	"kino":           {"amenity", "cinema"},
+	"cinema":         {"amenity", "cinema"},
+	"feuerwehr":      {"amenity", "fire_station"},
+	"polizei":        {"amenity", "police"},
+	"police":         {"amenity", "police"},
+}
+
+// navigatePrefixes are phrase prefixes that signal a navigate intent.
+var navigatePrefixes = []string{
+	"navigation nach ", "navigiere nach ", "navigier nach ",
+	"fahre nach ", "fahr nach ", "fahrt nach ", "fahrt zu ",
+	"route nach ", "route zu ", "route zum ", "route zur ",
+	"geh nach ", "gehe nach ", "gehe zu ", "geh zu ",
+	"bring mich nach ", "bring mich zu ", "bring mich zum ", "bring mich zur ",
+	"zeig mir den weg nach ", "zeig den weg nach ",
+	"wie komme ich nach ", "wie komm ich nach ",
+	"navigate to ", "directions to ", "route to ", "take me to ",
+	"drive to ", "go to ",
+}
+
+// durationPhrases indicate the user wants travel time or distance between two places.
+var durationPhrases = []string{
+	"wie lange dauert es von ", "wie lange dauert die fahrt von ",
+	"wie lange brauche ich von ", "wie weit ist es von ",
+	"wie lange dauert", "wie lange brauche ich",
+	"how long does it take", "how far is it from ",
+	"entfernung von ", "fahrzeit von ",
+}
+
+// leisureKeywords indicate the user is looking for a recreational activity.
+var leisureKeywords = []string{
+	"spazieren", "spaziergang", "wandern", "wanderung", "joggen",
+	"radfahren", "pilze sammeln", "pilze", "entspannen",
+	"erholung", "ausflug", "picknick", "walk", "hiking", "cycling",
+}
+
+// extractPOIFromPrompt finds the first known POI keyword in a lowercased prompt.
+func extractPOIFromPrompt(lower string) (keyword, tagKey, tagVal string) {
+	for kw, tv := range poiKeywordTags {
+		if strings.Contains(lower, kw) {
+			return kw, tv[0], tv[1]
+		}
+	}
+	return "", "", ""
+}
+
+// classifyPromptIntent analyses a natural-language prompt and returns the
+// most likely intent so the system can answer locally without an LLM.
+// fillerPrefixes are conversational filler words that may precede an actual command.
+var fillerPrefixes = []string{
+	"äh, ", "äh ", "ähm, ", "ähm ", "hmm, ", "hmm ", "ok, ", "ok ",
+	"also, ", "also ", "bitte ", "bitte, ",
+}
+
+func classifyPromptIntent(prompt string) promptIntent {
+	lower := strings.ToLower(strings.TrimSpace(prompt))
+	// Strip leading filler words so "äh, Flughafen München" reduces to "Flughafen München".
+	for _, f := range fillerPrefixes {
+		if strings.HasPrefix(lower, f) {
+			lower = strings.TrimSpace(lower[len(f):])
+			break
+		}
+	}
+
+	// duration intent: "wie lange dauert es von X nach Y"
+	for _, ph := range durationPhrases {
+		if strings.Contains(lower, ph) {
+			re := regexp.MustCompile(`(?i)von\s+(.+?)\s+nach\s+(.+?)(?:\s*[?!.]|$)`)
+			if m := re.FindStringSubmatch(lower); len(m) == 3 {
+				return promptIntent{Type: intentDuration, Origin: strings.TrimSpace(m[1]), Destination: strings.TrimSpace(m[2])}
+			}
+			re2 := regexp.MustCompile(`(?i)nach\s+(.+?)(?:\s*[?!.]|$)`)
+			if m := re2.FindStringSubmatch(lower); len(m) == 2 {
+				return promptIntent{Type: intentDuration, Destination: strings.TrimSpace(m[1])}
+			}
+			return promptIntent{Type: intentDuration}
+		}
+	}
+
+	// multi-stop intent: explicit "zwischenstopp" or "über … nach"
+	reover := regexp.MustCompile(`(?i)\büber\b.+\bnach\b`)
+	if strings.Contains(lower, "zwischenstopp") || strings.Contains(lower, "zwischenstation") ||
+		strings.Contains(lower, "zwischenhalt") || strings.Contains(lower, "stopover") ||
+		reover.MatchString(lower) {
+		dest := ""
+		reStop := regexp.MustCompile(`(?i)nach\s+(.+?)(?:\s+mit|\s+und|\s*[?!.]|$)`)
+		if m := reStop.FindStringSubmatch(lower); len(m) == 2 {
+			dest = strings.TrimSpace(m[1])
+		}
+		kw, tagKey, tagVal := extractPOIFromPrompt(lower)
+		return promptIntent{Type: intentMultiStop, Destination: dest, POIType: kw, POITagKey: tagKey, POITagVal: tagVal}
+	}
+
+	// poi_on_route: "auf der Route" / "auf dem Weg"
+	if strings.Contains(lower, "auf der route") || strings.Contains(lower, "auf meiner route") ||
+		strings.Contains(lower, "entlang der route") || strings.Contains(lower, "along the route") ||
+		strings.Contains(lower, "auf dem weg") || strings.Contains(lower, "am weg") {
+		kw, tagKey, tagVal := extractPOIFromPrompt(lower)
+		return promptIntent{Type: intentPOIOnRoute, POIType: kw, POITagKey: tagKey, POITagVal: tagVal}
+	}
+
+	// navigate intent: prefix forms ("Navigation nach X")
+	for _, pfx := range navigatePrefixes {
+		if strings.HasPrefix(lower, pfx) {
+			dest := strings.TrimRight(strings.TrimSpace(lower[len(pfx):]), " ?!.")
+			if dest != "" {
+				return promptIntent{Type: intentNavigate, Destination: dest}
+			}
+		}
+	}
+	// navigate intent: postfix form ("nach X navigieren/fahren")
+	reNav := regexp.MustCompile(`(?i)nach\s+(.+?)\s+(?:navigieren|fahren|route|navigation)`)
+	if m := reNav.FindStringSubmatch(lower); len(m) == 2 {
+		if dest := strings.TrimSpace(m[1]); dest != "" {
+			return promptIntent{Type: intentNavigate, Destination: dest}
+		}
+	}
+
+	// poi_near: "in der Nähe" / "nächste" etc.
+	if strings.Contains(lower, "in der nähe") || strings.Contains(lower, "nächste") ||
+		strings.Contains(lower, "nächster") || strings.Contains(lower, "nächstes") ||
+		strings.Contains(lower, "nearest") || strings.Contains(lower, "near me") ||
+		strings.Contains(lower, "nahe von") || strings.Contains(lower, "nahe bei") {
+		kw, tagKey, tagVal := extractPOIFromPrompt(lower)
+		return promptIntent{Type: intentPOINear, POIType: kw, POITagKey: tagKey, POITagVal: tagVal}
+	}
+
+	// leisure intent
+	for _, kw := range leisureKeywords {
+		if strings.Contains(lower, kw) {
+			poiKw, tagKey, tagVal := extractPOIFromPrompt(lower)
+			return promptIntent{Type: intentLeisure, POIType: poiKw, POITagKey: tagKey, POITagVal: tagVal}
+		}
+	}
+
+	// Bare place-name fallback: short prompts with no verbs/question words are
+	// likely navigation targets (e.g. "Flughafen München", "Dingolfing").
+	// Only apply when the text contains no question indicators.
+	words := strings.Fields(lower)
+	questionWords := []string{"was", "wie", "wann", "warum", "wer", "wo", "welche", "welcher", "welches", "what", "how", "when", "why", "who", "where", "which"}
+	verbWords := []string{"ist", "sind", "hat", "haben", "kann", "gibt", "zeig", "erkläre", "erklar"}
+	if len(words) >= 1 && len(words) <= 5 {
+		isQuestion := false
+		for _, w := range words {
+			for _, qw := range questionWords {
+				if w == qw {
+					isQuestion = true
+					break
+				}
+			}
+			for _, vw := range verbWords {
+				if w == vw {
+					isQuestion = true
+					break
+				}
+			}
+		}
+		if !isQuestion {
+			return promptIntent{Type: intentNavigate, Destination: strings.TrimRight(lower, " ?!.")}
+		}
+	}
+
+	return promptIntent{Type: intentUnknown}
+}
+
+// poiNearResult is a single POI with its distance from a reference point.
+type poiNearResult struct {
+	osmmini.AddressEntry
+	DistM float64
+	Label string
+}
+
+// searchPOIsNear returns up to limit POIs matching tagKey/tagVal sorted by
+// distance from the given reference coordinates.
+func (s *server) searchPOIsNear(lat, lon float64, tagKey, tagVal string, limit int) []poiNearResult {
+	var results []poiNearResult
+
+	s.poiMu.RLock()
+	for _, w := range s.poiWays {
+		v, ok := w.Tags[tagKey]
+		if !ok || (tagVal != "" && !strings.EqualFold(v, tagVal)) {
+			continue
+		}
+		var cx, cy float64
+		var cnt int
+		for _, nid := range w.NodeIDs {
+			if c, ok2 := s.poiNodes[nid]; ok2 {
+				cx += c.Lat
+				cy += c.Lon
+				cnt++
+			}
+		}
+		if cnt == 0 {
+			continue
+		}
+		coord := osmmini.Coord{Lat: cx / float64(cnt), Lon: cy / float64(cnt)}
+		lbl := w.Tags["name"]
+		if lbl == "" {
+			lbl = w.Tags["brand"]
+		}
+		if lbl == "" {
+			lbl = tagKey + "=" + tagVal
+		}
+		results = append(results, poiNearResult{
+			AddressEntry: osmmini.AddressEntry{ID: w.ID, Coord: coord, Tags: w.Tags},
+			DistM:        haversineMeters(lat, lon, coord.Lat, coord.Lon),
+			Label:        lbl,
+		})
+	}
+	s.poiMu.RUnlock()
+
+	for _, a := range s.addrs {
+		v, ok := a.Tags[tagKey]
+		if !ok || (tagVal != "" && !strings.EqualFold(v, tagVal)) {
+			continue
+		}
+		lbl := formatAddressLabel(a.Tags)
+		results = append(results, poiNearResult{
+			AddressEntry: a,
+			DistM:        haversineMeters(lat, lon, a.Coord.Lat, a.Coord.Lon),
+			Label:        lbl,
+		})
+	}
+
+	slices.SortFunc(results, func(a, b poiNearResult) int {
+		if a.DistM < b.DistM {
+			return -1
+		}
+		if a.DistM > b.DistM {
+			return 1
+		}
+		return 0
+	})
+	if len(results) > limit {
+		results = results[:limit]
+	}
+	return results
+}
+
+// handleIntentLocally processes a classified prompt intent without an LLM.
+// Returns true if the request was handled and an HTTP response was written.
+func (s *server) handleIntentLocally(ctx context.Context, w http.ResponseWriter, req aiQueryRequest, intent promptIntent) bool {
+	var qlat, qlon float64
+	hasCoord := false
+	if req.UserLat != nil && req.UserLon != nil {
+		qlat, qlon = *req.UserLat, *req.UserLon
+		hasCoord = true
+	} else if req.MapLat != nil && req.MapLon != nil {
+		qlat, qlon = *req.MapLat, *req.MapLon
+		hasCoord = true
+	}
+	opt := s.settings.Get().Routing
+
+	coordStr := func() string {
+		if hasCoord {
+			return fmt.Sprintf("%.6f,%.6f", qlat, qlon)
+		}
+		return req.RouteFrom
+	}
+
+	formatDur := func(durS float64) string {
+		durMin := durS / 60
+		if durMin < 60 {
+			return fmt.Sprintf("%.0f min", durMin)
+		}
+		h := int(durMin) / 60
+		m := int(durMin) % 60
+		if m == 0 {
+			return fmt.Sprintf("%d h", h)
+		}
+		return fmt.Sprintf("%d h %d min", h, m)
+	}
+
+	switch intent.Type {
+	case intentNavigate:
+		if intent.Destination == "" {
+			return false
+		}
+		from := coordStr()
+		// Prefer POI name match over address DB to avoid street names like
+		// "Flughafenstraße, Nürnberg" winning over the actual airport.
+		// Use distance-sorted lookup when user coordinates are available.
+		destStr := intent.Destination
+		if hasCoord {
+			if coord, lbl, ok := s.resolvePOIFuzzyNear(intent.Destination, qlat, qlon); ok {
+				_ = lbl
+				destStr = fmt.Sprintf("%.6f,%.6f", coord.Lat, coord.Lon)
+			}
+		} else if coord, _, ok := s.resolvePOIFuzzy(intent.Destination); ok {
+			destStr = fmt.Sprintf("%.6f,%.6f", coord.Lat, coord.Lon)
+		}
+		rr, fromAI, toAI, err := s.computeRouteFromLocQuery(ctx, from, destStr, opt)
+		if err != nil {
+			writeJSONError(w, http.StatusNotFound, "Route nicht gefunden: "+err.Error())
+			return true
+		}
+		resp := fmt.Sprintf("Route nach **%s**: %.1f km, ca. %s.", toAI.Label, rr.DistanceM/1000, formatDur(rr.DurationS))
+		writeJSON(w, http.StatusOK, aiQueryResponse{Provider: "local", Model: "navigate", Response: resp, Route: rr, From: fromAI, To: toAI})
+		return true
+
+	case intentDuration:
+		origin := intent.Origin
+		if origin == "" {
+			origin = coordStr()
+		}
+		if intent.Destination == "" || origin == "" {
+			return false
+		}
+		rr, fromAI, toAI, err := s.computeRouteFromLocQuery(ctx, origin, intent.Destination, opt)
+		if err != nil {
+			writeJSONError(w, http.StatusNotFound, "Route nicht gefunden: "+err.Error())
+			return true
+		}
+		resp := fmt.Sprintf("Von **%s** nach **%s**: %.1f km, ca. %s.", fromAI.Label, toAI.Label, rr.DistanceM/1000, formatDur(rr.DurationS))
+		writeJSON(w, http.StatusOK, aiQueryResponse{Provider: "local", Model: "duration", Response: resp, Route: rr, From: fromAI, To: toAI})
+		return true
+
+	case intentPOINear:
+		if !hasCoord || intent.POITagKey == "" {
+			return false
+		}
+		results := s.searchPOIsNear(qlat, qlon, intent.POITagKey, intent.POITagVal, 8)
+		if len(results) == 0 {
+			writeJSONError(w, http.StatusNotFound, fmt.Sprintf("Keine '%s' in der Nähe gefunden.", intent.POIType))
+			return true
+		}
+		best := results[0]
+		var routeObj *RouteResponse
+		var fromAI, toAI *aiLocation
+		if rr, fa, ta, err := s.computeRouteFromLocQuery(ctx, fmt.Sprintf("%.6f,%.6f", qlat, qlon), fmt.Sprintf("%.6f,%.6f", best.Coord.Lat, best.Coord.Lon), opt); err == nil {
+			routeObj = rr
+			fromAI = fa
+			toAI = ta
+			if toAI != nil {
+				toAI.Label = best.Label
+				toAI.Query = best.Label
+			}
+		}
+		suggestions := make([]apiSearchResult, 0, len(results))
+		for _, r := range results {
+			suggestions = append(suggestions, apiSearchResult{ID: r.ID, Kind: "poi", Label: r.Label, Lat: r.Coord.Lat, Lon: r.Coord.Lon, Tags: r.Tags})
+		}
+		resp := fmt.Sprintf("%d **%s** in der Nähe gefunden. Nächste: **%s** (%.0f m).", len(results), intent.POIType, best.Label, best.DistM)
+		if routeObj != nil {
+			resp += " Route berechnet."
+		}
+		writeJSON(w, http.StatusOK, aiQueryResponse{Provider: "local", Model: "poi-near", Response: resp, Route: routeObj, From: fromAI, To: toAI, Suggestions: suggestions})
+		return true
+
+	case intentPOIOnRoute:
+		if intent.POITagKey == "" || (req.RouteBBoxMinLat == 0 && req.RouteBBoxMaxLat == 0) {
+			return false
+		}
+		refLat := (req.RouteBBoxMinLat + req.RouteBBoxMaxLat) / 2
+		refLon := (req.RouteBBoxMinLon + req.RouteBBoxMaxLon) / 2
+		var results []poiNearResult
+		s.poiMu.RLock()
+		for _, w := range s.poiWays {
+			v, ok := w.Tags[intent.POITagKey]
+			if !ok || (intent.POITagVal != "" && !strings.EqualFold(v, intent.POITagVal)) {
+				continue
+			}
+			var cx, cy float64
+			var cnt int
+			for _, nid := range w.NodeIDs {
+				if c, ok2 := s.poiNodes[nid]; ok2 {
+					cx += c.Lat
+					cy += c.Lon
+					cnt++
+				}
+			}
+			if cnt == 0 {
+				continue
+			}
+			clat, clon := cx/float64(cnt), cy/float64(cnt)
+			if clat < req.RouteBBoxMinLat || clat > req.RouteBBoxMaxLat ||
+				clon < req.RouteBBoxMinLon || clon > req.RouteBBoxMaxLon {
+				continue
+			}
+			lbl := w.Tags["name"]
+			if lbl == "" {
+				lbl = w.Tags["brand"]
+			}
+			if lbl == "" {
+				lbl = intent.POITagKey + "=" + intent.POITagVal
+			}
+			results = append(results, poiNearResult{
+				AddressEntry: osmmini.AddressEntry{ID: w.ID, Coord: osmmini.Coord{Lat: clat, Lon: clon}, Tags: w.Tags},
+				DistM:        haversineMeters(refLat, refLon, clat, clon),
+				Label:        lbl,
+			})
+		}
+		s.poiMu.RUnlock()
+		slices.SortFunc(results, func(a, b poiNearResult) int {
+			if a.DistM < b.DistM {
+				return -1
+			}
+			if a.DistM > b.DistM {
+				return 1
+			}
+			return 0
+		})
+		if len(results) > 8 {
+			results = results[:8]
+		}
+		if len(results) == 0 {
+			writeJSONError(w, http.StatusNotFound, fmt.Sprintf("Keine '%s' auf der Route gefunden.", intent.POIType))
+			return true
+		}
+		suggestions := make([]apiSearchResult, 0, len(results))
+		for _, r := range results {
+			suggestions = append(suggestions, apiSearchResult{ID: r.ID, Kind: "poi", Label: r.Label, Lat: r.Coord.Lat, Lon: r.Coord.Lon, Tags: r.Tags})
+		}
+		resp := fmt.Sprintf("%d **%s** auf der Route. Nächste: **%s**.", len(results), intent.POIType, results[0].Label)
+		writeJSON(w, http.StatusOK, aiQueryResponse{Provider: "local", Model: "poi-on-route", Response: resp, Suggestions: suggestions})
+		return true
+
+	case intentMultiStop:
+		if intent.Destination == "" || !hasCoord {
+			return false
+		}
+		fromStr := fmt.Sprintf("%.6f,%.6f", qlat, qlon)
+		// Find the nearest intermediate POI stop if a type was specified.
+		var stopCoord *osmmini.Coord
+		var stopLabel string
+		if intent.POITagKey != "" {
+			if poiRes := s.searchPOIsNear(qlat, qlon, intent.POITagKey, intent.POITagVal, 1); len(poiRes) > 0 {
+				c := poiRes[0].Coord
+				stopCoord = &c
+				stopLabel = poiRes[0].Label
+			}
+		}
+		if stopCoord != nil {
+			stopStr := fmt.Sprintf("%.6f,%.6f", stopCoord.Lat, stopCoord.Lon)
+			rr1, _, _, err1 := s.computeRouteFromLocQuery(ctx, fromStr, stopStr, opt)
+			rr2, _, toAI2, err2 := s.computeRouteFromLocQuery(ctx, stopStr, intent.Destination, opt)
+			if err1 == nil && err2 == nil {
+				combined := &RouteResponse{
+					From:      rr1.From,
+					To:        rr2.To,
+					Engine:    rr2.Engine,
+					Objective: rr2.Objective,
+					Profile:   rr2.Profile,
+					DistanceM: rr1.DistanceM + rr2.DistanceM,
+					DurationS: rr1.DurationS + rr2.DurationS,
+					Path:      append(rr1.Path, rr2.Path...),
+					Steps:     append(rr1.Steps, rr2.Steps...),
+				}
+				startLat, startLon := rr1.From.Lat, rr1.From.Lon
+				fa := &aiLocation{Query: fromStr, Label: rr1.From.Label, Lat: &startLat, Lon: &startLon}
+				stopLatV, stopLonV := stopCoord.Lat, stopCoord.Lon
+				stopAI := aiLocation{Query: stopLabel, Label: stopLabel, Lat: &stopLatV, Lon: &stopLonV}
+				resp := fmt.Sprintf("Route mit Zwischenstopp bei **%s** nach **%s**: %.1f km, ca. %s.",
+					stopLabel, toAI2.Label, combined.DistanceM/1000, formatDur(combined.DurationS))
+				writeJSON(w, http.StatusOK, aiQueryResponse{Provider: "local", Model: "multi-stop", Response: resp, Route: combined, From: fa, To: toAI2, Waypoints: []aiLocation{stopAI}})
+				return true
+			}
+		}
+		// Fallback: direct route without stop.
+		rr, fromAI, toAI, err := s.computeRouteFromLocQuery(ctx, fromStr, intent.Destination, opt)
+		if err != nil {
+			return false
+		}
+		resp := fmt.Sprintf("Route nach **%s**: %.1f km, ca. %s.", toAI.Label, rr.DistanceM/1000, formatDur(rr.DurationS))
+		if intent.POITagKey != "" {
+			resp += fmt.Sprintf(" (Kein '%s' auf dem Weg gefunden.)", intent.POIType)
+		}
+		writeJSON(w, http.StatusOK, aiQueryResponse{Provider: "local", Model: "multi-stop", Response: resp, Route: rr, From: fromAI, To: toAI})
+		return true
+
+	case intentLeisure:
+		if !hasCoord || intent.POITagKey == "" {
+			return false
+		}
+		results := s.searchPOIsNear(qlat, qlon, intent.POITagKey, intent.POITagVal, 5)
+		if len(results) == 0 {
+			return false
+		}
+		best := results[0]
+		var routeObj *RouteResponse
+		var fromAI, toAI *aiLocation
+		if rr, fa, ta, err := s.computeRouteFromLocQuery(ctx, fmt.Sprintf("%.6f,%.6f", qlat, qlon), fmt.Sprintf("%.6f,%.6f", best.Coord.Lat, best.Coord.Lon), opt); err == nil {
+			routeObj = rr
+			fromAI = fa
+			toAI = ta
+			if toAI != nil {
+				toAI.Label = best.Label
+				toAI.Query = best.Label
+			}
+		}
+		suggestions := make([]apiSearchResult, 0, len(results))
+		for _, r := range results {
+			suggestions = append(suggestions, apiSearchResult{ID: r.ID, Kind: "poi", Label: r.Label, Lat: r.Coord.Lat, Lon: r.Coord.Lon, Tags: r.Tags})
+		}
+		resp := fmt.Sprintf("Nächstes passendes Ziel: **%s** (%.0f m).", best.Label, best.DistM)
+		if routeObj != nil {
+			resp += fmt.Sprintf(" %.1f km, ca. %s.", routeObj.DistanceM/1000, formatDur(routeObj.DurationS))
+		}
+		writeJSON(w, http.StatusOK, aiQueryResponse{Provider: "local", Model: "leisure", Response: resp, Route: routeObj, From: fromAI, To: toAI, Suggestions: suggestions})
+		return true
+	}
+	return false
+}
+
+// extractRouteAction scans an LLM response text for a ```route-action``` code
+// block and returns the from/to values when one is found. The block must
+// contain a JSON object with "action":"compute_route", "from", and "to" keys.
+// The function also returns the cleaned response text with the block removed.
+func extractRouteAction(text string) (from, to, cleanText string, found bool) {
+	// Match ```route-action\n{...}\n``` (allow optional spaces/newlines)
+	re := regexp.MustCompile("(?s)```route-action\\s*\\n(\\{[^`]+\\})\\s*```")
+	m := re.FindStringSubmatchIndex(text)
+	if m == nil {
+		return "", "", text, false
+	}
+	jsonStr := strings.TrimSpace(text[m[2]:m[3]])
+	var action struct {
+		Action string `json:"action"`
+		From   string `json:"from"`
+		To     string `json:"to"`
+	}
+	if err := json.Unmarshal([]byte(jsonStr), &action); err != nil {
+		return "", "", text, false
+	}
+	if action.Action != "compute_route" || action.To == "" {
+		return "", "", text, false
+	}
+	// Remove the block from the text and trim trailing whitespace/newlines.
+	clean := strings.TrimRight(text[:m[0]], " \t\n\r") + strings.TrimLeft(text[m[1]:], " \t\n\r")
+	clean = strings.TrimSpace(clean)
+	return action.From, action.To, clean, true
+}
+
+// resolvePOIFuzzyNear is like resolvePOIFuzzy but sorts all candidates by
+// distance from (lat, lon) and returns the nearest match. This prevents address
+// entries like "Flughafenstraße, Nürnberg" from winning over "Flughafen München"
+// when the user is near Munich.
+func (s *server) resolvePOIFuzzyNear(query string, lat, lon float64) (osmmini.Coord, string, bool) {
+	norm := normalizeForCompare(query)
+	if norm == "" {
+		return osmmini.Coord{}, "", false
+	}
+	type cand struct {
+		coord osmmini.Coord
+		label string
+		dist  float64
+	}
+	var cands []cand
+	s.poiMu.RLock()
+	for _, w := range s.poiWays {
+		name := normalizeForCompare(w.Tags["name"])
+		brand := normalizeForCompare(w.Tags["brand"])
+		if !strings.Contains(name, norm) && !strings.Contains(norm, name) &&
+			!strings.Contains(brand, norm) && !strings.Contains(norm, brand) {
+			continue
+		}
+		var cx, cy float64
+		var cnt int
+		for _, nid := range w.NodeIDs {
+			if c, ok := s.poiNodes[nid]; ok {
+				cx += c.Lat
+				cy += c.Lon
+				cnt++
+			}
+		}
+		if cnt == 0 {
+			continue
+		}
+		coord := osmmini.Coord{Lat: cx / float64(cnt), Lon: cy / float64(cnt)}
+		lbl := w.Tags["name"]
+		if lbl == "" {
+			lbl = w.Tags["brand"]
+		}
+		cands = append(cands, cand{coord: coord, label: lbl, dist: haversineMeters(lat, lon, coord.Lat, coord.Lon)})
+	}
+	s.poiMu.RUnlock()
+	for _, a := range s.addrs {
+		name := normalizeForCompare(a.Tags["name"])
+		if name != "" && (strings.Contains(name, norm) || strings.Contains(norm, name)) {
+			cands = append(cands, cand{coord: a.Coord, label: formatAddressLabel(a.Tags), dist: haversineMeters(lat, lon, a.Coord.Lat, a.Coord.Lon)})
+		}
+	}
+	if len(cands) == 0 {
+		return osmmini.Coord{}, "", false
+	}
+	slices.SortFunc(cands, func(a, b cand) int {
+		if a.dist < b.dist {
+			return -1
+		}
+		if a.dist > b.dist {
+			return 1
+		}
+		return 0
+	})
+	return cands[0].coord, cands[0].label, true
+}
+
+// resolvePOIFuzzy searches the POI way/address index for a name that contains
+// the query string (case-insensitive). Returns the best matching coord and label.
+func (s *server) resolvePOIFuzzy(query string) (osmmini.Coord, string, bool) {
+	norm := normalizeForCompare(query)
+	if norm == "" {
+		return osmmini.Coord{}, "", false
+	}
+	s.poiMu.RLock()
+	defer s.poiMu.RUnlock()
+
+	// Search ways first (usually have better centroid data).
+	for _, w := range s.poiWays {
+		name := normalizeForCompare(w.Tags["name"])
+		brand := normalizeForCompare(w.Tags["brand"])
+		if name == "" && brand == "" {
+			continue
+		}
+		if !strings.Contains(name, norm) && !strings.Contains(norm, name) &&
+			!strings.Contains(brand, norm) && !strings.Contains(norm, brand) {
+			continue
+		}
+		var cx, cy float64
+		var cnt int
+		for _, nid := range w.NodeIDs {
+			if c, ok := s.poiNodes[nid]; ok {
+				cx += c.Lat
+				cy += c.Lon
+				cnt++
+			}
+		}
+		if cnt == 0 {
+			continue
+		}
+		label := w.Tags["name"]
+		if label == "" {
+			label = w.Tags["brand"]
+		}
+		return osmmini.Coord{Lat: cx / float64(cnt), Lon: cy / float64(cnt)}, label, true
+	}
+	// Fall back to address entries.
+	for _, a := range s.addrs {
+		name := normalizeForCompare(a.Tags["name"])
+		if name != "" && (strings.Contains(name, norm) || strings.Contains(norm, name)) {
+			return a.Coord, formatAddressLabel(a.Tags), true
+		}
+	}
+	return osmmini.Coord{}, "", false
+}
+
+// computeRouteFromLocQuery resolves from/to location strings and runs the
+// router, returning a fully-populated RouteResponse ready for the UI.
+// Either argument may be empty (treated as "use map center / best guess").
+// Resolution order: lat,lon parse → address index → POI fuzzy search.
+func (s *server) computeRouteFromLocQuery(ctx context.Context, from, to string, opt osmmini.RouteOptions) (*RouteResponse, *aiLocation, *aiLocation, error) {
+	fromLoc := Location{Query: from}
+	toLoc := Location{Query: to}
+
+	fromCoord, fromLabel, _, err := s.resolveLocation(fromLoc)
+	if err != nil {
+		// Try POI fuzzy fallback.
+		if c, lbl, ok := s.resolvePOIFuzzy(from); ok {
+			fromCoord = c
+			fromLabel = lbl
+		} else {
+			return nil, nil, nil, fmt.Errorf("start: %w", err)
+		}
+	}
+	toCoord, toLabel, _, err := s.resolveLocation(toLoc)
+	if err != nil {
+		// Try POI fuzzy fallback.
+		if c, lbl, ok := s.resolvePOIFuzzy(to); ok {
+			toCoord = c
+			toLabel = lbl
+		} else {
+			return nil, nil, nil, fmt.Errorf("ziel '%s': %w", to, err)
+		}
+	}
+
+	startID, startSnap, okF := s.router.NearestNode(fromCoord.Lat, fromCoord.Lon)
+	if !okF {
+		return nil, nil, nil, fmt.Errorf("kein Startknoten gefunden")
+	}
+	endID, endSnap, okT := s.router.NearestNode(toCoord.Lat, toCoord.Lon)
+	if !okT {
+		return nil, nil, nil, fmt.Errorf("kein Zielknoten gefunden")
+	}
+
+	res, err := s.router.RouteWithOptions(ctx, startID, endID, opt)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	steps := s.router.ManeuversForPath(res.Path, opt)
+	gURL := buildGoogleMapsURL([]osmmini.Coord{fromCoord, toCoord}, 0)
+	aURL := buildAppleMapsURL([]osmmini.Coord{fromCoord, toCoord})
+
+	rr := &RouteResponse{
+		From:          RoutePoint{Input: from, Label: fromLabel, Lat: fromCoord.Lat, Lon: fromCoord.Lon, Node: startID, SnapM: startSnap},
+		To:            RoutePoint{Input: to, Label: toLabel, Lat: toCoord.Lat, Lon: toCoord.Lon, Node: endID, SnapM: endSnap},
+		Engine:        string(res.Engine),
+		Objective:     string(res.Objective),
+		Profile:       string(opt.Profile),
+		Cost:          res.Cost,
+		DistanceM:     res.DistanceM,
+		DurationS:     res.DurationS,
+		Path:          res.PathCoords,
+		GoogleMapsURL: gURL,
+		AppleMapsURL:  aURL,
+		Steps:         steps,
+	}
+	fromLat, fromLon := fromCoord.Lat, fromCoord.Lon
+	toLat, toLon := toCoord.Lat, toCoord.Lon
+	fromAI := &aiLocation{Query: from, Label: fromLabel, Lat: &fromLat, Lon: &fromLon}
+	toAI := &aiLocation{Query: to, Label: toLabel, Lat: &toLat, Lon: &toLon}
+	return rr, fromAI, toAI, nil
 }
 
 // queryOllama sends a chat completion request to an Ollama instance.

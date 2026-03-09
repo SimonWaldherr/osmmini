@@ -142,6 +142,7 @@ const debouncedCompute = debounce(function(){ try{ compute(); } catch(e){} }, 30
 
 let polyline = null;
 let startMarker = null, endMarker = null;
+let currentRouteBBox = null; // {minLat, minLon, maxLat, maxLon} of the last rendered route
 const stops = []; // map markers
 const waypoints = []; // input waypoints
 let stopSeq = 1;
@@ -169,27 +170,31 @@ function preventAutofill() {
     
     container.appendChild(input);
     
-    // Use a workaround: reset value every few ms to prevent Safari autofill
+    // Use a workaround: reset value on suspicious autofill attempts
     let lastValue = '';
+    let autofillTimer = null;
     input.addEventListener('input', (e) => {
       lastValue = e.target.value;
     });
-    
-    // Clear any suspicious autofill attempts
-    setInterval(() => {
-      if (input === document.activeElement) {
+    input.addEventListener('focus', () => {
+      // Only watch while the input is focused; clear on blur to avoid leaking.
+      autofillTimer = setInterval(() => {
         const currentValue = input.value;
-        // If value changed without user input event, Safari likely autofilled
         if (currentValue !== lastValue && currentValue.includes(' ')) {
-          // Check if it looks like Safari's autofill (typically has spaces/numbers)
-          const isLikelyAutofill = /\d+|straße|str\.|platz|weg/i.test(currentValue) && 
+          const isLikelyAutofill = /\d+|straße|str\.|platz|weg/i.test(currentValue) &&
                                     lastValue.length < 3;
           if (isLikelyAutofill) {
             input.value = lastValue;
           }
         }
+      }, 100);
+    });
+    input.addEventListener('blur', () => {
+      if (autofillTimer !== null) {
+        clearInterval(autofillTimer);
+        autofillTimer = null;
       }
-    }, 100);
+    });
     
     return input;
   }
@@ -333,7 +338,12 @@ async function apiPutSettings(settings) {
 
 async function apiRoute(from,to,options){
   const res = await fetch('/api/v1/route',{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({from:{query:from}, to:{query:to}, options})});
-  if(!res.ok){ const err = await res.json().catch(()=>({})); throw new Error(err.error || res.statusText); }
+  if(!res.ok){
+    const err = await res.json().catch(()=>({}));
+    const ex = new Error(err.error || res.statusText);
+    ex.details = err;
+    throw ex;
+  }
   return res.json();
 }
 
@@ -344,8 +354,67 @@ async function apiTripSolve(from,to,options){
   stops.forEach(s=> allStops.push({id:s.id, location:{lat:s.lat, lon:s.lon}}));
   const plan = { start:{query:from}, end:{query:to}, stops: allStops, dependencies:[], optimize };
   const res = await fetch('/api/v1/trip/solve', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({plan, options})});
-  if(!res.ok){ const err = await res.json().catch(()=>({})); throw new Error(err.error || res.statusText); }
+  if(!res.ok){
+    const err = await res.json().catch(()=>({}));
+    const ex = new Error(err.error || res.statusText);
+    ex.details = err;
+    throw ex;
+  }
   return res.json();
+}
+
+function renderDisambiguationButtons(details) {
+  if (!details || !Array.isArray(details.suggestions) || details.suggestions.length === 0) return;
+  const messagesEl = document.getElementById('aiMessages');
+  if (!messagesEl) return;
+
+  const target = details.target === 'from' ? 'from' : 'to';
+  const query = details.query || '';
+
+  const wrapper = document.createElement('div');
+  wrapper.className = 'ai-message ai-assistant';
+
+  const header = document.createElement('div');
+  header.style.fontSize = '11px';
+  header.style.color = 'var(--text-muted)';
+  header.style.marginBottom = '6px';
+  header.textContent = 'Mehrdeutiges Ziel';
+  wrapper.appendChild(header);
+
+  const text = document.createElement('div');
+  text.style.fontSize = '13px';
+  text.style.marginBottom = '8px';
+  text.innerHTML = `Ich bin nicht sicher, welches ${target === 'from' ? 'Start' : 'Ziel'} gemeint ist${query ? ` (<strong>${escapeHtml(query)}</strong>)` : ''}. Bitte auswählen:`;
+  wrapper.appendChild(text);
+
+  const btnRow = document.createElement('div');
+  btnRow.style.display = 'flex';
+  btnRow.style.flexWrap = 'wrap';
+  btnRow.style.gap = '6px';
+
+  details.suggestions.slice(0, 6).forEach((sug) => {
+    const btn = document.createElement('button');
+    btn.className = 'btn';
+    btn.style.padding = '6px 10px';
+    btn.style.fontSize = '12px';
+    btn.textContent = sug.label || `${(sug.lat || 0).toFixed(5)}, ${(sug.lon || 0).toFixed(5)}`;
+    btn.title = sug.kind || 'Treffer';
+    btn.addEventListener('click', async () => {
+      const val = sug.label || `${sug.lat},${sug.lon}`;
+      const el = document.getElementById(target);
+      if (el) el.value = val;
+      try {
+        if (typeof sug.lat === 'number' && typeof sug.lon === 'number') map.panTo([sug.lat, sug.lon]);
+      } catch (e) {}
+      showToast(`${target === 'from' ? 'Start' : 'Ziel'} gesetzt: ${val}`, 'success', 1800);
+      try { await compute(); } catch (e) { console.warn('compute after disambiguation failed', e); }
+    });
+    btnRow.appendChild(btn);
+  });
+
+  wrapper.appendChild(btnRow);
+  messagesEl.appendChild(wrapper);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
 function renderPath(path, meta){
@@ -353,6 +422,13 @@ function renderPath(path, meta){
   if(polyline) polyline.remove();
   if(startMarker) startMarker.remove(); if(endMarker) endMarker.remove();
   if(coords.length===0) return;
+  // Track route bounding box for poi_on_route queries
+  currentRouteBBox = coords.reduce((bb, c) => ({
+    minLat: Math.min(bb.minLat, c[0]),
+    minLon: Math.min(bb.minLon, c[1]),
+    maxLat: Math.max(bb.maxLat, c[0]),
+    maxLon: Math.max(bb.maxLon, c[1]),
+  }), {minLat: coords[0][0], minLon: coords[0][1], maxLat: coords[0][0], maxLon: coords[0][1]});
   polyline = L.polyline(coords,{color:'#3a8eef', weight:5, opacity: 0.8}).addTo(map);
   startMarker = L.circleMarker(coords[0],{radius:7, color:'#6ef2a0', fillColor:'#6ef2a0', fillOpacity:0.8}).addTo(map);
   endMarker = L.circleMarker(coords[coords.length-1],{radius:7, color:'#ffcc66', fillColor:'#ffcc66', fillOpacity:0.8}).addTo(map);
@@ -443,6 +519,12 @@ async function compute() {
     }
   } catch (e) {
     document.getElementById('status').textContent = '❌ Fehler';
+    try {
+      if (e && e.details && Array.isArray(e.details.suggestions) && e.details.suggestions.length > 0) {
+        renderDisambiguationButtons(e.details);
+        showToast('Mehrdeutiges Ziel: Bitte einen Vorschlag auswählen', 'info', 2600);
+      }
+    } catch (de) { /* non-fatal */ }
     showToast(e.message || 'Fehler bei der Routenberechnung', 'error', 4000);
     console.error(e);
   }
@@ -487,41 +569,33 @@ function renderManeuvers(steps) {
   if (!steps || steps.length === 0) { el.style.display = 'none'; return; }
   const list = document.createElement('div');
   list.className = 'maneuver-list';
-  steps.forEach((s, idx) => {
+  steps.forEach((s) => {
     const row = document.createElement('div');
     row.className = 'maneuver-row';
-    row.style.display = 'flex';
-    row.style.alignItems = 'center';
-    row.style.justifyContent = 'space-between';
-    row.style.padding = '6px 8px';
-    row.style.borderRadius = '6px';
-    row.style.marginBottom = '6px';
-    row.style.background = 'rgba(255,255,255,0.02)';
 
     const left = document.createElement('div');
-    left.style.display = 'flex';
-    left.style.alignItems = 'center';
-    left.style.gap = '8px';
+    left.className = 'maneuver-left';
 
-    const ic = document.createElement('div'); ic.textContent = iconForType(s.type || s.Type || ''); ic.style.fontSize = '18px';
-    const txt = document.createElement('div'); txt.style.fontSize = '13px'; txt.style.lineHeight = '1.1';
-    txt.innerHTML = `<div style="font-weight:600">${escapeHtml(s.instruction || s.Instruction || '')}</div><div style="font-size:11px; opacity:0.7;">${escapeHtml((s.type||s.Type||'').toString())}</div>`;
-    left.appendChild(ic); left.appendChild(txt);
+    const ic = document.createElement('div');
+    ic.className = 'maneuver-icon';
+    ic.textContent = iconForType(s.type || s.Type || '');
+
+    const txt = document.createElement('div');
+    txt.className = 'maneuver-text';
+    txt.innerHTML = `<div class="maneuver-instr">${escapeHtml(s.instruction || s.Instruction || '')}</div>`
+                  + `<div class="maneuver-type">${escapeHtml((s.type||s.Type||'').toString())}</div>`;
+    left.append(ic, txt);
 
     const right = document.createElement('div');
-    right.style.textAlign = 'right';
-    right.style.minWidth = '70px';
-    right.innerHTML = `<div style="font-weight:600">${formatMeters(s.distance_m || s.DistanceM || 0)}</div><div style="font-size:11px; opacity:0.7">${formatDuration(s.duration_s || s.DurationS || 0)}</div>`;
+    right.className = 'maneuver-right';
+    right.innerHTML = `<div class="maneuver-dist">${formatMeters(s.distance_m || s.DistanceM || 0)}</div>`
+                    + `<div class="maneuver-dur">${formatDuration(s.duration_s || s.DurationS || 0)}</div>`;
 
-    row.appendChild(left);
-    row.appendChild(right);
-
-    // pan to maneuver on click
+    row.append(left, right);
     row.addEventListener('click', () => {
       const lat = s.lat || s.Lat; const lon = s.lon || s.Lon;
       if (lat && lon) map.panTo([lat, lon]);
     });
-
     list.appendChild(row);
   });
   el.appendChild(list);
@@ -597,6 +671,150 @@ document.getElementById('exportRoute')?.addEventListener('click', () => {
   URL.revokeObjectURL(url);
   showToast('Route als GeoJSON exportiert', 'success', 2000);
 });
+
+// --- Agent action executor ---
+async function postAgentExecute(actions, session, confirm=false, dry_run=false) {
+  const body = { actions, session_id: session, confirm: confirm, dry_run: dry_run };
+  const res = await fetch('/api/v1/agent/execute', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  if (!res.ok) {
+    const err = await res.json().catch(()=>({})); throw new Error(err.error || res.statusText);
+  }
+  return res.json();
+}
+
+// Execute a list of actions returned by the agent. If actions include
+// compute_route we ask for confirmation and call server execute to compute.
+async function executeAgentActions(actions, session_id) {
+  if (!Array.isArray(actions)) return;
+  // handle non-routing actions immediately and collect summaries
+  const summaries = [];
+  for (const act of actions) {
+    const t = act.type || act.Type || '';
+    const params = act.params || {};
+    if (t === 'highlight_poi') {
+      try {
+        const id = params.id;
+        const qlat = userLocation ? userLocation.lat : null;
+        const qlon = userLocation ? userLocation.lon : null;
+        const qs = (qlat!==null && qlon!==null) ? `?lat=${qlat}&lon=${qlon}` : '';
+        const res = await fetch(`/api/v1/poi/${id}${qs}`);
+        if (res.ok) {
+          const data = await res.json();
+          const m = L.marker([data.lat, data.lon]).addTo(map);
+          m.bindPopup(`<strong>${escapeHtml(data.label||'')}</strong>`).openPopup();
+          searchResultMarkers.push(m);
+          const distText = data.distance_m ? `${Math.round(data.distance_m)} m` : '';
+          summaries.push(`Hervorgehoben: ${data.label || ('#' + id)} ${distText}`);
+        }
+      } catch (e) { console.warn('highlight failed', e); summaries.push('Hervorhebung fehlgeschlagen'); }
+    } else if (t === 'show_info') {
+      try {
+        const id = params.id;
+        const qlat = userLocation ? userLocation.lat : null;
+        const qlon = userLocation ? userLocation.lon : null;
+        const qs = (qlat!==null && qlon!==null) ? `?lat=${qlat}&lon=${qlon}` : '';
+        const res = await fetch(`/api/v1/poi/${id}${qs}`);
+        if (res.ok) {
+          const data = await res.json();
+          const html = `<div style="min-width:200px;"><strong>${escapeHtml(data.label||'')}</strong><div style="font-size:12px;opacity:0.8;">${escapeHtml(Object.keys(data.tags||{}).slice(0,6).map(k=>k+': '+data.tags[k]).join('<br/>'))}</div></div>`;
+          const m = L.marker([data.lat, data.lon]).addTo(map);
+          m.bindPopup(html).openPopup();
+          searchResultMarkers.push(m);
+          map.panTo([data.lat, data.lon]);
+          const distText = data.distance_m ? `${Math.round(data.distance_m)} m` : '';
+          summaries.push(`Info angezeigt: ${data.label || ('#' + id)} ${distText}`);
+        }
+      } catch (e) { console.warn('show_info failed', e); summaries.push('Details konnten nicht geladen werden'); }
+    }
+  }
+
+  // append a concise assistant message summarizing non-routing actions
+  try {
+    const messagesEl = document.getElementById('aiMessages');
+    if (summaries.length > 0 && messagesEl) {
+      const assist = document.createElement('div');
+      assist.className = 'ai-message ai-assistant';
+      assist.innerHTML = `<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">lokaler Agent — Aktionen</div><div style="font-size:13px;">${escapeHtml(summaries.join(' • '))}</div>`;
+      messagesEl.appendChild(assist);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+  } catch (e) { /* non-fatal */ }
+
+  // If any compute_route actions exist, populate the #from and #to inputs
+  const computeActions = actions.filter(a => (a.type||a.Type) === 'compute_route');
+  if (computeActions.length === 0) return;
+
+  try {
+    // Use the first compute_route action to populate the form (common case)
+    const c = computeActions[0];
+    const params = c.params || {};
+    // determine from value
+    let fromVal = '';
+    if (params.from) {
+      const f = params.from;
+      if (f.query) fromVal = f.query;
+      else if (typeof f.lat === 'number' && typeof f.lon === 'number') fromVal = `${f.lat.toFixed(6)},${f.lon.toFixed(6)}`;
+    }
+    // determine to value; if id present, try to fetch POI label
+    let toVal = '';
+    if (params.to) {
+      const t = params.to;
+      if (t.query) toVal = t.query;
+      else if (typeof t.lat === 'number' && typeof t.lon === 'number') toVal = `${t.lat.toFixed(6)},${t.lon.toFixed(6)}`;
+      else if (t.id) {
+        const id = t.id;
+        try {
+          const qlat = userLocation ? userLocation.lat : null;
+          const qlon = userLocation ? userLocation.lon : null;
+          const qs = (qlat!==null && qlon!==null) ? `?lat=${qlat}&lon=${qlon}` : '';
+          const res = await fetch(`/api/v1/poi/${id}${qs}`);
+          if (res.ok) {
+            const data = await res.json();
+            if (data.label) toVal = data.label;
+            else if (typeof data.lat === 'number' && typeof data.lon === 'number') toVal = `${data.lat.toFixed(6)},${data.lon.toFixed(6)}`;
+          }
+        } catch (e) { /* ignore */ }
+      }
+    }
+
+    // Populate the form fields
+    try {
+      if (fromVal) {
+        const fe = document.getElementById('from'); if (fe) fe.value = fromVal;
+      }
+      if (toVal) {
+        const te = document.getElementById('to'); if (te) te.value = toVal;
+      }
+      showToast('Agent: Formular mit Quelle und Ziel ausgefüllt', 'success', 2200);
+
+      // append an assistant message summarizing what was filled
+      const messagesEl = document.getElementById('aiMessages');
+      if (messagesEl) {
+        const assist = document.createElement('div');
+        assist.className = 'ai-message ai-assistant';
+        const parts = [];
+        if (fromVal) parts.push('Quelle: ' + escapeHtml(fromVal));
+        if (toVal) parts.push('Ziel: ' + escapeHtml(toVal));
+        assist.innerHTML = `<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">lokaler Agent — Formular ausgefüllt</div><div style="font-size:13px;">${parts.join(' • ')}</div>`;
+        messagesEl.appendChild(assist);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      }
+
+      // automatically trigger route computation after populating the form
+      try {
+        setTimeout(() => {
+          compute();
+        }, 200);
+      } catch (e) { console.warn('auto compute failed', e); }
+    } catch (e) { console.warn('Failed to populate form', e); }
+  } catch (e) {
+    console.error('Agent compute handling failed', e);
+    showToast('Agent konnte Quelle/Ziel nicht einfügen', 'error', 4000);
+  }
+}
+
+// Export for quick manual testing from console
+window.executeAgentActions = executeAgentActions;
 
 map.on('click', ev=>{
   const id = 'M'+(stopSeq++);
@@ -1390,6 +1608,20 @@ if (aiToggle) {
 let aiAvailable = false;
 let aiModels = [];
 
+// Persist AI session ID across page reloads via localStorage.
+// _aiSessionId holds the current multi-turn session id in memory;
+// localStorage mirrors it for persistence across page reloads.
+let _aiSessionId = localStorage.getItem('ai_session_id') || '';
+function getAISessionId() {
+  return _aiSessionId;
+}
+function setAISessionId(sid) {
+  if (sid) {
+    _aiSessionId = sid;
+    localStorage.setItem('ai_session_id', sid);
+  }
+}
+
 async function checkAIStatus() {
   const statusEl = document.getElementById('aiStatus');
   const modelSelectEl = document.getElementById('aiModelSelect');
@@ -1422,15 +1654,17 @@ async function checkAIStatus() {
         modelSelectEl.style.display = 'block';
         sendBtn.disabled = false;
         const providers = data.providers.filter(p => p.available).map(p => p.name).join(', ');
-        statusEl.innerHTML = `<span style="color:#6ef2a0;">✅ KI verfügbar</span> (${providers}, ${aiModels.length} Modell${aiModels.length>1?'e':''})`;
+        statusEl.textContent = `${providers} · ${aiModels.length} Modell${aiModels.length>1?'e':''}`;
+        const badge = document.getElementById('aiStatusBadge');
+        if (badge) { badge.textContent = '● Online'; badge.className = 'status-badge ok'; badge.style.display = 'inline-flex'; }
       } else {
-        statusEl.innerHTML = '<span style="color:#ffcc66;">⚠️ Provider verfügbar, aber keine Modelle geladen</span>';
+        statusEl.textContent = 'Provider erreichbar, aber keine Modelle geladen.';
       }
     } else {
-      statusEl.innerHTML = '<span style="color:var(--text-muted);">❌ Keine KI verfügbar. Starte <a href="https://ollama.com" target="_blank" style="color:var(--primary);">Ollama</a> oder <a href="https://lmstudio.ai" target="_blank" style="color:var(--primary);">LM Studio</a>.</span>';
+      statusEl.innerHTML = 'Keine KI verfügbar. Starte <a href="https://ollama.com" target="_blank">Ollama</a> oder <a href="https://lmstudio.ai" target="_blank">LM Studio</a>.';
     }
   } catch (e) {
-    statusEl.innerHTML = '<span style="color:var(--text-muted);">❌ KI-Status konnte nicht abgefragt werden</span>';
+    statusEl.textContent = 'KI-Status nicht abrufbar.';
   }
 }
 
@@ -1460,8 +1694,57 @@ async function sendAIQuery() {
   
   try {
     const model = document.getElementById('aiModel').value || '';
+    // Helper: attempt a one-time browser geolocation read (short timeout)
+    async function tryObtainUserLocation(ms) {
+      return new Promise((resolve) => {
+        if (userLocation && typeof userLocation.lat === 'number' && typeof userLocation.lon === 'number') {
+          return resolve(userLocation);
+        }
+        if (!navigator.geolocation) return resolve(null);
+        let done = false;
+        const tid = setTimeout(() => { if (!done) { done = true; resolve(null); } }, ms);
+        navigator.geolocation.getCurrentPosition((pos) => {
+          if (done) return;
+          done = true; clearTimeout(tid);
+          userLocation = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+          resolve(userLocation);
+        }, (err) => {
+          if (done) return;
+          done = true; clearTimeout(tid);
+          resolve(null);
+        }, { enableHighAccuracy: true, timeout: ms });
+      });
+    }
+
+    // Try to obtain user location (non-blocking but awaited with short timeout)
+    try { await tryObtainUserLocation(3000); } catch (e) {}
+
     // include map center as location hint if available
     const payload = { prompt, model };
+    // propagate AI session id for multi-turn context when available
+    const _sid = getAISessionId();
+    if (_sid) payload.session = _sid;
+    // include current route context so the LLM has accurate info
+    try {
+      const fromVal = document.getElementById('from')?.value?.trim();
+      const toVal = document.getElementById('to')?.value?.trim();
+      const distText = document.getElementById('detailDistance')?.textContent?.trim();
+      const engineText = document.getElementById('detailEngine')?.textContent?.trim();
+      if (fromVal) payload.route_from = fromVal;
+      if (toVal) payload.route_to = toVal;
+      if (distText) {
+        const distKm = parseFloat(distText);
+        if (!isNaN(distKm)) payload.route_dist_m = distKm * 1000;
+      }
+      if (engineText) payload.route_engine = engineText;
+      // include route bounding box for poi_on_route queries
+      if (currentRouteBBox) {
+        payload.route_bbox_min_lat = currentRouteBBox.minLat;
+        payload.route_bbox_min_lon = currentRouteBBox.minLon;
+        payload.route_bbox_max_lat = currentRouteBBox.maxLat;
+        payload.route_bbox_max_lon = currentRouteBBox.maxLon;
+      }
+    } catch (_e) {}
     try {
       // Always include current map center as a hint
       if (window.map && typeof map.getCenter === 'function') {
@@ -1484,6 +1767,133 @@ async function sendAIQuery() {
     } catch (e) {}
     // Follow-up handling: if user asks duration and we have a recent route, answer locally
     const lowerPrompt = (prompt || '').toLowerCase();
+
+    // Local UX shortcut: chained intent
+    // "vom aktuellen Ort zur nächsten Tankstelle und dann weiter zum Flughafen ..."
+    // If we already have a tankstelle destination in #to, keep it as waypoint and route onward.
+    try {
+      const fromEl = document.getElementById('from');
+      const toEl = document.getElementById('to');
+      const chainedFuelToDestination = (prompt || '').trim().match(/(?:ich\s+meinte|gemeint|vom\s+aktuellen\s+ort|von\s+meinem\s+standort|von\s+hier|vom\s+standort).*(?:n(?:ä|ae)chst\w*\s+tankstelle).*(?:und\s+dann\s+)?weiter(?:\s+(?:zum|zur|nach))\s+(.+)$/i);
+      if (chainedFuelToDestination && fromEl && toEl) {
+        const finalDestination = (chainedFuelToDestination[1] || '').trim();
+        if (finalDestination) {
+          // Prefer explicit browser location as actual start when available.
+          if (userLocation && typeof userLocation.lat === 'number' && typeof userLocation.lon === 'number') {
+            fromEl.value = `${userLocation.lat.toFixed(6)},${userLocation.lon.toFixed(6)}`;
+          }
+
+          // Preserve current destination (nearest fuel stop) as waypoint for the onward route.
+          const fuelStop = (toEl.value || '').trim();
+          if (fuelStop && fuelStop.toLowerCase() !== finalDestination.toLowerCase()) {
+            const exists = waypoints.some(w => (w && w.input && w.input.value || '').trim().toLowerCase() === fuelStop.toLowerCase());
+            if (!exists) addWaypointWithValue(fuelStop);
+          }
+
+          toEl.value = finalDestination;
+          loadingMsg.innerHTML = `<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">lokal</div>Mehrziel-Route erkannt: <strong>${escapeHtml(fromEl.value || 'Start')}</strong> → <strong>${escapeHtml(fuelStop || 'Tankstelle')}</strong> → <strong>${escapeHtml(finalDestination)}</strong><br/>Berechne Route...`;
+          await compute();
+          const dist = document.getElementById('detailDistance')?.textContent || '';
+          const dur = document.getElementById('detailDuration')?.textContent || '';
+          if (dist || dur) {
+            loadingMsg.innerHTML = `<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">lokal</div>Mehrziel-Route berechnet: <strong>${escapeHtml(dist)}</strong>${dur ? ` • ${escapeHtml(dur)}` : ''}`;
+          }
+          sendBtn.disabled = false;
+          messagesEl.scrollTop = messagesEl.scrollHeight;
+          return;
+        }
+      }
+    } catch (e) { console.warn('chained-fuel shortcut failed', e); }
+
+    // Local UX shortcut: "weiter zum ..." should continue from current destination
+    // and directly compute a new route instead of asking the LLM again.
+    try {
+      const continueMatch = (prompt || '').trim().match(/^(?:und\s+)?weiter(?:\s+(?:zum|zur|nach))?\s+(.+)$/i);
+      const fromEl = document.getElementById('from');
+      const toEl = document.getElementById('to');
+      if (continueMatch && fromEl && toEl && toEl.value.trim()) {
+        const nextDestination = (continueMatch[1] || '').trim();
+        // Guard: this shortcut should only handle short direct continuations.
+        // Longer correction/explanation sentences are handled by other intent branches.
+        const looksLikeSentence = /\b(ich|meinte|vom|von|und dann|zur n|zur naechsten|zur nächsten)\b/i.test(nextDestination) || nextDestination.split(/\s+/).length > 6;
+        if (nextDestination && !looksLikeSentence) {
+          fromEl.value = toEl.value.trim();
+          toEl.value = nextDestination;
+          loadingMsg.innerHTML = `<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">lokal</div>Weiterfahrt: <strong>${escapeHtml(fromEl.value)}</strong> → <strong>${escapeHtml(nextDestination)}</strong><br/>Berechne Route...`;
+          await compute();
+          const dist = document.getElementById('detailDistance')?.textContent || '';
+          const dur = document.getElementById('detailDuration')?.textContent || '';
+          if (dist || dur) {
+            loadingMsg.innerHTML = `<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">lokal</div>Route aktualisiert: <strong>${escapeHtml(dist)}</strong>${dur ? ` • ${escapeHtml(dur)}` : ''}`;
+          }
+          sendBtn.disabled = false;
+          messagesEl.scrollTop = messagesEl.scrollHeight;
+          return;
+        }
+      }
+    } catch (e) { console.warn('continue-route shortcut failed', e); }
+
+    // Local UX shortcut: simple preference confirmations should trigger compute directly.
+    try {
+      const fromEl = document.getElementById('from');
+      const toEl = document.getElementById('to');
+      const isPreferenceOnly = /^(normal|ganz normal|standard|standardroute|schnellste|kürzeste)$/i.test((prompt || '').trim());
+      if (isPreferenceOnly && fromEl && toEl && fromEl.value.trim() && toEl.value.trim()) {
+        loadingMsg.innerHTML = '<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">lokal</div>Präferenz erkannt, berechne Route...';
+        await compute();
+        const dist = document.getElementById('detailDistance')?.textContent || '';
+        const dur = document.getElementById('detailDuration')?.textContent || '';
+        if (dist || dur) {
+          loadingMsg.innerHTML = `<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">lokal</div>Route berechnet: <strong>${escapeHtml(dist)}</strong>${dur ? ` • ${escapeHtml(dur)}` : ''}`;
+        }
+        sendBtn.disabled = false;
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        return;
+      }
+    } catch (e) { console.warn('preference shortcut failed', e); }
+
+    // Local UX shortcut: "Route auf der Karte anzeigen" / "ausgeben" should use existing
+    // map route first, and only compute when no route is currently displayed.
+    try {
+      const showRouteIntent = /(route.*(karte|anzeigen|zeige|einblenden)|auf der karte anzeigen|route anzeigen|ausgeben|abbiegehinweise|abbiegehinweis|anweisungen)/i.test(lowerPrompt);
+      const fromEl = document.getElementById('from');
+      const toEl = document.getElementById('to');
+      if (showRouteIntent) {
+        if (polyline) {
+          map.fitBounds(polyline.getBounds(), { padding: [40, 40] });
+          const dist = document.getElementById('detailDistance')?.textContent || '';
+          const dur = document.getElementById('detailDuration')?.textContent || '';
+          loadingMsg.innerHTML = `<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">lokal</div>Route auf der Karte angezeigt${dist || dur ? `: <strong>${escapeHtml(dist)}</strong>${dur ? ` • ${escapeHtml(dur)}` : ''}` : ''}`;
+          sendBtn.disabled = false;
+          messagesEl.scrollTop = messagesEl.scrollHeight;
+          return;
+        }
+        if (fromEl && toEl && fromEl.value.trim() && toEl.value.trim()) {
+          loadingMsg.innerHTML = '<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">lokal</div>Keine aktive Route, berechne jetzt...';
+          await compute();
+          const dist = document.getElementById('detailDistance')?.textContent || '';
+          const dur = document.getElementById('detailDuration')?.textContent || '';
+          loadingMsg.innerHTML = `<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">lokal</div>Route berechnet und angezeigt${dist || dur ? `: <strong>${escapeHtml(dist)}</strong>${dur ? ` • ${escapeHtml(dur)}` : ''}` : ''}`;
+          sendBtn.disabled = false;
+          messagesEl.scrollTop = messagesEl.scrollHeight;
+          return;
+        }
+      }
+    } catch (e) { console.warn('show-route shortcut failed', e); }
+
+    // If user issues a correction/negation asking for recalculation, trigger a fresh compute
+    try {
+      const correctionRE = /\b(falsch|nein|nö|nicht richtig|nicht korrekt|korrigier|korrigiere|noch ?mal|erneut|rechn(e|et|ung)|berechne|neu berechnen|neu berechnen)\b/i;
+      if (correctionRE.test(lowerPrompt)) {
+        loadingMsg.innerHTML = '<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">lokal</div>Berechne Route neu...';
+        try {
+          await compute();
+        } catch (e) { console.warn('recompute failed', e); }
+        sendBtn.disabled = false;
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        return;
+      }
+    } catch (e) {}
     if ((lowerPrompt.includes('wie lange') || lowerPrompt.includes('dauert') || lowerPrompt.includes('wie lang')) && lastAIResponse && lastAIResponse.route) {
       // show assistant quick reply with duration/distance
       const meta = lastAIResponse.route;
@@ -1498,6 +1908,31 @@ async function sendAIQuery() {
       return;
     }
 
+    // First, try the lightweight local agent retrieval which handles nearest-X queries.
+    try {
+      const agentPayload = Object.assign({}, payload, { session: getAISessionId() });
+      const agentRes = await fetch('/api/v1/agent/query', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(agentPayload) });
+      if (agentRes && agentRes.ok) {
+        const agentData = await agentRes.json();
+        if (agentData && Array.isArray(agentData.actions) && agentData.actions.length) {
+          // detect noop-only
+          const meaningful = agentData.actions.some(a => (a.type && a.type !== 'noop') || (a.Type && a.Type !== 'noop'));
+          if (meaningful) {
+            // ensure session id
+            if (agentData.session_id) setAISessionId(agentData.session_id);
+            loadingMsg.innerHTML = '<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">lokaler Agent</div>Aktionen werden ausgeführt...';
+            await executeAgentActions(agentData.actions, agentData.session_id || getAISessionId());
+            sendBtn.disabled = false;
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+            return;
+          }
+        }
+      }
+    } catch (e) {
+      // non-fatal: fall back to full AI query
+      console.warn('local agent query failed:', e);
+    }
+
     const res = await fetch('/api/v1/ai/query', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
@@ -1510,8 +1945,15 @@ async function sendAIQuery() {
     }
     
     const data = await res.json();
+    // persist session id from AI responses for multi-turn requests
+    try {
+      if (data && (data.session_id || data.sessionId || data.SessionID)) {
+        setAISessionId(data.session_id || data.sessionId || data.SessionID);
+      }
+    } catch (e) {}
     // remember for follow-ups
     try { lastAIResponse = data; } catch(e){}
+    // Build the base message text first; we'll append route info below if present.
     loadingMsg.innerHTML = `<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">${escapeHtml(data.provider)}/${escapeHtml(data.model)}</div>${escapeHtml(data.response)}`;
     // If the AI returned a computed route, render it on the map and fill inputs
     try {
@@ -1521,11 +1963,21 @@ async function sendAIQuery() {
         try {
           const fromEl = document.getElementById('from');
           const toEl = document.getElementById('to');
-          if (fromEl && data.from && data.from.query) fromEl.value = data.from.query;
-          if (toEl && data.to && data.to.query) toEl.value = data.to.query;
+          if (fromEl && data.from && (data.from.query || data.from.label)) fromEl.value = data.from.query || data.from.label;
+          if (toEl && data.to && (data.to.query || data.to.label)) toEl.value = data.to.query || data.to.label;
         } catch (e) {}
         setMapsLinks(data.route.google_maps_url || data.route.googleMapsURL || '', data.route.apple_maps_url || data.route.appleMapsURL || '');
-        showToast('KI: Route berechnet und angezeigt', 'success', 1800);
+        // Append a compact route summary badge to the message
+        try {
+          const distKm = data.route.distance_m > 0 ? (data.route.distance_m / 1000).toFixed(1) + ' km' : '';
+          const durMin = data.route.duration_s > 0 ? Math.round(data.route.duration_s / 60) : 0;
+          const durText = durMin >= 60 ? Math.floor(durMin/60) + 'h ' + (durMin%60) + 'min' : (durMin > 0 ? durMin + ' min' : '');
+          const parts = [distKm, durText].filter(Boolean).join(' • ');
+          if (parts) {
+            loadingMsg.innerHTML += `<div style="margin-top:8px;padding:6px 10px;border-radius:6px;background:rgba(110,242,160,0.12);border:1px solid rgba(110,242,160,0.3);font-size:12px;color:#6ef2a0;">✅ Route berechnet: <strong>${parts}</strong></div>`;
+          }
+        } catch (_e) {}
+        showToast(`KI: Route ${(data.route.distance_m/1000).toFixed(1)} km berechnet`, 'success', 2000);
       }
       // If the AI returned suggestions (multiple POI matches), show them on the map
       if (data && data.suggestions && Array.isArray(data.suggestions) && data.suggestions.length) {

@@ -2,7 +2,7 @@
 <html lang="de">
   <head>
     <meta charset="utf-8" />
-    <title>OSMmini — modern UI</title>
+    <title>OSMmini</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="app-version" content="{{.Version}}">
     <meta name="theme-color" content="#050d1f">
@@ -13,62 +13,201 @@
     <link rel="stylesheet" href="/static/style.css?v={{.Version}}" />
     <script id="initialSettings" type="application/json">{{.Settings}}</script>
     <style>
-      /* Critical CSS for instant rendering */
       body { margin: 0; background: #050d1f; }
-      .spinner-page { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); 
-        width: 48px; height: 48px; border: 4px solid rgba(77,163,255,0.2); 
-        border-top-color: #4da3ff; border-radius: 50%; 
-        animation: spin 1s linear infinite; z-index: 9999; }
-      @keyframes spin { to { transform: translate(-50%, -50%) rotate(360deg); } }
+      .spinner-page {
+        position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
+        width: 44px; height: 44px;
+        border: 3px solid rgba(77,163,255,0.15);
+        border-top-color: #4da3ff;
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+        z-index: 9999;
+      }
+      @keyframes spin { to { transform: translate(-50%,-50%) rotate(360deg); } }
     </style>
   </head>
   <body>
     <div id="pageSpinner" class="spinner-page"></div>
-    <div class="app" style="opacity:0;transition:opacity 0.3s ease;">
+    <div class="app" style="opacity:0;transition:opacity 0.25s ease;">
+
       <aside class="sidebar">
+
+        <!-- ── Header ── -->
         <div class="header">
-          <div class="header-top">
+          <div class="logo">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="10"/>
+              <polyline points="12 8 8 12 12 16"/>
+              <line x1="16" y1="12" x2="8" y2="12"/>
+            </svg>
             <h1>OSMmini</h1>
-            <div style="display:flex; gap:8px; align-items:center">
-              <button id="useLocationBtn" class="btn btn-sm btn-outline" title="Use my location" aria-label="Use my location">📍 Mein Standort</button>
-              <button id="themeToggle" class="theme-toggle" title="Toggle Dark/Light Mode" aria-label="Theme toggle">🌙</button>
-            </div>
           </div>
-          <p class="tag">Offline Routing</p>
+          <div class="header-actions">
+            <button id="useLocationBtn" class="btn-icon" title="Meinen Standort verwenden" aria-label="Standort verwenden">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/><circle cx="12" cy="12" r="9" opacity=".25"/></svg>
+            </button>
+            <button id="themeToggle" class="btn-icon" title="Design wechseln" aria-label="Theme wechseln">
+              <svg id="themeIconMoon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg>
+              <svg id="themeIconSun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+            </button>
+          </div>
         </div>
 
+        <!-- ── Route card ── -->
         <section class="card route-card">
-          <h2>Route</h2>
-          <div class="input-group" id="from-group">
-            <label>Start</label>
-            <div id="from-suggest" class="suggest"></div>
-            <div id="from-container"></div>
+
+          <div class="route-inputs">
+            <!-- From -->
+            <div class="route-input-row" id="from-group">
+              <div class="route-dot route-dot-start"></div>
+              <div class="route-input-wrap">
+                <div id="from-suggest" class="suggest"></div>
+                <div id="from-container"></div>
+              </div>
+            </div>
+
+            <!-- Connector + swap -->
+            <div class="route-connector-row">
+              <div class="route-connector-line"></div>
+              <button id="swapFromTo" class="btn-swap" title="Start und Ziel tauschen" aria-label="Tauschen">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/><polyline points="5 12 12 5 19 12" style="transform:rotate(180deg);transform-origin:50% 50%"/></svg>
+              </button>
+            </div>
+
+            <!-- Waypoints -->
+            <div id="waypointsContainer" class="waypoints"></div>
+
+            <!-- To -->
+            <div class="route-input-row" id="to-group">
+              <div class="route-dot route-dot-end"></div>
+              <div class="route-input-wrap">
+                <div id="to-suggest" class="suggest"></div>
+                <div id="to-container"></div>
+              </div>
+            </div>
           </div>
 
-          <div id="waypointsContainer" class="waypoints"></div>
-          
-          <button id="addWaypoint" class="btn btn-sm btn-outline">+ Zwischenstopp</button>
+          <!-- Add waypoint -->
+          <button id="addWaypoint" class="btn-add-wp">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            Zwischenstopp
+          </button>
 
-          <div class="input-group" id="to-group">
-            <label>Ziel</label>
-            <div id="to-suggest" class="suggest"></div>
-            <div id="to-container"></div>
+          <!-- Compute row -->
+          <div class="compute-row">
+            <button id="go" class="btn btn-primary">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              Route berechnen
+            </button>
+            <button id="clear" class="btn btn-ghost" title="Zurücksetzen" aria-label="Reset">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-3.5"/></svg>
+            </button>
           </div>
 
-          <div class="actions">
-            <button id="go" class="btn btn-primary">Route berechnen</button>
-            <button id="clear" class="btn btn-secondary">Reset</button>
+          <!-- Status bar -->
+          <div class="status-bar">
+            <span id="status" role="status" aria-live="polite" class="status-text">Bereit</span>
+            <div id="spinner" class="spinner" aria-hidden="true" style="display:none"></div>
+          </div>
+
+          <!-- Route result (shown after compute) -->
+          <div id="routeDetails" class="route-details" style="display:none">
+            <div class="route-stats">
+              <div class="stat-pill">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+                <span id="detailDistance">—</span>
+              </div>
+              <div class="stat-pill">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                <span id="detailDuration">—</span>
+              </div>
+              <div class="stat-pill">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+                <span id="detailETA">—</span>
+              </div>
+              <div class="stat-pill stat-pill-engine">
+                <span id="detailEngine">—</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Route action buttons -->
+          <div class="route-actions" id="routeActions" style="display:none">
+            <button id="zoomToRoute" class="btn btn-action" title="Route einpassen">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+              Einpassen
+            </button>
+            <button id="clearRoute" class="btn btn-action" title="Route löschen">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>
+              Löschen
+            </button>
+            <button id="exportRoute" class="btn btn-action" title="Route exportieren">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              Export
+            </button>
+          </div>
+
+          <!-- External links -->
+          <div class="external-links">
+            <a id="gmaps" class="link-ext" href="#" target="_blank" rel="noopener" style="display:none">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0118 0z"/><circle cx="12" cy="10" r="3"/></svg>
+              Google Maps
+            </a>
+            <a id="amaps" class="link-ext" href="#" target="_blank" rel="noopener" style="display:none">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0118 0z"/><circle cx="12" cy="10" r="3"/></svg>
+              Apple Maps
+            </a>
+          </div>
+
+          <!-- Distance (compat, hidden — content shown in route-stats above) -->
+          <div id="distance" style="display:none"></div>
+
+          <!-- Maneuvers -->
+          <div id="maneuvers" class="maneuvers" style="display:none"></div>
+
+          <!-- Stop list -->
+          <div id="stopList" class="stop-list"></div>
+
+        </section>
+
+        <!-- ── AI Assistant card ── -->
+        <section class="card ai-card collapsed" id="aiCard">
+          <div class="card-header" id="aiCardHeader">
+            <div class="card-header-left">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 9h6M9 12h6M9 15h4"/></svg>
+              <h2>KI-Assistent</h2>
+            </div>
+            <div style="display:flex;align-items:center;gap:6px">
+              <span id="aiStatusBadge" class="status-badge" style="display:none"></span>
+              <button id="aiToggle" class="btn-collapse" aria-expanded="false" title="Ein-/ausklappen">›</button>
+            </div>
+          </div>
+          <div class="card-body" id="aiBody" style="display:none">
+            <div id="aiStatus" class="ai-status-bar"></div>
+            <div id="aiModelSelect" class="ai-model-select" style="display:none">
+              <select id="aiModel" class="setting-select"></select>
+            </div>
+            <div id="aiMessages" class="ai-messages"></div>
+            <div class="ai-input-row">
+              <input id="aiPrompt" type="text" placeholder="Frage zur Route oder Navigation…" autocomplete="off" autocorrect="off" spellcheck="false"/>
+              <button id="aiSend" class="btn-send" disabled title="Senden">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+              </button>
+            </div>
           </div>
         </section>
 
+        <!-- ── Settings card ── -->
         <section class="card settings-card collapsed" id="settingsCard">
           <div class="card-header">
-            <h2>⚙️ Einstellungen</h2>
-            <button id="settingsToggle" class="btn btn-sm btn-outline" aria-expanded="false">›</button>
+            <div class="card-header-left">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93l-1.41 1.41M4.93 19.07l-1.41 1.41M20 12h-2M6 12H4M19.07 19.07l-1.41-1.41M4.93 4.93l1.41 1.41M12 20v-2M12 6V4"/></svg>
+              <h2>Einstellungen</h2>
+            </div>
+            <button id="settingsToggle" class="btn-collapse" aria-expanded="false">›</button>
           </div>
           <div class="card-body" id="settingsBody" style="display:none">
-            
-            <!-- Routing Configuration -->
+
             <div class="settings-section">
               <div class="section-header">
                 <span class="section-icon">🚗</span>
@@ -76,63 +215,43 @@
               </div>
               <div class="settings-grid">
                 <div class="setting-item">
-                  <label class="setting-label" title="Fahrzeugprofil">
-                    Profil
-                    <span class="info-icon" title="Wähle ein Fahrprofil passend zum Fahrzeug/Nutzer">ⓘ</span>
-                  </label>
-                  <select id="profile" class="setting-select">
-                    <option value="">— Benutzerdefiniert —</option>
-                    <!-- populated by JS from /api/v1/profiles -->
-                  </select>
+                  <label class="setting-label" title="Fahrzeugprofil">Profil <span class="info-icon" title="Passend zum Fahrzeug/Nutzer">ⓘ</span></label>
+                  <select id="profile" class="setting-select"><option value="">— Standard —</option></select>
                 </div>
                 <div class="setting-item">
-                  <label class="setting-label" title="Algorithmus für Pfadfindung">
-                    Engine
-                    <span class="info-icon" title="A* ist schnell und optimal, CH ist sehr schnell bei großen Graphen">ⓘ</span>
-                  </label>
+                  <label class="setting-label">Engine <span class="info-icon" title="A* schnell, CH sehr schnell">ⓘ</span></label>
                   <select id="engine" class="setting-select">
-                    <option value="astar">⚡ A* (schnell)</option>
-                    <option value="dijkstra">🔍 Dijkstra (exakt)</option>
-                    <option value="dijkstra-node">📊 Dijkstra Node</option>
-                    <option value="ch">🚀 CH (sehr schnell)</option>
+                    <option value="astar">A* (schnell)</option>
+                    <option value="dijkstra">Dijkstra (exakt)</option>
+                    <option value="dijkstra-node">Dijkstra Node</option>
+                    <option value="ch">CH (sehr schnell)</option>
                   </select>
                 </div>
                 <div class="setting-item">
-                  <label class="setting-label" title="Optimierungsziel">
-                    Ziel
-                    <span class="info-icon" title="Distanz = kürzeste Strecke, Dauer = schnellste Route">ⓘ</span>
-                  </label>
+                  <label class="setting-label">Ziel <span class="info-icon" title="Kürzeste Strecke oder schnellste Zeit">ⓘ</span></label>
                   <select id="objective" class="setting-select">
-                    <option value="distance">📏 Distanz</option>
-                    <option value="duration">⏱️ Dauer</option>
-                    <option value="economy">⛽ Ökonomie</option>
+                    <option value="distance">Distanz</option>
+                    <option value="duration">Dauer</option>
+                    <option value="economy">Ökonomie</option>
                   </select>
                 </div>
               </div>
             </div>
 
-            <!-- Trip Options -->
             <div class="settings-section">
-              <div class="section-header">
-                <span class="section-icon">🗺️</span>
-                <h3>Trip-Optionen</h3>
-              </div>
-              <label class="checkbox switch" title="Stopps automatisch in optimaler Reihenfolge anordnen">
+              <div class="section-header"><span class="section-icon">🗺️</span><h3>Trip-Optionen</h3></div>
+              <label class="checkbox switch" title="Stopps automatisch optimieren">
                 <input id="optimize" type="checkbox" checked role="switch" aria-checked="true"/>
                 <span>Reihenfolge optimieren</span>
               </label>
-              <label class="checkbox switch" title="Erweiterte Gewichtung für Abbiegemanöver">
+              <label class="checkbox switch">
                 <input id="pro" type="checkbox" role="switch" aria-checked="false"/>
                 <span>Erweiterte Gewichte</span>
               </label>
             </div>
 
-            <!-- Pro Weights -->
             <div id="weights" class="settings-section weights hidden">
-              <div class="section-header">
-                <span class="section-icon">⚖️</span>
-                <h3>Abbiegegewichte</h3>
-              </div>
+              <div class="section-header"><span class="section-icon">⚖️</span><h3>Abbiegegewichte</h3></div>
               <div class="settings-grid">
                 <div class="setting-item">
                   <label class="setting-label">Linksabbiegen (s)</label>
@@ -143,59 +262,41 @@
                   <input id="w_right" type="number" step="0.5" min="0" max="60" class="setting-input"/>
                 </div>
                 <div class="setting-item">
-                  <label class="setting-label">Ampelstrafe (s)
-                    <span class="info-icon" title="Zeitstrafe pro Kreuzung mit Ampel">ⓘ</span>
-                  </label>
+                  <label class="setting-label">Ampelstrafe (s) <span class="info-icon" title="Zeitstrafe pro Ampelkreuzung">ⓘ</span></label>
                   <input id="w_traffic_light" type="number" step="1" min="0" max="120" class="setting-input"/>
                 </div>
               </div>
-              <label class="checkbox switch" title="Linksabbiegen vermeiden (no-left-turn Routing)">
+              <label class="checkbox switch">
                 <input id="noLeftTurn" type="checkbox" role="switch" aria-checked="false"/>
                 <span>Linksabbiegen vermeiden</span>
               </label>
             </div>
 
-            <!-- Emergency / BOS Mode -->
             <div class="settings-section">
-              <div class="section-header">
-                <span class="section-icon">🚒</span>
-                <h3>BOS / Einsatzmodus</h3>
-              </div>
-              <label class="checkbox switch" title="Einsatzfahrt: Höhere Geschwindigkeiten, Vorrang an Kreuzungen">
+              <div class="section-header"><span class="section-icon">🚒</span><h3>BOS / Einsatzmodus</h3></div>
+              <label class="checkbox switch">
                 <input id="emergencyMode" type="checkbox" role="switch" aria-checked="false"/>
                 <span>Einsatzmodus (Feuerwehr, Rettung)</span>
               </label>
-              <p style="font-size:11px; color:var(--text-muted); margin-top:8px; opacity:0.7;">
-                🔵 Höhere Geschwindigkeiten, optimiert für Einsatzfahrzeuge
-              </p>
             </div>
 
-            <!-- Map / Tile Source -->
             <div class="settings-section collapsible" id="mapSection">
               <div class="section-header clickable" id="mapHeader">
-                <span class="section-icon">🗺️</span>
-                <h3>Kartenquelle</h3>
+                <span class="section-icon">🗺️</span><h3>Kartenquelle</h3>
                 <span class="collapse-indicator">›</span>
               </div>
               <div id="mapSettings" style="display:none">
                 <div class="settings-grid">
                   <div class="setting-item">
-                    <label class="setting-label" title="Vordefinierte Kartenquellen">
-                      Preset
-                      <span class="info-icon" title="Wähle eine vordefinierte Kartenquelle aus">ⓘ</span>
-                    </label>
-                    <select id="tilePreset" class="setting-select">
-                      <option value="">— Benutzerdefiniert —</option>
-                    </select>
+                    <label class="setting-label">Preset <span class="info-icon" title="Vordefinierte Kartenquelle">ⓘ</span></label>
+                    <select id="tilePreset" class="setting-select"><option value="">— Benutzerdefiniert —</option></select>
                   </div>
                   <div class="setting-item">
-                    <label class="setting-label" title="Kartentyp: Raster (Leaflet), Vektor (MapLibre GL) oder WMS">
-                      Kartentyp
-                    </label>
+                    <label class="setting-label">Kartentyp</label>
                     <select id="mapType" class="setting-select">
-                      <option value="raster">🖼️ Raster (Leaflet)</option>
-                      <option value="vector">✨ Vektor (MapLibre GL)</option>
-                      <option value="wms">🌍 WMS</option>
+                      <option value="raster">Raster (Leaflet)</option>
+                      <option value="vector">Vektor (MapLibre GL)</option>
+                      <option value="wms">WMS</option>
                     </select>
                   </div>
                   <div class="setting-item" id="upstreamRow">
@@ -203,7 +304,7 @@
                     <input id="tileUpstream" type="text" class="setting-input" placeholder="https://…/{z}/{x}/{y}.png"/>
                   </div>
                   <div class="setting-item" id="styleUrlRow" style="display:none">
-                    <label class="setting-label">Style-URL (MapLibre GL)</label>
+                    <label class="setting-label">Style-URL</label>
                     <input id="tileStyleUrl" type="text" class="setting-input" placeholder="https://…/style.json"/>
                   </div>
                   <div class="setting-item" id="wmsLayersRow" style="display:none">
@@ -218,97 +319,48 @@
               </div>
             </div>
 
-            <!-- Highway Types -->
             <div class="settings-section collapsible" id="highwaySection">
               <div class="section-header clickable" id="highwayHeader">
-                <span class="section-icon">🛣️</span>
-                <h3>Erlaubte Straßentypen</h3>
+                <span class="section-icon">🛣️</span><h3>Erlaubte Straßentypen</h3>
                 <span class="collapse-indicator">›</span>
               </div>
-              <div id="allowedHighways" class="allowed-highways" style="display:none">
-                <!-- checkboxes inserted by JS -->
-              </div>
+              <div id="allowedHighways" class="allowed-highways" style="display:none"></div>
             </div>
 
-            <!-- Speed Defaults -->
             <div class="settings-section collapsible" id="speedSection">
               <div class="section-header clickable" id="speedHeader">
-                <span class="section-icon">🚦</span>
-                <h3>Standardgeschwindigkeiten</h3>
+                <span class="section-icon">🚦</span><h3>Standardgeschwindigkeiten</h3>
                 <span class="collapse-indicator">›</span>
               </div>
-              <div id="speedDefaults" class="speed-defaults" style="display:none">
-                <!-- inputs inserted by JS -->
-              </div>
+              <div id="speedDefaults" class="speed-defaults" style="display:none"></div>
             </div>
 
-            <!-- Action Buttons -->
             <div class="settings-actions">
-              <button id="save" class="btn btn-primary">💾 Speichern</button>
-              <button id="resetSettings" class="btn btn-secondary">🔄 Zurücksetzen</button>
+              <button id="save" class="btn btn-primary">Speichern</button>
+              <button id="resetSettings" class="btn btn-ghost">Zurücksetzen</button>
             </div>
           </div>
         </section>
 
-        <section class="card stops-card">
-          <h2>Ergebnis</h2>
-          <div id="info" class="info">
-            <div id="status" role="status" aria-live="polite">Bereit</div>
-            <div id="spinner" class="spinner" aria-hidden="true" title="Loading" style="display:none"></div>
-            <div id="distance"></div>
-            <div id="routeDetails" class="route-details" style="display:none">
-              <div class="detail-row"><span class="detail-label">Distanz:</span><span id="detailDistance"></span></div>
-              <div class="detail-row"><span class="detail-label">Dauer:</span><span id="detailDuration"></span></div>
-              <div class="detail-row"><span class="detail-label">ETA:</span><span id="detailETA"></span></div>
-              <div class="detail-row"><span class="detail-label">Engine:</span><span id="detailEngine"></span></div>
-            </div>
-            <div class="route-actions" id="routeActions" style="display:none">
-              <button id="zoomToRoute" class="btn btn-sm btn-outline" title="Route einpassen">🔍 Zoom</button>
-              <button id="clearRoute" class="btn btn-sm btn-outline" title="Route löschen">✕ Route</button>
-              <button id="exportRoute" class="btn btn-sm btn-outline" title="Route exportieren">💾 Export</button>
-            </div>
-            <div id="maneuvers" class="maneuvers" style="display:none; margin-top:8px;"></div>
-            <div class="external-links">
-                <a id="gmaps" class="link" href="#" target="_blank" style="display:none">📍 Google Maps</a>
-                <a id="amaps" class="link" href="#" target="_blank" style="display:none">🗺️ Apple Maps</a>
-            </div>
-          </div>
-          <div id="stopList" class="stop-list"></div>
-        </section>
-        
+        <!-- ── Help card ── -->
         <section class="card help-card collapsed" id="helpCard">
           <div class="card-header">
-            <h2>⌨️ Shortcuts</h2>
-            <button id="helpToggle" class="btn btn-sm btn-outline" aria-expanded="false">›</button>
+            <div class="card-header-left">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+              <h2>Shortcuts</h2>
+            </div>
+            <button id="helpToggle" class="btn-collapse" aria-expanded="false">›</button>
           </div>
           <div class="card-body" id="helpBody" style="display:none">
             <div class="shortcut-list">
-              <div class="shortcut-item"><kbd>Cmd/Ctrl + Enter</kbd> <span>Route berechnen</span></div>
-              <div class="shortcut-item"><kbd>Esc</kbd> <span>Suche schließen</span></div>
-              <div class="shortcut-item"><kbd>↑ ↓</kbd> <span>Suche navigieren</span></div>
-              <div class="shortcut-item"><kbd>Rechtsklick</kbd> <span>Marker löschen</span></div>
+              <div class="shortcut-item"><kbd>Cmd/Ctrl+Enter</kbd><span>Route berechnen</span></div>
+              <div class="shortcut-item"><kbd>Esc</kbd><span>Suche schließen</span></div>
+              <div class="shortcut-item"><kbd>↑ ↓</kbd><span>Suche navigieren</span></div>
+              <div class="shortcut-item"><kbd>Rechtsklick</kbd><span>Marker löschen</span></div>
             </div>
           </div>
         </section>
 
-        <section class="card ai-card collapsed" id="aiCard">
-          <div class="card-header">
-            <h2>🤖 KI-Assistent</h2>
-            <button id="aiToggle" class="btn btn-sm btn-outline" aria-expanded="false">›</button>
-          </div>
-          <div class="card-body" id="aiBody" style="display:none">
-            <div id="aiStatus" style="font-size:12px; color:var(--text-muted); margin-bottom:8px;">Prüfe KI-Verfügbarkeit...</div>
-            <div id="aiModelSelect" style="margin-bottom:8px; display:none;">
-              <label class="setting-label">Modell</label>
-              <select id="aiModel" class="setting-select"></select>
-            </div>
-            <div id="aiMessages" class="ai-messages" style="max-height:200px; overflow-y:auto; margin-bottom:8px;"></div>
-            <div style="display:flex; gap:6px;">
-              <input id="aiPrompt" type="text" placeholder="Frage zur Route oder Navigation..." style="flex:1;" autocomplete="off"/>
-              <button id="aiSend" class="btn btn-primary btn-sm" disabled>Senden</button>
-            </div>
-          </div>
-        </section>
       </aside>
 
       <main id="map" class="map"></main>
@@ -317,75 +369,66 @@
     <script>
       (function(){
         const localCss = '/static/leaflet/leaflet.css';
-        const cdnCss = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
-        const localJs = '/static/leaflet/leaflet.js';
-        const cdnJs = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+        const cdnCss   = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+        const localJs  = '/static/leaflet/leaflet.js';
+        const cdnJs    = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
 
         function loadCss(href){
-          return new Promise((resolve,reject)=>{
-            const l = document.createElement('link');
-            l.rel = 'stylesheet'; l.href = href;
-            l.onload = ()=>resolve(href);
-            l.onerror = ()=>reject(href);
-            document.head.appendChild(l);
-          });
+          return new Promise((res,rej)=>{ const l=document.createElement('link'); l.rel='stylesheet'; l.href=href; l.onload=()=>res(href); l.onerror=()=>rej(href); document.head.appendChild(l); });
         }
-
         function loadScript(src){
-          return new Promise((resolve,reject)=>{
-            const s = document.createElement('script');
-            s.src = src; s.defer = true;
-            s.onload = ()=>resolve(src);
-            s.onerror = ()=>reject(src);
-            document.head.appendChild(s);
-          });
+          return new Promise((res,rej)=>{ const s=document.createElement('script'); s.src=src; s.defer=true; s.onload=()=>res(src); s.onerror=()=>rej(src); document.head.appendChild(s); });
         }
 
-        // Try local CSS first, then CDN
         loadCss(localCss).catch(()=>loadCss(cdnCss)).catch(()=>{});
 
-        // Load Leaflet (local preferred) then MarkerCluster then app.js
-        loadScript(localJs).catch(()=>loadScript(cdnJs)).then(() => {
-          // markercluster CSS/JS (optional; used if available)
-          const mcCss1 = '/static/leaflet/MarkerCluster.css';
-          const mcCss2 = '/static/leaflet/MarkerCluster.Default.css';
-          const mcJsLocal = '/static/leaflet/leaflet.markercluster.js';
-          const mcJsCDN = 'https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js';
-          // try to load markercluster CSS (local first)
+        loadScript(localJs).catch(()=>loadScript(cdnJs)).then(()=>{
+          const mcCss1  = '/static/leaflet/MarkerCluster.css';
+          const mcCss2  = '/static/leaflet/MarkerCluster.Default.css';
+          const mcJsLoc = '/static/leaflet/leaflet.markercluster.js';
+          const mcJsCdn = 'https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js';
           loadCss(mcCss1).catch(()=>loadCss('https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css')).catch(()=>{});
           loadCss(mcCss2).catch(()=>loadCss('https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css')).catch(()=>{});
-          // try to load markercluster JS, then app
-          loadScript(mcJsLocal).catch(()=>loadScript(mcJsCDN)).finally(()=>{
-            const app = document.createElement('script');
-            app.src = '/static/app.js?v={{.Version}}';
-            app.defer = true;
-            document.head.appendChild(app);
+          loadScript(mcJsLoc).catch(()=>loadScript(mcJsCdn)).finally(()=>{
+            const a=document.createElement('script'); a.src='/static/app.js?v={{.Version}}'; a.defer=true; document.head.appendChild(a);
           });
-        }).catch(() => {
-          // if both leaflet loads fail, still load app.js so it can show errors
-          const app = document.createElement('script');
-          app.src = '/static/app.js?v={{.Version}}';
-          app.defer = true;
-          document.head.appendChild(app);
+        }).catch(()=>{
+          const a=document.createElement('script'); a.src='/static/app.js?v={{.Version}}'; a.defer=true; document.head.appendChild(a);
         });
       })();
 
-      // Initialize immediately when DOM is ready and hide spinner when ready
-      document.addEventListener('DOMContentLoaded', () => {
-        const spinner = document.getElementById('pageSpinner');
-        const app = document.querySelector('.app');
-        const checkReady = setInterval(() => {
-          if (window.L && window.initializeApp) {
-            clearInterval(checkReady);
-            if (spinner) spinner.style.display = 'none';
-            if (app) app.style.opacity = '1';
+      document.addEventListener('DOMContentLoaded',()=>{
+        const spinner=document.getElementById('pageSpinner');
+        const app=document.querySelector('.app');
+        const t=setInterval(()=>{
+          if(window.L && window.initializeApp){
+            clearInterval(t);
+            if(spinner) spinner.style.display='none';
+            if(app) app.style.opacity='1';
           }
-        }, 50);
-        // Fallback to hide spinner after 5s
-        setTimeout(() => {
-          if (spinner) spinner.style.display = 'none';
-          if (app) app.style.opacity = '1';
-        }, 5000);
+        },50);
+        setTimeout(()=>{ if(spinner) spinner.style.display='none'; if(app) app.style.opacity='1'; }, 5000);
+
+        // Swap from/to button
+        document.getElementById('swapFromTo')?.addEventListener('click',()=>{
+          const f=document.getElementById('from');
+          const t=document.getElementById('to');
+          if(f && t){ const v=f.value; f.value=t.value; t.value=v; }
+        });
+
+        // SVG theme icons
+        const root=document.documentElement;
+        function syncThemeIcons(){
+          const light=root.classList.contains('light-mode');
+          const moon=document.getElementById('themeIconMoon');
+          const sun=document.getElementById('themeIconSun');
+          if(moon) moon.style.display=light?'none':'block';
+          if(sun)  sun.style.display=light?'block':'none';
+        }
+        syncThemeIcons();
+        document.getElementById('themeToggle')?.addEventListener('click',()=>{
+          setTimeout(syncThemeIcons,10);
+        });
       });
     </script>
   </body>

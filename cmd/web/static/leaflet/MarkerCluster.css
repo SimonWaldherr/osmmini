@@ -1,0 +1,8 @@
+/* Minimal placeholder for MarkerCluster styles used by the demo UI.
+   This is intentionally small and provides only basic visuals so the
+   app can load local assets during development. For full features,
+   include the upstream Leaflet.markercluster CSS from the project.
+*/
+.marker-cluster-small { background-color: rgba(51,136,255,0.6); border-radius: 20px; color: white; padding: 4px 8px; font-weight: 700; }
+.marker-cluster-medium { background-color: rgba(77,163,255,0.7); border-radius: 22px; color: white; padding: 6px 10px; font-weight: 700; }
+.marker-cluster-large { background-color: rgba(0,120,200,0.8); border-radius: 24px; color: white; padding: 8px 12px; font-weight: 700; }
