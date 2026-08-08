@@ -39,6 +39,9 @@ paths:
                 $ref: "#/components/schemas/Settings"
     put:
       summary: Update settings
+      description: "Unauthenticated by default. If the server is started with -admin-token (or OSMMINI_ADMIN_TOKEN), a matching Authorization: Bearer token header is required."
+      security:
+        - bearerAuth: []
       requestBody:
         required: true
         content:
@@ -58,6 +61,70 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid admin token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /api/v1/tinytiles/build:
+    get:
+      summary: Get local tinyTiles build status
+      responses:
+        "200":
+          description: Current build state; contains no local filesystem paths
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TinyTilesBuildStatus"
+    post:
+      summary: Build or replace the local tinyTiles artifact from the loaded PBF
+      description: Requires the same administrator token as settings updates. The request starts an asynchronous build and returns immediately.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TinyTilesBuildRequest"
+      responses:
+        "202":
+          description: Build accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TinyTilesBuildStatus"
+        "400":
+          description: Invalid zoom range or unavailable PBF
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid administrator token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: Another build is already running
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /api/v1/tile-sources:
+    get:
+      summary: List built-in map-source presets
+      responses:
+        "200":
+          description: Map-source presets
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TileSourcePreset"
   /api/v1/search:
     get:
       summary: Address and street search
@@ -132,6 +199,11 @@ paths:
               schema:
                 type: string
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
   schemas:
     Error:
       type: object
@@ -283,3 +355,47 @@ components:
             cache_dir: { type: string }
             upstream: { type: string }
             user_agent: { type: string }
+            map_type: { type: string, enum: [raster, raster-direct, vector, wms] }
+            style_url: { type: string, format: uri-reference }
+            wms_layers: { type: string }
+            attribution: { type: string }
+            max_zoom: { type: integer, minimum: 0, maximum: 22 }
+            mem_cache_size: { type: integer, minimum: 0 }
+    TileSourcePreset:
+      type: object
+      required: [id, label, map_type, attribution]
+      properties:
+        id: { type: string }
+        label: { type: string }
+        map_type: { type: string, enum: [raster, raster-direct, vector, wms] }
+        upstream: { type: string }
+        style_url: { type: string, format: uri-reference }
+        wms_layers: { type: string }
+        attribution: { type: string }
+        max_zoom: { type: integer, minimum: 0, maximum: 22 }
+    TinyTilesBuildRequest:
+      type: object
+      properties:
+        min_zoom: { type: integer, minimum: 5, maximum: 14, default: 5 }
+        max_zoom: { type: integer, minimum: 5, maximum: 14, default: 14 }
+    TinyTilesBuildStatus:
+      type: object
+      required: [state, phase, progress]
+      properties:
+        state: { type: string, enum: [idle, building, ready, failed] }
+        phase:
+          type: string
+          enum: [idle, preparing, generating, importing, finalizing, activating, processing, ready, failed]
+          description: Public build phase; does not expose local paths or tinyTiles internals.
+        progress:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: Monotonic overall build progress. During the importing phase it follows the completed tinyTiles import rows.
+        message: { type: string }
+        error: { type: string, description: Public, path-free failure message }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+        artifact: { type: string, description: Artifact file name only }
+        min_zoom: { type: integer }
+        max_zoom: { type: integer }

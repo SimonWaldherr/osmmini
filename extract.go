@@ -32,12 +32,16 @@ func Extract(r io.Reader, opts Options, cb Callbacks) error {
 	wantHighway := cb.HighwayWay != nil
 
 	// IMPORTANT:
-	// Nodes must still be processed if cb.Node is set, even if no address callback is used.
-	// Otherwise Router building (which relies on cb.Node) silently builds an empty graph.
-	wantNode := cb.Node != nil || cb.AddressNode != nil
+	// Nodes must still be processed if any node callback is set, even if no
+	// address callback is used. Otherwise router building (which relies on
+	// cb.Node) and POI extraction (which relies on cb.TaggedNode) silently
+	// miss all nodes.
+	wantNode := cb.Node != nil || cb.AddressNode != nil || cb.TaggedNode != nil
 
 	wantAddrWay := cb.AddressWay != nil
+	wantTaggedWay := cb.TaggedWay != nil
 	wantAddrRel := cb.AddressRelation != nil
+	wantTaggedRel := cb.TaggedRelation != nil
 
 	br := bufio.NewReaderSize(r, 1<<20)
 
@@ -55,7 +59,7 @@ func Extract(r io.Reader, opts Options, cb Callbacks) error {
 			// HeaderBlock is not needed for our extraction/filtering.
 			continue
 		case "OSMData":
-			if err := processOSMData(raw, wantHighway, wantNode, wantAddrWay, wantAddrRel, opts, cb); err != nil {
+			if err := processOSMData(raw, wantHighway, wantNode, wantAddrWay, wantTaggedWay, wantAddrRel, wantTaggedRel, opts, cb); err != nil {
 				return err
 			}
 		default:
@@ -285,7 +289,7 @@ func parseAndDecompressBlob(b []byte) ([]byte, error) {
 
 // ---- OSMData: PrimitiveBlock / PrimitiveGroup ----
 
-func processOSMData(raw []byte, wantHighway, wantNode, wantAddrWay, wantAddrRel bool, opts Options, cb Callbacks) error {
+func processOSMData(raw []byte, wantHighway, wantNode, wantAddrWay, wantTaggedWay, wantAddrRel, wantTaggedRel bool, opts Options, cb Callbacks) error {
 	ctx := blockCtx{
 		granularity: 100,
 		latOffset:   0,
@@ -373,7 +377,7 @@ func processOSMData(raw []byte, wantHighway, wantNode, wantAddrWay, wantAddrRel 
 	}
 
 	for _, g := range groups {
-		if err := processPrimitiveGroup(g, ctx, wantHighway, wantNode, wantAddrWay, wantAddrRel, opts, cb); err != nil {
+		if err := processPrimitiveGroup(g, ctx, wantHighway, wantNode, wantAddrWay, wantTaggedWay, wantAddrRel, wantTaggedRel, opts, cb); err != nil {
 			return err
 		}
 	}
@@ -418,7 +422,7 @@ func parseStringTable(raw []byte) ([]string, error) {
 	return st, nil
 }
 
-func processPrimitiveGroup(raw []byte, ctx blockCtx, wantHighway, wantNode, wantAddrWay, wantAddrRel bool, opts Options, cb Callbacks) error {
+func processPrimitiveGroup(raw []byte, ctx blockCtx, wantHighway, wantNode, wantAddrWay, wantTaggedWay, wantAddrRel, wantTaggedRel bool, opts Options, cb Callbacks) error {
 	i := 0
 	for i < len(raw) {
 		tag, err := readUvarint(raw, &i)
@@ -465,7 +469,7 @@ func processPrimitiveGroup(raw []byte, ctx blockCtx, wantHighway, wantNode, want
 			if err != nil {
 				return err
 			}
-			if wantHighway || wantAddrWay {
+			if wantHighway || wantAddrWay || wantTaggedWay {
 				if err := processWay(msg, ctx, wantHighway, wantAddrWay, opts, cb); err != nil {
 					return err
 				}
@@ -479,7 +483,7 @@ func processPrimitiveGroup(raw []byte, ctx blockCtx, wantHighway, wantNode, want
 			if err != nil {
 				return err
 			}
-			if wantAddrRel {
+			if wantAddrRel || wantTaggedRel {
 				if err := processRelation(msg, ctx, opts, cb); err != nil {
 					return err
 				}
@@ -583,15 +587,27 @@ func processNode(raw []byte, ctx blockCtx, opts Options, cb Callbacks) error {
 		}
 	}
 
-	if cb.AddressNode == nil {
+	if cb.AddressNode == nil && cb.TaggedNode == nil {
 		return nil
 	}
 
-	isAddr, err := scanKeys(keysSegs, ctx.st, false, true)
-	if err != nil {
-		return err
+	isAddr := false
+	if cb.AddressNode != nil {
+		var err error
+		isAddr, err = scanKeys(keysSegs, ctx.st, false, true)
+		if err != nil {
+			return err
+		}
 	}
-	if !isAddr {
+	taggedCandidate := cb.TaggedNode != nil
+	if taggedCandidate && opts.TaggedNodeKey != nil {
+		var err error
+		taggedCandidate, err = hasMatchingKey(keysSegs, ctx.st, opts.TaggedNodeKey)
+		if err != nil {
+			return err
+		}
+	}
+	if !isAddr && !taggedCandidate {
 		return nil
 	}
 
@@ -600,12 +616,23 @@ func processNode(raw []byte, ctx blockCtx, opts Options, cb Callbacks) error {
 		return err
 	}
 
-	return cb.AddressNode(Node{
+	n := Node{
 		ID:   id,
 		Lat:  latDeg,
 		Lon:  lonDeg,
 		Tags: tags,
-	})
+	}
+	if isAddr && cb.AddressNode != nil {
+		if err := cb.AddressNode(n); err != nil {
+			return err
+		}
+	}
+	if taggedCandidate && len(tags) > 0 {
+		if err := cb.TaggedNode(n); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func processDenseNodes(raw []byte, ctx blockCtx, opts Options, cb Callbacks) error {
@@ -718,7 +745,7 @@ func processDenseNodes(raw []byte, ctx blockCtx, opts Options, cb Callbacks) err
 			}
 		}
 
-		if cb.AddressNode == nil {
+		if cb.AddressNode == nil && cb.TaggedNode == nil {
 			continue
 		}
 		if kvIdx >= len(keysVals) {
@@ -732,6 +759,7 @@ func processDenseNodes(raw []byte, ctx blockCtx, opts Options, cb Callbacks) err
 
 		pairs := make([][2]int32, 0, 8)
 		isAddr := false
+		taggedCandidate := cb.TaggedNode != nil && opts.TaggedNodeKey == nil
 
 		for {
 			if kvIdx >= len(keysVals) {
@@ -750,14 +778,17 @@ func processDenseNodes(raw []byte, ctx blockCtx, opts Options, cb Callbacks) err
 
 			pairs = append(pairs, [2]int32{k, v})
 
-			if !isAddr && int(k) >= 0 && int(k) < len(ctx.st) {
+			if cb.AddressNode != nil && !isAddr && int(k) >= 0 && int(k) < len(ctx.st) {
 				if strings.HasPrefix(ctx.st[k], "addr:") {
 					isAddr = true
 				}
 			}
+			if cb.TaggedNode != nil && !taggedCandidate && opts.TaggedNodeKey != nil && int(k) >= 0 && int(k) < len(ctx.st) && opts.TaggedNodeKey(ctx.st[k]) {
+				taggedCandidate = true
+			}
 		}
 
-		if !isAddr {
+		if !isAddr && !taggedCandidate {
 			continue
 		}
 
@@ -775,13 +806,21 @@ func processDenseNodes(raw []byte, ctx blockCtx, opts Options, cb Callbacks) err
 			tags[k] = ctx.st[vi]
 		}
 
-		if err := cb.AddressNode(Node{
+		n := Node{
 			ID:   idAcc,
 			Lat:  latDeg,
 			Lon:  lonDeg,
 			Tags: tags,
-		}); err != nil {
-			return err
+		}
+		if isAddr && cb.AddressNode != nil {
+			if err := cb.AddressNode(n); err != nil {
+				return err
+			}
+		}
+		if taggedCandidate && len(tags) > 0 {
+			if err := cb.TaggedNode(n); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -872,12 +911,16 @@ func processWay(raw []byte, ctx blockCtx, wantHighway, wantAddrWay bool, opts Op
 		isHighway, isAddr = h, a
 	}
 
-	if !isHighway && !isAddr {
-		// Even when not highway/address, we may still want ways that have
-		// arbitrary tags requested by the caller (e.g., landuse, amenity).
-		// Defer to buildTags to determine if any tags pass KeepTag and
-		// emit via TaggedWay callback when present.
-		// continue below to build tags for that purpose.
+	taggedCandidate := cb.TaggedWay != nil
+	if taggedCandidate && opts.TaggedWayKey != nil {
+		var err error
+		taggedCandidate, err = hasMatchingKey(keysSegs, ctx.st, opts.TaggedWayKey)
+		if err != nil {
+			return err
+		}
+	}
+	if !isHighway && !isAddr && !taggedCandidate {
+		return nil
 	}
 
 	tags, err := buildTags(keysSegs, valsSegs, ctx.st, opts.KeepTag)
@@ -907,7 +950,7 @@ func processWay(raw []byte, ctx blockCtx, wantHighway, wantAddrWay bool, opts Op
 	}
 	// If the way carries any tags that the caller asked to keep, expose it
 	// to TaggedWay so higher-level code can index POIs or area ways.
-	if cb.TaggedWay != nil && len(tags) > 0 {
+	if taggedCandidate && len(tags) > 0 {
 		if err := cb.TaggedWay(w); err != nil {
 			return err
 		}
@@ -1015,11 +1058,27 @@ func processRelation(raw []byte, ctx blockCtx, opts Options, cb Callbacks) error
 		return nil
 	}
 
-	// Determine whether relation has addr keys (old behavior) but always
-	// attempt to build tags when TaggedRelation is requested.
-	isAddr, err := scanKeys(keysSegs, ctx.st, false, true)
-	if err != nil {
-		return err
+	// Determine whether the relation has address tags for the legacy callback.
+	// TaggedRelation is independent of address tags and receives relations with
+	// at least one tag accepted by Options.KeepTag.
+	isAddr := false
+	if cb.AddressRelation != nil {
+		var err error
+		isAddr, err = scanKeys(keysSegs, ctx.st, false, true)
+		if err != nil {
+			return err
+		}
+	}
+	taggedCandidate := cb.TaggedRelation != nil
+	if taggedCandidate && opts.TaggedRelationKey != nil {
+		var err error
+		taggedCandidate, err = hasMatchingKey(keysSegs, ctx.st, opts.TaggedRelationKey)
+		if err != nil {
+			return err
+		}
+	}
+	if !isAddr && !taggedCandidate {
+		return nil
 	}
 
 	tags, err := buildTags(keysSegs, valsSegs, ctx.st, opts.KeepTag)
@@ -1027,8 +1086,7 @@ func processRelation(raw []byte, ctx blockCtx, opts Options, cb Callbacks) error
 		return err
 	}
 
-	// If neither address relation nor tagged relation is wanted, skip.
-	if !isAddr && cb.TaggedRelation == nil && cb.AddressRelation == nil {
+	if !isAddr && len(tags) == 0 {
 		return nil
 	}
 
@@ -1078,11 +1136,22 @@ func processRelation(raw []byte, ctx blockCtx, opts Options, cb Callbacks) error
 		}
 	}
 
-	return cb.AddressRelation(Relation{
+	r := Relation{
 		ID:      id,
 		Members: members,
 		Tags:    tags,
-	})
+	}
+	if isAddr && cb.AddressRelation != nil {
+		if err := cb.AddressRelation(r); err != nil {
+			return err
+		}
+	}
+	if taggedCandidate && len(tags) > 0 {
+		if err := cb.TaggedRelation(r); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ---- Tag / Key helpers ----
@@ -1090,6 +1159,29 @@ func processRelation(raw []byte, ctx blockCtx, opts Options, cb Callbacks) error
 func scanKeys(keysSegs [][]byte, st []string, wantHighway, wantAddr bool) (bool, error) {
 	_, addr, err := scanWayKeys(keysSegs, st, wantHighway, wantAddr)
 	return addr, err
+}
+
+// hasMatchingKey checks compact PBF key segments without building a full tag
+// map. It lets callers avoid decoding node references or values for entities
+// that cannot match their tagged-entity index.
+func hasMatchingKey(keysSegs [][]byte, st []string, match func(string) bool) (bool, error) {
+	if match == nil {
+		return true, nil
+	}
+	for _, seg := range keysSegs {
+		j := 0
+		for j < len(seg) {
+			v, err := readUvarint(seg, &j)
+			if err != nil {
+				return false, err
+			}
+			idx := int(v)
+			if idx >= 0 && idx < len(st) && match(st[idx]) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 func scanWayKeys(keysSegs [][]byte, st []string, wantHighway, wantAddr bool) (highway bool, addr bool, err error) {

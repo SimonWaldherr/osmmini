@@ -15,11 +15,14 @@
   },
   "tiles": {
     "cache_dir": "tiles-cache",
-    "upstream": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+    "upstream": "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
     "user_agent": "osmmini-routerd/1.0 (offline routing)",
-    "map_type": "raster",
-    "attribution": "© OpenStreetMap contributors"
+    "map_type": "raster-direct",
+    "attribution": "© OpenStreetMap contributors © CARTO",
+    "max_zoom": 19
   },
+  "ai": {},
+  "save_poi_cache": true,
   "default_highway_speeds": {
     "motorway": 150
   }

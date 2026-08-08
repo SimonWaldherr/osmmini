@@ -1,0 +1,15 @@
+{
+  "routing": {
+    "engine": "astar",
+    "objective": "duration",
+    "pro": false
+  },
+  "tiles": {
+    "cache_dir": "tiles-cache-tinytiles",
+    "map_type": "vector",
+    "style_url": "/static/styles/tinytiles-minimal.json",
+    "attribution": "© OpenStreetMap contributors",
+    "max_zoom": 14
+  },
+  "save_poi_cache": true
+}

@@ -5,7 +5,10 @@ let preloadedSettings = null;
 try {
   const settingsEl = document.getElementById('initialSettings');
   if (settingsEl) {
-    preloadedSettings = JSON.parse(settingsEl.textContent);
+    const parsed = JSON.parse(settingsEl.textContent);
+    // Accept pages served by older server binaries too: they embedded a
+    // pre-marshaled JSON string, which html/template encoded once more.
+    preloadedSettings = typeof parsed === 'string' ? JSON.parse(parsed) : parsed;
   }
 } catch (e) {
   console.warn('Failed to load preloaded settings:', e);
@@ -21,6 +24,7 @@ function syncInputClearState(inputId) {
 
 const map = L.map('map').setView([48.7, 12.7], 10);
 let currentTileLayer = null;
+let tileLayerGeneration = 0;
 let userLocationMarker = null;
 let userLocation = null; // {lat, lon} from browser geolocation (explicit user permission)
 let searchResultMarkers = [];
@@ -29,60 +33,288 @@ let searchResultCluster = null;
 // Dynamic script/css loader helpers (used for MapLibre GL lazy-loading)
 function _loadScript(src) {
   return new Promise((resolve, reject) => {
-    if (document.querySelector(`script[src="${src}"]`)) { resolve(); return; }
+    const existing = document.querySelector(`script[src="${src}"]`);
+    if (existing?.dataset.loadState === 'loaded') { resolve(); return; }
+    if (existing) existing.remove();
     const s = document.createElement('script');
     s.src = src;
-    s.onload = resolve; s.onerror = reject;
+    s.onload = () => { s.dataset.loadState = 'loaded'; resolve(); };
+    s.onerror = () => { s.remove(); reject(new Error(`Could not load ${src}`)); };
     document.head.appendChild(s);
   });
 }
 function _loadCss(href) {
-  if (document.querySelector(`link[href="${href}"]`)) return;
-  const l = document.createElement('link');
-  l.rel = 'stylesheet'; l.href = href;
-  document.head.appendChild(l);
+  return new Promise((resolve, reject) => {
+    const existing = document.querySelector(`link[href="${href}"]`);
+    if (existing?.dataset.loadState === 'loaded') { resolve(); return; }
+    if (existing) existing.remove();
+    const l = document.createElement('link');
+    l.rel = 'stylesheet'; l.href = href;
+    l.onload = () => { l.dataset.loadState = 'loaded'; resolve(); };
+    l.onerror = () => { l.remove(); reject(new Error(`Could not load ${href}`)); };
+    document.head.appendChild(l);
+  });
 }
 function _loadMapLibreGL() {
   if (window.maplibregl && window.L && L.maplibreGL) return Promise.resolve();
-  _loadCss('https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css');
-  return _loadScript('https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js')
-    .then(() => _loadScript('https://unpkg.com/@maplibre/maplibre-gl-leaflet@0.0.20/leaflet-maplibre-gl.js'));
+  // Prefer a locally vendored copy (see `make maplibre-assets`, used for the
+  // fully offline tinyTiles profile) and fall back to the CDN otherwise, so
+  // the vector map works out of the box without a vendoring step.
+  const cdnCss = 'https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css';
+  const cdnJs = 'https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js';
+  const cdnAdapter = 'https://unpkg.com/@maplibre/maplibre-gl-leaflet@0.0.20/leaflet-maplibre-gl.js';
+  return _loadCss('/static/maplibre/maplibre-gl.css').catch(() => _loadCss(cdnCss))
+    .then(() => _loadScript('/static/maplibre/maplibre-gl.js').catch(() => _loadScript(cdnJs)))
+    .then(() => _loadScript('/static/maplibre/leaflet-maplibre-gl.js').catch(() => _loadScript(cdnAdapter)));
 }
 
-// Apply a tile/map layer from settings. Removes the old layer first.
-async function applyTileLayer(settings) {
-  if (currentTileLayer) { map.removeLayer(currentTileLayer); }
-  currentTileLayer = null;
-  const tiles = (settings && settings.tiles) || {};
-  const mapType = tiles.map_type || 'raster';
-  const attribution = tiles.attribution || '';
+function supportsWebGL() {
+  try {
+    const canvas = document.createElement('canvas');
+    return !!(window.WebGLRenderingContext &&
+      (canvas.getContext('webgl') || canvas.getContext('experimental-webgl')));
+  } catch (_) {
+    return false;
+  }
+}
 
-  if (mapType === 'vector' && tiles.style_url) {
+// Legacy Bayern vector configurations occasionally only contain a style URL.
+// The official vector service has a matching WMTS base map, so use it directly
+// as a last-resort browser fallback while the server migrates the configuration
+// and resumes proxying it on the next request/restart.
+function bayernRasterFallback(tiles) {
+  let style;
+  try {
+    style = new URL(tiles.style_url);
+  } catch (_) {
+    return null;
+  }
+  if (style.hostname.toLowerCase() !== 'vtod1.bayernwolke.de' ||
+      !style.pathname.startsWith('/styles/by_style_')) {
+    return null;
+  }
+  const isAerial = style.pathname.toLowerCase().includes('luftbild');
+  return {
+    url: isAerial
+      ? 'https://wmtsod1.bayernwolke.de/wmts/by_dop/smerc/{z}/{x}/{y}'
+      : 'https://wmtsod1.bayernwolke.de/wmts/by_webkarte/smerc/{z}/{x}/{y}',
+    attribution: escapeHtml('© Datenquellen: Bayerische Vermessungsverwaltung, GeoBasis-DE / BKG 2023 – Daten verändert'),
+  };
+}
+
+// Direct raster sources are intentionally loaded by the browser rather than
+// through /tiles. This preserves normal browser request metadata for public
+// tile services and keeps their traffic out of the application's cache proxy.
+// The hostname check also repairs older settings files that still describe the
+// standard OSM source as plain "raster".
+function usesDirectRaster(mapType, tiles) {
+  if (mapType === 'raster-direct') return true;
+  try {
+    return new URL(tiles.upstream).hostname.toLowerCase() === 'tile.openstreetmap.org';
+  } catch (_) {
+    return false;
+  }
+}
+
+function updateMapModeUI(tiles = {}) {
+  const context = document.querySelector('.workspace-context');
+  const icon = document.getElementById('mapModeIcon');
+  const title = document.getElementById('mapModeTitle');
+  const meta = document.getElementById('mapModeMeta');
+  if (!context || !icon || !title || !meta) return;
+
+  const styleURL = String(tiles.style_url || '');
+  const upstream = String(tiles.upstream || '');
+  const isTinyTiles = styleURL === '/static/styles/tinytiles-minimal.json';
+  const isBavaria = styleURL.includes('bayernwolke.de') || upstream.includes('bayernwolke.de') || upstream.includes('geoservices.bayern.de');
+  context.dataset.mode = isTinyTiles ? 'offline' : isBavaria ? 'bayern' : 'online';
+
+  if (isTinyTiles) {
+    icon.textContent = '📦';
+    title.textContent = 'Offline-Karte aktiv';
+    meta.textContent = 'tinyTiles + Routing: lokale PBF.';
+  } else if (isBavaria) {
+    icon.textContent = '⌖';
+    title.textContent = 'Bayern-Karte aktiv';
+    meta.textContent = 'BayernAtlas · Routing: lokale PBF.';
+  } else {
+    icon.textContent = '◌';
+    title.textContent = 'Online-Karte aktiv';
+    meta.textContent = 'Routing & Suche: lokale PBF.';
+  }
+}
+
+// Use a compact, non-secret fingerprint for browser-cache namespacing. Passing
+// a raw upstream URL here could expose custom service tokens in browser/server
+// logs; the server independently derives its own cache namespace.
+function tileSourceCacheKey(mapType, tiles) {
+  const source = [mapType, tiles.upstream || '', tiles.wms_layers || ''].join('\u001f');
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let i = 0; i < source.length; i++) {
+    const code = source.charCodeAt(i);
+    h1 = Math.imul(h1 ^ code, 2654435761);
+    h2 = Math.imul(h2 ^ code, 1597334677);
+  }
+  return `${(h1 >>> 0).toString(36)}-${(h2 >>> 0).toString(36)}`;
+}
+
+// Let a committed map change reach the next paint. Source-specific readiness
+// checks live below; this only handles the last browser frame.
+function waitForMapLayerPaint() {
+  return new Promise((resolve) => {
+    window.requestAnimationFrame(() => window.requestAnimationFrame(resolve));
+  });
+}
+
+function waitForMapLibreLayer(layer, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    const glMap = layer?.getMaplibreMap?.();
+    if (!glMap) { resolve(false); return; }
+    let done = false;
+    const finish = (ready) => {
+      if (done) return;
+      done = true;
+      window.clearTimeout(timeout);
+      resolve(ready);
+    };
+    const timeout = window.setTimeout(() => finish(false), timeoutMs);
+    if (glMap.loaded?.()) {
+      finish(true);
+      return;
+    }
+    glMap.once?.('idle', () => finish(true));
+    glMap.once?.('error', () => finish(false));
+  });
+}
+
+function waitForRasterLayer(layer, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    let done = false;
+    let loadedTiles = 0;
+    let failedTiles = 0;
+    const finish = (ready) => {
+      if (done) return;
+      done = true;
+      window.clearTimeout(timeout);
+      layer.off?.('tileload', onTileLoad);
+      layer.off?.('tileerror', onTileError);
+      layer.off?.('load', onLoad);
+      resolve(ready);
+    };
+    const onTileLoad = () => { loadedTiles += 1; };
+    const onTileError = () => {
+      failedTiles += 1;
+      // A single retry/error should not discard a source that has working
+      // neighbours. Several failed tiles without one success is conclusive.
+      if (loadedTiles === 0 && failedTiles >= 3) finish(false);
+    };
+    const onLoad = () => finish(loadedTiles > 0);
+    const timeout = window.setTimeout(() => finish(loadedTiles > 0), timeoutMs);
+    layer.on?.('tileload', onTileLoad);
+    layer.on?.('tileerror', onTileError);
+    layer.on?.('load', onLoad);
+  });
+}
+
+async function activateRasterLayer(layer, generation) {
+  const previous = currentTileLayer;
+  layer.addTo(map);
+  const ready = await waitForRasterLayer(layer);
+  if (!ready || generation !== tileLayerGeneration) {
+    map.removeLayer(layer);
+    return false;
+  }
+  if (previous && previous !== layer) map.removeLayer(previous);
+  currentTileLayer = layer;
+  await waitForMapLayerPaint();
+  return true;
+}
+
+// Apply a tile/map layer from settings.  MapLibre/assets are prepared before
+// replacing the old layer, so a failed switch leaves the visible map intact.
+// A temporary source preview goes directly to the selected provider: the
+// server-side cache deliberately only knows the persisted source configuration.
+async function applyTileLayer(settings, { directPreview = false } = {}) {
+  const generation = ++tileLayerGeneration;
+  const tiles = (settings && settings.tiles) || {};
+  const mapType = (tiles.map_type || 'raster').toLowerCase();
+  const attribution = escapeHtml(tiles.attribution || '');
+  const maxZoom = Number.isInteger(tiles.max_zoom) && tiles.max_zoom > 0 ? tiles.max_zoom : 19;
+  const directRaster = directPreview || usesDirectRaster(mapType, tiles);
+
+  // The query component gives the browser cache a source-specific URL. The
+  // server independently namespaces L1/L2 by the same render-relevant fields.
+  // This prevents an OSM tile from being reused after switching to BayernAtlas.
+  const proxyURL = '/tiles/{z}/{x}/{y}.png?source=' + tileSourceCacheKey(mapType, tiles);
+
+  if (mapType === 'vector' && tiles.style_url && supportsWebGL()) {
     try {
       await _loadMapLibreGL();
-      currentTileLayer = L.maplibreGL({ style: tiles.style_url, attribution }).addTo(map);
-      return;
+      if (generation !== tileLayerGeneration) return false;
+      const previous = currentTileLayer;
+      const layer = L.maplibreGL({ style: tiles.style_url, attribution }).addTo(map);
+      const ready = await waitForMapLibreLayer(layer);
+      if (!ready || generation !== tileLayerGeneration) {
+        map.removeLayer(layer);
+        return false;
+      }
+      if (previous && previous !== layer) map.removeLayer(previous);
+      currentTileLayer = layer;
+      await waitForMapLayerPaint();
+      updateMapModeUI(tiles);
+      return true;
     } catch (e) {
       console.warn('MapLibre GL load failed, falling back to raster tiles', e);
     }
-  } else if (mapType === 'wms' && tiles.upstream) {
-    currentTileLayer = L.tileLayer.wms(tiles.upstream, {
+  } else if (mapType === 'vector' && tiles.style_url) {
+    console.warn('WebGL is unavailable, falling back to raster tiles');
+  }
+
+  if (generation !== tileLayerGeneration) return false;
+  if (mapType === 'wms' && tiles.upstream && directPreview) {
+    const layer = L.tileLayer.wms(tiles.upstream, {
       layers: tiles.wms_layers || '',
       format: 'image/png',
       transparent: false,
       attribution,
-      maxZoom: 18,
-    }).addTo(map);
-    return;
+      maxZoom,
+      updateWhenIdle: true,
+      updateWhenZooming: false,
+      keepBuffer: 2,
+    }).on('tileerror', () => {
+      console.warn('Map WMS tile could not be loaded');
+    });
+    const applied = await activateRasterLayer(layer, generation);
+    if (applied) updateMapModeUI(tiles);
+    return applied;
   }
-  // Default: raster tiles via the server proxy
-  currentTileLayer = L.tileLayer('/tiles/{z}/{x}/{y}.png', {
-    maxZoom: 19,
-    attribution,
+  const rasterFallback = tiles.upstream
+    ? { url: directRaster ? tiles.upstream : proxyURL, attribution }
+    : bayernRasterFallback(tiles);
+  if (!rasterFallback) {
+    const message = tiles.style_url === '/static/styles/tinytiles-minimal.json'
+      ? 'Die lokale tinyTiles-Karte benötigt WebGL. Bitte WebGL aktivieren oder eine Raster-Kartenquelle auswählen.'
+      : 'Diese Vektorkarte benötigt WebGL oder eine Raster-Fallback-URL. Bitte BayernAtlas WMTS auswählen.';
+    console.error(message);
+    showToast(message, 'error', 7000);
+    return false;
+  }
+  // Proxied raster, WMTS, and WMS sources use the same-origin tile endpoint.
+  // For WMS the server converts the slippy coordinate to GetMap parameters;
+  // direct raster sources are loaded from their own URL instead.
+  const layer = L.tileLayer(rasterFallback.url, {
+    maxZoom,
+    attribution: rasterFallback.attribution,
     updateWhenIdle: true,
     updateWhenZooming: false,
     keepBuffer: 2,
-  }).addTo(map);
+  }).on('tileerror', () => {
+    console.warn('Map tile could not be loaded');
+  });
+  const applied = await activateRasterLayer(layer, generation);
+  if (applied) updateMapModeUI(tiles);
+  return applied;
 }
 
 // Initialize the tile layer from preloaded (server-side) settings
@@ -93,12 +325,52 @@ function showToast(message, type = 'info', duration = 3000) {
   const toast = document.createElement('div');
   toast.className = `toast ${type}`;
   const icon = type === 'success' ? '✅' : type === 'error' ? '❌' : 'ℹ️';
-  toast.innerHTML = `<span style="font-size:18px;">${icon}</span><span>${message}</span>`;
+  const iconEl = document.createElement('span');
+  iconEl.style.fontSize = '18px';
+  iconEl.textContent = icon;
+  const messageEl = document.createElement('span');
+  messageEl.textContent = String(message || '');
+  toast.append(iconEl, messageEl);
   document.body.appendChild(toast);
   setTimeout(() => {
     toast.style.animation = 'toastSlide 0.3s ease reverse';
     setTimeout(() => toast.remove(), 300);
   }, duration);
+}
+
+// A map-level progress affordance is separate from the build status in the
+// settings panel.  It makes a source switch comprehensible even while that
+// panel is collapsed.
+function showTileLoadOverlay({ title = 'Karte wird geladen', message = 'Die Kartenquelle wird vorbereitet.', progress = null, mode = 'online' } = {}) {
+  const overlay = document.getElementById('tileLoadOverlay');
+  if (!overlay) return;
+  const titleEl = document.getElementById('tileLoadTitle');
+  const messageEl = document.getElementById('tileLoadMessage');
+  const iconEl = document.getElementById('tileLoadIcon');
+  const progressEl = document.getElementById('tileLoadProgress');
+  const progressBar = document.getElementById('tileLoadProgressBar');
+  const numericProgress = Number(progress);
+  const determinate = Number.isFinite(numericProgress);
+  const value = Math.max(0, Math.min(100, Math.round(numericProgress)));
+
+  if (titleEl) titleEl.textContent = title;
+  if (messageEl) messageEl.textContent = message;
+  if (iconEl) iconEl.textContent = mode === 'tinytiles' ? '📦' : '◌';
+  if (progressEl) {
+    progressEl.classList.toggle('is-determinate', determinate);
+    progressEl.setAttribute('aria-valuetext', determinate ? `${value} %` : 'Wird geladen');
+    if (determinate) progressEl.setAttribute('aria-valuenow', String(value));
+    else progressEl.removeAttribute('aria-valuenow');
+  }
+  if (progressBar) {
+    progressBar.style.width = determinate ? `${value}%` : '';
+  }
+  overlay.hidden = false;
+}
+
+function hideTileLoadOverlay() {
+  const overlay = document.getElementById('tileLoadOverlay');
+  if (overlay) overlay.hidden = true;
 }
 
 // Use browser geolocation to set 'from' input and center the map
@@ -367,13 +639,29 @@ async function apiGetSettings() {
   });
 }
 
+// Administrative endpoints share the session-only token configured in the
+// settings panel. Keeping this in one helper makes local maintenance actions
+// (such as building a tinyTiles artifact) behave exactly like saving settings.
+function adminAuthHeaders(headers = {}) {
+  // Prefer a token that was just entered in the visible field. This permits a
+  // protected maintenance action before the user has saved unrelated settings.
+  const entered = document.getElementById('adminToken')?.value.trim() || '';
+  const token = entered || sessionStorage.getItem('osmminiAdminToken') || '';
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return headers;
+}
+
 async function apiPutSettings(settings) {
+  const headers = adminAuthHeaders({'Content-Type':'application/json'});
   const res = await fetch('/api/v1/settings', {
     method: 'PUT',
-    headers: {'Content-Type':'application/json'},
+    headers,
     body: JSON.stringify(settings)
   });
-  if (!res.ok) throw new Error('settings save failed');
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `settings save failed (${res.status})`);
+  }
   return res.json();
 }
 
@@ -944,8 +1232,8 @@ function addWaypoint() {
   wrapper.appendChild(removeBtn);
   container.appendChild(wrapper);
   
-  waypoints.push({id, input, wrapper});
-  makeSuggest(id + '-suggest', input);
+  const suggestHandle = makeSuggest(id + '-suggest', input);
+  waypoints.push({id, input, wrapper, suggestHandle});
   
   input.addEventListener('change', debouncedCompute);
   
@@ -974,6 +1262,7 @@ function addWaypointWithValue(val) {
 function removeWaypoint(id) {
   const idx = waypoints.findIndex(w => w.id === id);
   if (idx >= 0) {
+    waypoints[idx].suggestHandle?.destroy();
     waypoints[idx].wrapper.remove();
     waypoints.splice(idx, 1);
     compute();
@@ -1106,9 +1395,18 @@ function makeSuggest(containerId, inputOrId) {
     if (active) active.scrollIntoView({block: 'nearest'});
   }
 
-  document.addEventListener('click', (ev) => {
+  function onDocumentClick(ev) {
     if (!container.contains(ev.target) && ev.target !== input) hide();
-  });
+  }
+  document.addEventListener('click', onDocumentClick);
+
+  return {
+    destroy() {
+      document.removeEventListener('click', onDocumentClick);
+      if (timeout) clearTimeout(timeout);
+      if (ctrl) ctrl.abort();
+    }
+  };
 }
 
 function clearSearchResults() {
@@ -1170,7 +1468,12 @@ function showSearchResultsOnMap(results) {
             const qlat = userLocation ? userLocation.lat : null;
             const qlon = userLocation ? userLocation.lon : null;
             const qs = (qlat !== null && qlon !== null) ? `?lat=${qlat}&lon=${qlon}` : '';
-            const res = await fetch(`/api/v1/poi/${item.id}${qs}`);
+            // Search uses "poi" for way-based POIs and also displays address
+            // and street results. Only entity kinds accepted by the typed API
+            // are encoded; legacy lookup remains useful for the other kinds.
+            const entityKind = item.kind === 'poi' ? 'way' : (['node', 'way', 'relation'].includes(item.kind) ? item.kind : '');
+            const poiPath = entityKind ? `${entityKind}/${item.id}` : String(item.id);
+            const res = await fetch(`/api/v1/poi/${poiPath}${qs}`);
             if (!res.ok) throw new Error('fetch failed');
             const data = await res.json();
             // build info html
@@ -1263,7 +1566,7 @@ function getResultInputValue(item) {
 // simple HTML escaper for suggestion labels
 function escapeHtml(s){
   if(!s) return '';
-  return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+  return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#39;');
 }
 
 // (debounce already defined earlier)
@@ -1386,6 +1689,8 @@ function initializeSettingsUI(s) {
     if (suEl) suEl.value = tiles.style_url || '';
     const wlEl = document.getElementById('wmsLayers');
     if (wlEl) wlEl.value = tiles.wms_layers || '';
+    const mzEl = document.getElementById('tileMaxZoom');
+    if (mzEl) mzEl.value = Number.isInteger(tiles.max_zoom) && tiles.max_zoom > 0 ? tiles.max_zoom : '';
     const atEl = document.getElementById('tileAttribution');
     if (atEl) atEl.value = tiles.attribution || '';
     updateMapTypeVisibility(mt);
@@ -1395,9 +1700,252 @@ function initializeSettingsUI(s) {
     if (keyEl) keyEl.value = ai.openai_api_key || '';
     const urlEl = document.getElementById('openaiBaseUrl');
     if (urlEl) urlEl.value = ai.openai_base_url || '';
+    const adminTokenEl = document.getElementById('adminToken');
+    if (adminTokenEl) adminTokenEl.value = sessionStorage.getItem('osmminiAdminToken') || '';
+    settingsUIReady = true;
+    syncTileSourcePickerFromTiles(tiles);
+    maybeShowMapWelcome();
 }
 
-// Show/hide tile source fields based on selected map type
+// ─── Visual tile-source picker ───────────────────────────────────────────
+// Presets are deliberately represented as accessible cards rather than a
+// select box: their coverage, online/offline behaviour and preview can be
+// understood before changing the live map.
+const tilePreviewCoordinate = { z: 10, x: 544, y: 354 };
+let tilePresets = [];
+let activeTilePresetID = '';
+let activeTileSourceFilter = 'recommended';
+let tilePreviewObserver = null;
+let settingsUIReady = false;
+let tilePresetAPIReady = false;
+
+function tilePresetCategory(preset) {
+  if (preset?.id === 'tinytiles_local') return 'offline';
+  if (String(preset?.id || '').startsWith('bayern_') || preset?.id === 'geodaten_bavaria') return 'bayern';
+  return 'online';
+}
+
+function isRecommendedTilePreset(preset) {
+  return ['tinytiles_local', 'carto_voyager', 'basemap_de', 'bayern_vector_standard'].includes(preset?.id);
+}
+
+function tilePresetKindLabel(preset) {
+  const type = String(preset?.map_type || 'raster').toLowerCase();
+  if (type === 'vector') return 'Vektor';
+  if (type === 'wms') return 'WMS';
+  return 'Raster';
+}
+
+function tilePresetDescription(preset) {
+  if (preset?.id === 'tinytiles_local') return 'Aus deiner PBF – ohne externe Tile-API';
+  if (tilePresetCategory(preset) === 'bayern') return preset.map_type === 'vector' ? 'Bayern · detaillierte Vektorkarte' : 'Bayern · amtliche Karte';
+  if (['carto_voyager', 'carto_light', 'carto_dark'].includes(preset?.id)) return 'Global · zuverlässige Onlinekarte';
+  if (preset?.id === 'basemap_de') return 'Deutschland · amtliche Basiskarte';
+  return 'Online · Kartenquelle des Anbieters';
+}
+
+function tilePresetIcon(preset) {
+  if (preset?.id === 'tinytiles_local') return '📦';
+  if (String(preset?.id || '').includes('luftbild')) return '🛰️';
+  if (preset?.map_type === 'vector') return '◈';
+  if (preset?.map_type === 'wms') return '▦';
+  return '▤';
+}
+
+function tilePresetBadges(preset) {
+  const badges = [];
+  const category = tilePresetCategory(preset);
+  if (category === 'offline') badges.push('Offline');
+  else if (category === 'bayern') badges.push('Bayern');
+  else badges.push('Online');
+  badges.push(tilePresetKindLabel(preset));
+  return badges;
+}
+
+function tilePreviewURL(preset) {
+  if (!preset?.upstream || preset.map_type === 'wms') return '';
+  const { z, x, y } = tilePreviewCoordinate;
+  return preset.upstream
+    .replaceAll('{z}', String(z))
+    .replaceAll('{x}', String(x))
+    .replaceAll('{y}', String(y));
+}
+
+function hydrateTilePreview(image) {
+  if (!image?.dataset.src || image.dataset.loaded === '1') return;
+  image.dataset.loaded = '1';
+  image.src = image.dataset.src;
+  image.addEventListener('error', () => image.closest('.tile-source-preview')?.classList.add('preview-unavailable'), { once: true });
+}
+
+function observeTilePreview(image) {
+  if (!image?.dataset.src) return;
+  if (!('IntersectionObserver' in window)) return;
+  if (!tilePreviewObserver) {
+    tilePreviewObserver = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        if (!entry.isIntersecting) return;
+        hydrateTilePreview(entry.target);
+        tilePreviewObserver?.unobserve(entry.target);
+      });
+    }, { rootMargin: '120px' });
+  }
+  tilePreviewObserver.observe(image);
+}
+
+function hydrateVisibleTilePreviews() {
+  document.querySelectorAll('.tile-source-preview img[data-src]').forEach(hydrateTilePreview);
+}
+
+function createTilePreview(preset) {
+  const preview = document.createElement('span');
+  preview.className = `tile-source-preview tile-source-preview-${String(preset?.map_type || 'raster').toLowerCase()}`;
+  preview.setAttribute('aria-hidden', 'true');
+  const url = tilePreviewURL(preset);
+  if (url) {
+    const image = document.createElement('img');
+    image.alt = '';
+    image.loading = 'lazy';
+    image.decoding = 'async';
+    image.dataset.src = url;
+    preview.appendChild(image);
+    observeTilePreview(image);
+  }
+  const vectorRoad = document.createElement('span');
+  vectorRoad.className = 'tile-preview-road';
+  const vectorWater = document.createElement('span');
+  vectorWater.className = 'tile-preview-water';
+  const vectorBlocks = document.createElement('span');
+  vectorBlocks.className = 'tile-preview-blocks';
+  preview.append(vectorRoad, vectorWater, vectorBlocks);
+  return preview;
+}
+
+function matchingPresetForTiles(tiles = {}) {
+  return tilePresets.find((preset) => preset.style_url && preset.style_url === tiles.style_url) ||
+    tilePresets.find((preset) =>
+      preset.upstream && preset.upstream === tiles.upstream &&
+      (preset.map_type || 'raster') === (tiles.map_type || 'raster') &&
+      (preset.wms_layers || '') === (tiles.wms_layers || '')
+    ) || null;
+}
+
+function syncTileSourcePickerFromTiles(tiles = {}) {
+  activeTilePresetID = matchingPresetForTiles(tiles)?.id || '';
+  renderTileSourceCards();
+  renderWelcomeOnlineCards();
+}
+
+function setTileSourceForm(preset) {
+  const mapType = document.getElementById('mapType');
+  const upstream = document.getElementById('tileUpstream');
+  const style = document.getElementById('tileStyleUrl');
+  const layers = document.getElementById('wmsLayers');
+  const attribution = document.getElementById('tileAttribution');
+  const maxZoom = document.getElementById('tileMaxZoom');
+  if (mapType) mapType.value = preset.map_type || 'raster';
+  if (upstream) upstream.value = preset.upstream || '';
+  if (style) style.value = preset.style_url || '';
+  if (layers) layers.value = preset.wms_layers || '';
+  if (attribution) attribution.value = preset.attribution || '';
+  if (maxZoom) maxZoom.value = Number.isInteger(preset.max_zoom) && preset.max_zoom > 0 ? preset.max_zoom : '';
+  updateMapTypeVisibility(preset.map_type || 'raster');
+}
+
+function setTileSourceAdvancedOpen(open) {
+  const advanced = document.getElementById('tileSourceAdvanced');
+  const toggle = document.getElementById('tileSourceAdvancedToggle');
+  if (!advanced || !toggle) return;
+  advanced.hidden = !open;
+  toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+  toggle.textContent = open ? 'Auswahl schließen' : 'Eigene Quelle';
+}
+
+function sourceSelectionHint(preset = null) {
+  const hint = document.getElementById('tileSourceSelectionHint');
+  if (!hint) return;
+  if (!preset) {
+    hint.textContent = 'Benutzerdefinierte Kartenquelle – bei Bedarf die erweiterten Felder öffnen.';
+    return;
+  }
+  if (preset.id === 'tinytiles_local') {
+    const state = normalizedTinyTilesState(window.tinyTilesLatestStatus?.state);
+    hint.textContent = state === 'ready'
+      ? 'Lokale Offline-Karte ist bereit.'
+      : state === 'building'
+        ? 'Lokale Offline-Karte wird gerade erzeugt.'
+        : 'Wählt die lokale Offline-Karte und startet bei Bedarf deren Erzeugung.';
+    return;
+  }
+  hint.textContent = `${tilePresetDescription(preset)} · Vorschau aktiv, mit „Speichern“ dauerhaft übernehmen.`;
+}
+
+function createTileSourceCard(preset, { compact = false } = {}) {
+  const card = document.createElement('button');
+  card.type = 'button';
+  card.className = compact ? 'tile-source-card tile-source-card-compact' : 'tile-source-card';
+  card.dataset.presetID = preset.id;
+  const active = activeTilePresetID === preset.id;
+  card.classList.toggle('is-active', active);
+  card.setAttribute('aria-pressed', active ? 'true' : 'false');
+
+  card.appendChild(createTilePreview(preset));
+  const body = document.createElement('span');
+  body.className = 'tile-source-card-body';
+  const title = document.createElement('strong');
+  title.textContent = preset.label;
+  const description = document.createElement('small');
+  description.textContent = tilePresetDescription(preset);
+  const badges = document.createElement('span');
+  badges.className = 'tile-source-badges';
+  tilePresetBadges(preset).forEach((label) => {
+    const badge = document.createElement('span');
+    badge.textContent = label;
+    badges.appendChild(badge);
+  });
+  body.append(title, description, badges);
+  card.appendChild(body);
+  const check = document.createElement('span');
+  check.className = 'tile-source-check';
+  check.setAttribute('aria-hidden', 'true');
+  check.textContent = active ? '✓' : tilePresetIcon(preset);
+  card.appendChild(check);
+  card.addEventListener('click', () => { void selectTilePreset(preset, { fromWelcome: compact }); });
+  return card;
+}
+
+function visibleTilePresets() {
+  if (activeTileSourceFilter === 'recommended') return tilePresets.filter(isRecommendedTilePreset);
+  return tilePresets.filter((preset) => tilePresetCategory(preset) === activeTileSourceFilter);
+}
+
+function renderTileSourceCards() {
+  const container = document.getElementById('tileSourceCards');
+  if (!container) return;
+  container.replaceChildren();
+  const presets = visibleTilePresets();
+  if (presets.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'tile-source-empty';
+    empty.textContent = 'Für diese Kategorie ist keine Kartenquelle verfügbar.';
+    container.appendChild(empty);
+  } else {
+    presets.forEach((preset) => container.appendChild(createTileSourceCard(preset)));
+  }
+  container.setAttribute('aria-busy', tilePresets.length === 0 ? 'true' : 'false');
+  sourceSelectionHint(tilePresets.find((preset) => preset.id === activeTilePresetID) || null);
+}
+
+function renderWelcomeOnlineCards() {
+  const container = document.getElementById('mapWelcomeOnlineCards');
+  if (!container) return;
+  container.replaceChildren();
+  const wanted = ['carto_voyager', 'basemap_de', 'bayern_vector_standard'];
+  const choices = wanted.map((id) => tilePresets.find((preset) => preset.id === id)).filter(Boolean);
+  choices.forEach((preset) => container.appendChild(createTileSourceCard(preset, { compact: true })));
+}
+
+// Show/hide custom source fields based on the selected map type.
 function updateMapTypeVisibility(mt) {
   const upstreamRow = document.getElementById('upstreamRow');
   const styleUrlRow = document.getElementById('styleUrlRow');
@@ -1407,66 +1955,639 @@ function updateMapTypeVisibility(mt) {
   if (wmsLayersRow) wmsLayersRow.style.display = (mt === 'wms') ? '' : 'none';
 }
 
-// Tile preset loading from API
+// Read just the map-source fields from the settings form. Keeping this in one
+// place makes preview and save behave identically.
+function tileSettingsFromUI(fallback = {}) {
+  const tiles = { ...fallback };
+  const mtEl = document.getElementById('mapType');
+  if (mtEl) tiles.map_type = mtEl.value;
+  const upEl = document.getElementById('tileUpstream');
+  if (upEl) tiles.upstream = upEl.value.trim();
+  const suEl = document.getElementById('tileStyleUrl');
+  if (suEl) tiles.style_url = suEl.value.trim();
+  const wlEl = document.getElementById('wmsLayers');
+  if (wlEl) tiles.wms_layers = wlEl.value.trim();
+  const mzEl = document.getElementById('tileMaxZoom');
+  if (mzEl) {
+    const maxZoom = Number.parseInt(mzEl.value, 10);
+    tiles.max_zoom = Number.isInteger(maxZoom) && maxZoom > 0 ? maxZoom : 0;
+  }
+  const atEl = document.getElementById('tileAttribution');
+  if (atEl) tiles.attribution = atEl.value;
+  return tiles;
+}
+
+function previewTileSource() {
+  const base = preloadedSettings || {};
+  const preview = { ...base, tiles: tileSettingsFromUI(base.tiles || {}) };
+  return applyTileLayer(preview, { directPreview: true });
+}
+
+function setTileSourceFilter(filter) {
+  activeTileSourceFilter = filter;
+  document.querySelectorAll('.tile-source-filter').forEach((button) => {
+    const active = button.dataset.tileFilter === filter;
+    button.classList.toggle('is-active', active);
+    button.setAttribute('aria-selected', active ? 'true' : 'false');
+  });
+  renderTileSourceCards();
+}
+
+async function selectTilePreset(preset, { fromWelcome = false } = {}) {
+  if (!preset) return;
+  if (preset.id === 'tinytiles_local') {
+    await selectTinyTilesSource({ fromWelcome });
+    return;
+  }
+  const previousPresetID = activeTilePresetID;
+  const previousTiles = tileSettingsFromUI((preloadedSettings || {}).tiles || {});
+  activeTilePresetID = preset.id;
+  setTileSourceForm(preset);
+  setTileSourceAdvancedOpen(false);
+  renderTileSourceCards();
+  sourceSelectionHint(preset);
+  if (fromWelcome) completeMapWelcome('online');
+  showTileLoadOverlay({ title: 'Online-Karte wird geladen', message: `${preset.label} wird vorbereitet.`, mode: 'online' });
+  try {
+    const applied = await previewTileSource();
+    if (!applied) {
+      activeTilePresetID = previousPresetID;
+      setTileSourceForm(previousTiles);
+      renderTileSourceCards();
+      sourceSelectionHint(tilePresets.find((item) => item.id === previousPresetID) || null);
+      throw new Error('Kartenquelle konnte nicht geladen werden; die bisherige Karte bleibt aktiv.');
+    }
+    await waitForMapLayerPaint();
+    showToast('Kartenvorschau geladen – zum Behalten bitte speichern.', 'info', 3500);
+  } catch (error) {
+    console.error('Failed to activate tile source', error);
+    showToast('Kartenquelle konnte nicht aktiviert werden.', 'error', 5000);
+  } finally {
+    hideTileLoadOverlay();
+  }
+}
+
+// ─── First-start map choice ──────────────────────────────────────────────
+// The choice is deliberately remembered only as onboarding completion. The
+// actual server setting still changes only through the explicit Save action.
+const mapWelcomeStorageKey = 'osmmini.map-choice-onboarding-v1';
+let mapWelcomeDeferredThisSession = false;
+
+function mapWelcomeWasCompleted() {
+  try {
+    return Boolean(localStorage.getItem(mapWelcomeStorageKey));
+  } catch (_) {
+    return false;
+  }
+}
+
+function resetMapWelcomeView() {
+  const main = document.getElementById('mapWelcomeMain');
+  const choices = document.getElementById('mapWelcomeOnlineChoices');
+  if (main) main.hidden = false;
+  if (choices) choices.hidden = true;
+}
+
+function maybeShowMapWelcome() {
+  if (!settingsUIReady || !tilePresetAPIReady || mapWelcomeDeferredThisSession || mapWelcomeWasCompleted()) return;
+  const overlay = document.getElementById('mapWelcomeOverlay');
+  const dialog = document.getElementById('mapWelcomeDialog');
+  if (!overlay || !dialog || !overlay.hidden) return;
+  resetMapWelcomeView();
+  overlay.hidden = false;
+  document.body.classList.add('map-welcome-open');
+  window.setTimeout(() => dialog.focus(), 0);
+}
+
+function hideMapWelcome({ defer = false } = {}) {
+  const overlay = document.getElementById('mapWelcomeOverlay');
+  if (overlay) overlay.hidden = true;
+  document.body.classList.remove('map-welcome-open');
+  if (defer) mapWelcomeDeferredThisSession = true;
+}
+
+function completeMapWelcome(choice) {
+  try {
+    localStorage.setItem(mapWelcomeStorageKey, choice || 'chosen');
+  } catch (_) {
+    // The map remains usable in strict privacy modes; the prompt may simply
+    // reappear after a reload.
+  }
+  hideMapWelcome();
+}
+
+function openSettingsSection(headerID, contentID, storageKey) {
+  const settingsBodyEl = document.getElementById('settingsBody');
+  const settingsCardEl = document.getElementById('settingsCard');
+  const settingsToggleEl = document.getElementById('settingsToggle');
+  if (settingsBodyEl) settingsBodyEl.style.display = 'block';
+  settingsCardEl?.classList.remove('collapsed');
+  if (settingsToggleEl) {
+    settingsToggleEl.setAttribute('aria-expanded', 'true');
+    settingsToggleEl.textContent = '‹';
+  }
+  try { localStorage.setItem('settingsOpen', '1'); } catch (_) {}
+
+  const header = document.getElementById(headerID);
+  const content = document.getElementById(contentID);
+  if (content) content.style.display = 'grid';
+  header?.closest('.settings-section')?.classList.add('expanded');
+  try { localStorage.setItem(storageKey, '1'); } catch (_) {}
+}
+
+function showMapSourcePicker(filter = 'recommended') {
+  openSettingsSection('mapHeader', 'mapSettings', 'mapSettingsOpen');
+  setTileSourceFilter(filter);
+  window.setTimeout(() => {
+    document.getElementById('tileSourceCards')?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    hydrateVisibleTilePreviews();
+  }, 0);
+}
+
+function openMapSourcePicker() {
+  completeMapWelcome('online');
+  showMapSourcePicker('online');
+}
+
+document.getElementById('mapWelcomeLater')?.addEventListener('click', () => hideMapWelcome({ defer: true }));
+document.getElementById('openMapSources')?.addEventListener('click', showMapSourcePicker);
+document.getElementById('mapWelcomeOffline')?.addEventListener('click', () => { void selectTinyTilesSource({ fromWelcome: true }); });
+document.getElementById('mapWelcomeOnline')?.addEventListener('click', () => {
+  const main = document.getElementById('mapWelcomeMain');
+  const choices = document.getElementById('mapWelcomeOnlineChoices');
+  if (main) main.hidden = true;
+  if (choices) choices.hidden = false;
+  renderWelcomeOnlineCards();
+  window.setTimeout(hydrateVisibleTilePreviews, 0);
+});
+document.getElementById('mapWelcomeBack')?.addEventListener('click', resetMapWelcomeView);
+document.getElementById('mapWelcomeMoreSources')?.addEventListener('click', openMapSourcePicker);
+document.getElementById('mapWelcomeOverlay')?.addEventListener('click', (event) => {
+  if (event.target === event.currentTarget) hideMapWelcome({ defer: true });
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !document.getElementById('mapWelcomeOverlay')?.hidden) {
+    hideMapWelcome({ defer: true });
+  }
+});
+
+// Tile preset loading from API.
 async function loadTilePresets() {
   try {
     const res = await fetch('/api/v1/tile-sources');
-    if (!res.ok) return;
+    if (!res.ok) throw new Error(`tile preset request failed (${res.status})`);
     const presets = await res.json();
-    const sel = document.getElementById('tilePreset');
-    if (!sel) return;
-    // remove old dynamic options (preserve the blank '— Benutzerdefiniert —' entry)
-    Array.from(sel.options).forEach(o => { if (o.value !== '') o.remove(); });
-    presets.forEach(p => {
-      const opt = document.createElement('option');
-      opt.value = p.id;
-      opt.textContent = p.label;
-      opt.dataset.preset = JSON.stringify(p);
-      sel.appendChild(opt);
-    });
-    // set current selection based on active upstream/style_url
-    const curSettings = preloadedSettings || {};
-    const curTiles = curSettings.tiles || {};
-    const match = presets.find(p =>
-      (p.upstream && p.upstream === curTiles.upstream) ||
-      (p.style_url && p.style_url === curTiles.style_url)
-    );
-    if (match) sel.value = match.id;
-  } catch (e) {
-    console.warn('Failed to load tile presets:', e);
+    tilePresets = Array.isArray(presets) ? presets : [];
+    const curTiles = (preloadedSettings || {}).tiles || {};
+    activeTilePresetID = matchingPresetForTiles(curTiles)?.id || activeTilePresetID;
+    renderTileSourceCards();
+    renderWelcomeOnlineCards();
+  } catch (error) {
+    console.warn('Failed to load tile presets:', error);
+    const container = document.getElementById('tileSourceCards');
+    if (container) {
+      container.replaceChildren();
+      const empty = document.createElement('div');
+      empty.className = 'tile-source-empty';
+      empty.textContent = 'Kartenquellen konnten nicht geladen werden.';
+      container.appendChild(empty);
+      container.setAttribute('aria-busy', 'false');
+    }
+  } finally {
+    tilePresetAPIReady = true;
+    maybeShowMapWelcome();
   }
 }
-loadTilePresets();
+void loadTilePresets();
 
-// Handle map type selector change
+document.getElementById('tileSourceFilters')?.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-tile-filter]');
+  if (button) setTileSourceFilter(button.dataset.tileFilter);
+});
+
+document.getElementById('tileSourceAdvancedToggle')?.addEventListener('click', () => {
+  const advanced = document.getElementById('tileSourceAdvanced');
+  const open = Boolean(advanced?.hidden);
+  setTileSourceAdvancedOpen(open);
+  if (open) {
+    activeTilePresetID = '';
+    renderTileSourceCards();
+    sourceSelectionHint(null);
+  }
+});
+
+document.getElementById('mapHeader')?.addEventListener('click', () => window.setTimeout(hydrateVisibleTilePreviews, 0));
+
+// Handle map type selector change.
 const mapTypeEl = document.getElementById('mapType');
 if (mapTypeEl) {
   mapTypeEl.addEventListener('change', () => updateMapTypeVisibility(mapTypeEl.value));
 }
 
-// Handle tile preset selector change — auto-fill fields
-const tilePresetEl = document.getElementById('tilePreset');
-if (tilePresetEl) {
-  tilePresetEl.addEventListener('change', function() {
-    const opt = this.options[this.selectedIndex];
-    if (!opt || !opt.dataset.preset) return;
-    try {
-      const p = JSON.parse(opt.dataset.preset);
-      const mtEl = document.getElementById('mapType');
-      if (mtEl) mtEl.value = p.map_type || 'raster';
-      const upEl = document.getElementById('tileUpstream');
-      if (upEl) upEl.value = p.upstream || '';
-      const suEl = document.getElementById('tileStyleUrl');
-      if (suEl) suEl.value = p.style_url || '';
-      const wlEl = document.getElementById('wmsLayers');
-      if (wlEl) wlEl.value = p.wms_layers || '';
-      const atEl = document.getElementById('tileAttribution');
-      if (atEl) atEl.value = p.attribution || '';
-      updateMapTypeVisibility(p.map_type || 'raster');
-    } catch (e) {
-      console.warn('Failed to parse preset data:', e);
-    }});
+document.getElementById('previewTileSource')?.addEventListener('click', () => {
+  activeTilePresetID = '';
+  renderTileSourceCards();
+  sourceSelectionHint(null);
+  showTileLoadOverlay({ title: 'Karte wird geladen', message: 'Die eigene Kartenquelle wird vorbereitet.', mode: 'online' });
+  previewTileSource()
+    .then((applied) => {
+      if (!applied) throw new Error('Kartenquelle konnte nicht aktiviert werden.');
+      return waitForMapLayerPaint();
+    })
+    .then(() => showToast('Kartenvorschau geladen – zum Behalten bitte speichern.', 'info', 3500))
+    .catch(() => showToast('Kartenquelle konnte nicht aktiviert werden.', 'error', 5000))
+    .finally(hideTileLoadOverlay);
+});
+
+// A manual source edit turns the selection into a custom configuration.
+['mapType', 'tileUpstream', 'tileStyleUrl', 'wmsLayers', 'tileMaxZoom', 'tileAttribution'].forEach((id) => {
+  document.getElementById(id)?.addEventListener('input', () => {
+    activeTilePresetID = '';
+    renderTileSourceCards();
+    sourceSelectionHint(null);
+  });
+  document.getElementById(id)?.addEventListener('change', () => {
+    activeTilePresetID = '';
+    renderTileSourceCards();
+    sourceSelectionHint(null);
+  });
+});
+
+// ─── Local tinyTiles build ────────────────────────────────────────────────
+// The server owns the PBF path and the actual generator. The browser only
+// starts the asynchronous job and polls its small status document, so a build
+// never blocks routing or the rest of the UI.
+const tinyTilesBuildEndpoint = '/api/v1/tinytiles/build';
+const tinyTilesPollIntervalMs = 2500;
+let tinyTilesPollTimer = null;
+let tinyTilesPollInFlight = false;
+let tinyTilesAutoActivateWhenReady = false;
+let tinyTilesLoadRequested = false;
+let tinyTilesLatestStatus = { state: 'idle', phase: 'idle', progress: 0 };
+window.tinyTilesLatestStatus = tinyTilesLatestStatus;
+
+function tinyTilesElements() {
+  return {
+    build: document.getElementById('tinyTilesBuild'),
+    activate: document.getElementById('tinyTilesActivate'),
+    status: document.getElementById('tinyTilesBuildStatus'),
+    icon: document.getElementById('tinyTilesStatusIcon'),
+    title: document.getElementById('tinyTilesStatusTitle'),
+    message: document.getElementById('tinyTilesStatusMessage'),
+    progress: document.getElementById('tinyTilesProgress'),
+    progressBar: document.querySelector('#tinyTilesProgress .tinytiles-progress-bar span'),
+  };
 }
+
+function normalizedTinyTilesState(value) {
+  switch (String(value || 'idle').toLowerCase()) {
+    case 'building':
+    case 'ready':
+    case 'failed':
+    case 'idle':
+      return String(value).toLowerCase();
+    default:
+      return 'idle';
+  }
+}
+
+function tinyTilesZoomsFromUI() {
+  const min = Number.parseInt(document.getElementById('tinyTilesMinZoom')?.value, 10);
+  const max = Number.parseInt(document.getElementById('tinyTilesMaxZoom')?.value, 10);
+  // The packaged minimal MapLibre style is defined for zoom 5–14. Keeping the
+  // UI in that range avoids generating tiles which that local style cannot use.
+  if (!Number.isInteger(min) || !Number.isInteger(max) || min < 5 || max > 14 || min > max) {
+    throw new Error('Bitte gültige Zoomstufen zwischen 5 und 14 wählen (Minimum ≤ Maximum).');
+  }
+  return { min_zoom: min, max_zoom: max };
+}
+
+function tinyTilesStatusText(status, state) {
+  if (state === 'building') {
+    return {
+      icon: '◌',
+      title: 'Offline-Karte wird erzeugt',
+      message: status.message || 'Die lokale Karte wird aus der PBF aufgebaut. Das kann je nach Gebiet einige Zeit dauern.',
+    };
+  }
+  if (state === 'ready') {
+    return {
+      icon: '✓',
+      title: 'Offline-Karte bereit',
+      message: status.message || 'Die lokale Kartenquelle kann jetzt ohne externe Tile-API verwendet werden.',
+    };
+  }
+  if (state === 'failed') {
+    return {
+      icon: '!',
+      title: 'Erzeugung fehlgeschlagen',
+      message: status.error || status.message || 'Die Offline-Karte konnte nicht erzeugt werden.',
+    };
+  }
+  return {
+    icon: '○',
+    title: 'Noch keine Offline-Karte',
+    message: status.message || 'Die lokale Karte wird aus der geladenen PBF erzeugt.',
+  };
+}
+
+function updateTinyTilesUI(rawStatus = {}) {
+  const state = normalizedTinyTilesState(rawStatus.state);
+  const text = tinyTilesStatusText(rawStatus, state);
+  const el = tinyTilesElements();
+  if (el.status) {
+    el.status.dataset.state = state;
+    el.status.setAttribute('aria-busy', state === 'building' ? 'true' : 'false');
+  }
+  if (el.icon) el.icon.textContent = text.icon;
+  if (el.title) el.title.textContent = text.title;
+  if (el.message) el.message.textContent = text.message;
+  if (el.progress) {
+    el.progress.hidden = state !== 'building';
+    const rawProgress = Number(rawStatus.progress);
+    const hasProgress = state === 'building' && Number.isFinite(rawProgress);
+    const progress = Math.max(0, Math.min(100, Math.round(rawProgress)));
+    el.progress.classList.toggle('is-determinate', hasProgress);
+    el.progress.setAttribute('aria-valuetext', state === 'building'
+      ? hasProgress ? `${progress} % – ${text.message}` : text.message
+      : state === 'ready' ? 'Abgeschlossen' : 'Nicht aktiv');
+    if (hasProgress) el.progress.setAttribute('aria-valuenow', String(progress));
+    else el.progress.removeAttribute('aria-valuenow');
+    if (el.progressBar) el.progressBar.style.width = hasProgress ? `${progress}%` : '';
+  }
+  if (el.build) {
+    el.build.disabled = state === 'building';
+    el.build.textContent = state === 'building'
+      ? 'Offline-Karte wird erzeugt …'
+      : state === 'ready' ? 'Offline-Karte neu erzeugen' : 'Offline-Karte erzeugen';
+  }
+  if (el.activate) el.activate.style.display = state === 'ready' ? '' : 'none';
+  return state;
+}
+
+function stopTinyTilesPolling() {
+  if (tinyTilesPollTimer !== null) {
+    window.clearTimeout(tinyTilesPollTimer);
+    tinyTilesPollTimer = null;
+  }
+}
+
+function scheduleTinyTilesPolling() {
+  if (tinyTilesPollTimer !== null) return;
+  tinyTilesPollTimer = window.setTimeout(async () => {
+    tinyTilesPollTimer = null;
+    const status = await fetchTinyTilesStatus({ silent: true });
+    if (status && normalizedTinyTilesState(status.state) === 'building') scheduleTinyTilesPolling();
+  }, tinyTilesPollIntervalMs);
+}
+
+async function tinyTilesResponseError(res, fallback) {
+  if (res.status === 401 || res.status === 403) {
+    return 'Administrationsschutz: Server mit -admin-token starten und den Token unten eintragen.';
+  }
+  const body = await res.json().catch(() => ({}));
+  if (typeof body?.error === 'string' && body.error) return body.error;
+  if (typeof body?.message === 'string' && body.message) return body.message;
+  return `${fallback} (${res.status})`;
+}
+
+function tinyTilesStyleSettings(status = {}) {
+  const min = Number.isInteger(status.min_zoom) ? status.min_zoom : 8;
+  const max = Number.isInteger(status.max_zoom) ? status.max_zoom : 14;
+  return {
+    map_type: 'vector',
+    upstream: '',
+    style_url: '/static/styles/tinytiles-minimal.json',
+    wms_layers: '',
+    attribution: '© OpenStreetMap contributors',
+    max_zoom: Math.max(5, Math.min(14, Math.max(min, max))),
+  };
+}
+
+function syncTinyTilesSourceForm(tiles) {
+  const mapType = document.getElementById('mapType');
+  const upstream = document.getElementById('tileUpstream');
+  const style = document.getElementById('tileStyleUrl');
+  const layers = document.getElementById('wmsLayers');
+  const attribution = document.getElementById('tileAttribution');
+  const maxZoom = document.getElementById('tileMaxZoom');
+  if (mapType) mapType.value = tiles.map_type;
+  if (upstream) upstream.value = tiles.upstream;
+  if (style) style.value = tiles.style_url;
+  if (layers) layers.value = tiles.wms_layers;
+  if (attribution) attribution.value = tiles.attribution;
+  if (maxZoom) maxZoom.value = tiles.max_zoom;
+  activeTilePresetID = 'tinytiles_local';
+  renderTileSourceCards();
+  renderWelcomeOnlineCards();
+  sourceSelectionHint(tilePresets.find((preset) => preset.id === 'tinytiles_local') || null);
+  updateMapTypeVisibility(tiles.map_type);
+}
+
+async function activateTinyTilesMap(status = {}) {
+  const tiles = tinyTilesStyleSettings(status);
+  const base = preloadedSettings || {};
+  tinyTilesLoadRequested = true;
+  showTileLoadOverlay({
+    title: 'Lokale Karte wird geladen',
+    message: 'Die Offline-Kacheln werden im Browser vorbereitet.',
+    progress: 100,
+    mode: 'tinytiles',
+  });
+  try {
+    const applied = await applyTileLayer({ ...base, tiles: { ...(base.tiles || {}), ...tiles } });
+    if (!applied) throw new Error('Die lokale Kartenquelle konnte nicht aktiviert werden.');
+    // This only changes the form and the in-memory preview. Clicking the regular
+    // “Speichern” button remains the explicit opt-in for persisting the source.
+    syncTinyTilesSourceForm(tiles);
+  } finally {
+    tinyTilesLoadRequested = false;
+    hideTileLoadOverlay();
+  }
+}
+
+function handleTinyTilesStatus(status) {
+  const safeStatus = status || { state: 'idle', phase: 'idle', progress: 0 };
+  tinyTilesLatestStatus = safeStatus;
+  window.tinyTilesLatestStatus = tinyTilesLatestStatus;
+  const state = updateTinyTilesUI(safeStatus);
+  const text = tinyTilesStatusText(safeStatus, state);
+  if (tinyTilesLoadRequested && state === 'building') {
+    showTileLoadOverlay({
+      title: 'Offline-Karte wird erzeugt',
+      message: text.message,
+      progress: safeStatus.progress,
+      mode: 'tinytiles',
+    });
+  }
+  if (activeTilePresetID === 'tinytiles_local') {
+    renderTileSourceCards();
+    sourceSelectionHint(tilePresets.find((preset) => preset.id === 'tinytiles_local') || null);
+  }
+  if (state === 'building') {
+    scheduleTinyTilesPolling();
+    return;
+  }
+  stopTinyTilesPolling();
+  if (state === 'failed') {
+    tinyTilesAutoActivateWhenReady = false;
+    if (tinyTilesLoadRequested) {
+      tinyTilesLoadRequested = false;
+      hideTileLoadOverlay();
+    }
+  }
+  if (state === 'ready' && tinyTilesAutoActivateWhenReady) {
+    tinyTilesAutoActivateWhenReady = false;
+    activateTinyTilesMap(safeStatus)
+      .then(() => showToast('Offline-Karte ist bereit und wird angezeigt. Zum dauerhaften Übernehmen bitte speichern.', 'success', 5500))
+      .catch((error) => {
+        console.error('Failed to activate tinyTiles map', error);
+        showToast('Offline-Karte ist bereit, konnte aber nicht angezeigt werden.', 'error', 5500);
+      });
+  }
+}
+
+async function fetchTinyTilesStatus({ silent = false } = {}) {
+  if (tinyTilesPollInFlight) return tinyTilesLatestStatus;
+  tinyTilesPollInFlight = true;
+  try {
+    const res = await fetch(tinyTilesBuildEndpoint, {
+      headers: adminAuthHeaders({ Accept: 'application/json' }),
+      cache: 'no-store',
+    });
+    if (!res.ok) throw new Error(await tinyTilesResponseError(res, 'tinyTiles-Status nicht abrufbar'));
+    const status = await res.json();
+    handleTinyTilesStatus(status || {});
+    return status;
+  } catch (error) {
+    stopTinyTilesPolling();
+    if (!silent) {
+      updateTinyTilesUI({ state: 'idle', message: error instanceof Error ? error.message : 'tinyTiles-Status nicht abrufbar' });
+    }
+    console.warn('Failed to fetch tinyTiles build status:', error);
+    return null;
+  } finally {
+    tinyTilesPollInFlight = false;
+  }
+}
+
+function openTinyTilesBuilder() {
+  openSettingsSection('tinyTilesHeader', 'tinyTilesSettings', 'tinyTilesSettingsOpen');
+  window.setTimeout(() => {
+    document.getElementById('tinyTilesSettings')?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }, 0);
+}
+
+async function selectTinyTilesSource({ fromWelcome = false } = {}) {
+  const preset = tilePresets.find((item) => item.id === 'tinytiles_local');
+  activeTilePresetID = 'tinytiles_local';
+  if (preset) setTileSourceForm(preset);
+  setTileSourceAdvancedOpen(false);
+  renderTileSourceCards();
+  sourceSelectionHint(preset || null);
+  if (fromWelcome) completeMapWelcome('offline');
+
+  tinyTilesLoadRequested = true;
+  showTileLoadOverlay({
+    title: 'Lokale Karte wird vorbereitet',
+    message: 'Prüfe, ob eine Offline-Karte vorhanden ist …',
+    mode: 'tinytiles',
+  });
+  const status = await fetchTinyTilesStatus({ silent: false });
+  if (!status) {
+    tinyTilesLoadRequested = false;
+    hideTileLoadOverlay();
+    openTinyTilesBuilder();
+    return;
+  }
+
+  const state = normalizedTinyTilesState(status.state);
+  if (state === 'ready') {
+    try {
+      await activateTinyTilesMap(status);
+      showToast('Offline-Karte wird angezeigt. Zum dauerhaften Übernehmen bitte speichern.', 'success', 5000);
+    } catch (error) {
+      console.error('Failed to activate tinyTiles map', error);
+      showToast('Offline-Karte konnte nicht angezeigt werden.', 'error', 5000);
+    }
+    return;
+  }
+  if (state === 'building') {
+    tinyTilesAutoActivateWhenReady = true;
+    openTinyTilesBuilder();
+    return;
+  }
+  openTinyTilesBuilder();
+  await startTinyTilesBuild();
+}
+
+async function startTinyTilesBuild() {
+  let zooms;
+  try {
+    zooms = tinyTilesZoomsFromUI();
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : 'Ungültige Zoomstufen.', 'error', 5000);
+    return;
+  }
+
+  const build = tinyTilesElements().build;
+  if (build) build.disabled = true;
+  tinyTilesLoadRequested = true;
+  handleTinyTilesStatus({ state: 'building', phase: 'preparing', progress: 0, message: 'Offline-Karte wird vorbereitet …' });
+  try {
+    const res = await fetch(tinyTilesBuildEndpoint, {
+      method: 'POST',
+      headers: adminAuthHeaders({ 'Content-Type': 'application/json', Accept: 'application/json' }),
+      body: JSON.stringify(zooms),
+    });
+    if (!res.ok) {
+      const message = await tinyTilesResponseError(res, 'Offline-Karte konnte nicht gestartet werden');
+      // A second tab may already have started exactly the same job. Treat that
+      // as a status refresh rather than pretending the existing build failed.
+      if (res.status === 409) {
+        tinyTilesAutoActivateWhenReady = true;
+        const status = await fetchTinyTilesStatus({ silent: false });
+        if (status) {
+          if (normalizedTinyTilesState(status.state) === 'building') {
+            showToast('Offline-Karte wird bereits erzeugt.', 'info', 3500);
+          }
+          return;
+        }
+      }
+      throw new Error(message);
+    }
+    const status = await res.json().catch(() => ({ state: 'building' }));
+    tinyTilesAutoActivateWhenReady = true;
+    handleTinyTilesStatus(status || { state: 'building' });
+    showToast('Offline-Karte wird im Hintergrund erzeugt.', 'info', 3500);
+  } catch (error) {
+    tinyTilesAutoActivateWhenReady = false;
+    tinyTilesLoadRequested = false;
+    hideTileLoadOverlay();
+    const message = error instanceof Error ? error.message : 'Offline-Karte konnte nicht gestartet werden.';
+    handleTinyTilesStatus({ state: 'failed', phase: 'failed', progress: 0, error: message });
+    showToast(message, 'error', 6000);
+  }
+}
+
+document.getElementById('tinyTilesBuild')?.addEventListener('click', () => { void startTinyTilesBuild(); });
+
+document.getElementById('tinyTilesActivate')?.addEventListener('click', async () => {
+  try {
+    const status = await fetchTinyTilesStatus({ silent: false });
+    if (!status || normalizedTinyTilesState(status.state) !== 'ready') return;
+    await activateTinyTilesMap(status);
+    showToast('Offline-Karte wird angezeigt. Zum dauerhaften Übernehmen bitte speichern.', 'success', 5000);
+  } catch (error) {
+    console.error('Failed to activate tinyTiles map', error);
+    showToast('Offline-Karte konnte nicht angezeigt werden.', 'error', 5000);
+  }
+});
+
+// A fresh page can show the existing artifact state, but does not replace the
+// user's current source until they explicitly start or activate tinyTiles.
+fetchTinyTilesStatus({ silent: false });
+window.addEventListener('pagehide', stopTinyTilesPolling, { once: true });
 
 // Vehicle profile loading from API
 async function loadVehicleProfiles() {
@@ -1546,24 +2667,21 @@ document.getElementById('save').onclick = async () => {
     cur.default_highway_speeds = cur.default_highway_speeds || {};
     speedInputs.forEach(si => { const k=si.dataset.type; const v=parseFloat(si.value); if(!isNaN(v)) cur.default_highway_speeds[k]=v; });
     // collect tile/map source settings
-    cur.tiles = cur.tiles || {};
-    const mtEl = document.getElementById('mapType');
-    if (mtEl) cur.tiles.map_type = mtEl.value;
-    const upEl = document.getElementById('tileUpstream');
-    if (upEl) cur.tiles.upstream = upEl.value;
-    const suEl = document.getElementById('tileStyleUrl');
-    if (suEl) cur.tiles.style_url = suEl.value;
-    const wlEl = document.getElementById('wmsLayers');
-    if (wlEl) cur.tiles.wms_layers = wlEl.value;
-    const atEl = document.getElementById('tileAttribution');
-    if (atEl) cur.tiles.attribution = atEl.value;
+    cur.tiles = tileSettingsFromUI(cur.tiles || {});
     // OpenAI / remote API key
     cur.ai = cur.ai || {};
     const keyEl = document.getElementById('openaiApiKey');
     if (keyEl) cur.ai.openai_api_key = keyEl.value.trim();
     const urlEl = document.getElementById('openaiBaseUrl');
     if (urlEl) cur.ai.openai_base_url = urlEl.value.trim();
-    await apiPutSettings(cur);
+    const adminTokenEl = document.getElementById('adminToken');
+    if (adminTokenEl) {
+      const token = adminTokenEl.value.trim();
+      if (token) sessionStorage.setItem('osmminiAdminToken', token);
+      else sessionStorage.removeItem('osmminiAdminToken');
+    }
+    const saved = await apiPutSettings(cur);
+    preloadedSettings = saved;
     apiCache.delete('settings'); // Invalidate cache
     // Refresh map tile layer with updated settings
     applyTileLayer(cur);
@@ -1574,7 +2692,8 @@ document.getElementById('save').onclick = async () => {
     setTimeout(() => { btn.innerHTML = origText; btn.disabled = false; }, 1500);
   } catch (e) {
     btn.innerHTML = '❌ Fehler';
-    showToast('Fehler beim Speichern der Einstellungen', 'error', 3000);
+    const detail = e instanceof Error ? e.message : 'unbekannter Fehler';
+    showToast('Einstellungen nicht gespeichert: ' + detail, 'error', 6000);
     setTimeout(() => { btn.innerHTML = origText; btn.disabled = false; }, 2000);
   }
 };
@@ -1647,6 +2766,7 @@ function setupCollapsibleSection(headerId, contentId, storageKey) {
 setupCollapsibleSection('highwayHeader', 'allowedHighways', 'highwaysOpen');
 setupCollapsibleSection('speedHeader', 'speedDefaults', 'speedsOpen');
 setupCollapsibleSection('mapHeader', 'mapSettings', 'mapSettingsOpen');
+setupCollapsibleSection('tinyTilesHeader', 'tinyTilesSettings', 'tinyTilesSettingsOpen');
 
 // Intersection Observer for lazy rendering of collapsed sections
 if ('IntersectionObserver' in window) {

@@ -1,0 +1,38 @@
+{
+  "routing": {
+    "engine": "astar",
+    "objective": "duration",
+    "pro": false,
+    "weights": {
+      "left_turn": 0,
+      "right_turn": 0,
+      "u_turn": 0,
+      "crossing": 0,
+      "max_speed_kph": 130,
+      "vehicle_height_m": 0,
+      "vehicle_weight_t": 0
+    }
+  },
+  "tiles": {
+    "cache_dir": "tiles-cache-bayern",
+    "map_type": "vector",
+    "style_url": "https://vtod1.bayernwolke.de/styles/by_style_standard.json",
+    "upstream": "https://wmtsod1.bayernwolke.de/wmts/by_webkarte/smerc/{z}/{x}/{y}",
+    "user_agent": "osmmini-routerd/1.0 (karte.bayern)",
+    "attribution": "Webkarte Vektor © Bayerische Vermessungsverwaltung – www.geodaten.bayern.de CC BY 4.0, © GeoBasis-DE / BKG 2022 (Daten verändert) CC BY 4.0",
+    "max_zoom": 19
+  },
+  "default_highway_speeds": {
+    "motorway": 130,
+    "trunk": 100,
+    "primary": 80,
+    "secondary": 70,
+    "tertiary": 60,
+    "unclassified": 50,
+    "residential": 30,
+    "living_street": 10,
+    "service": 20,
+    "track": 25
+  },
+  "save_poi_cache": true
+}

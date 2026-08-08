@@ -1,0 +1,19 @@
+{
+  "version": 8,
+  "name": "tinyTiles minimal offline",
+  "sources": {
+    "tinytiles": {
+      "type": "vector",
+      "url": "/tinytiles/tilejson.json"
+    }
+  },
+  "layers": [
+    {"id":"background","type":"background","paint":{"background-color":"#edf2e4"}},
+    {"id":"water","type":"fill","source":"tinytiles","source-layer":"water","paint":{"fill-color":"#9dc9e8","fill-opacity":0.9}},
+    {"id":"forest","type":"fill","source":"tinytiles","source-layer":"landcover","filter":["==",["get","class"],"forest"],"paint":{"fill-color":"#b7d7a8","fill-opacity":0.85}},
+    {"id":"farmland","type":"fill","source":"tinytiles","source-layer":"landcover","filter":["in",["get","class"],["literal",["farmland","meadow"]]],"paint":{"fill-color":"#e5dfad","fill-opacity":0.72}},
+    {"id":"buildings","type":"fill","source":"tinytiles","source-layer":"building","paint":{"fill-color":"#d9c5b0","fill-outline-color":"#bdab99"}},
+    {"id":"roads-casing","type":"line","source":"tinytiles","source-layer":"transportation","paint":{"line-color":"#bcae9f","line-width":["interpolate",["linear"],["zoom"],5,0.5,10,1.8,14,4]}},
+    {"id":"roads","type":"line","source":"tinytiles","source-layer":"transportation","paint":{"line-color":"#ffffff","line-width":["interpolate",["linear"],["zoom"],5,0.3,10,1.2,14,3]}}
+  ]
+}

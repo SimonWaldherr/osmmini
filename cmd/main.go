@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -24,10 +26,12 @@ import (
 	"sync"
 	"time"
 
+	tinytiles "github.com/Karte-Bayern/tinyTiles"
+	tinytilesserver "github.com/Karte-Bayern/tinyTiles/server"
 	osmmini "simonwaldherr.de/go/osmmini"
 )
 
-//go:embed web/index.html web/style.css web/app.js docs/* api/openapi.yaml
+//go:embed web/index.html web/style.css web/app.js web/static docs/* api/openapi.yaml
 var embedded embed.FS
 
 const buildVersion = "dev"
@@ -47,10 +51,11 @@ type TileSettings struct {
 	CacheDir     string `json:"cache_dir"`
 	Upstream     string `json:"upstream"`
 	UserAgent    string `json:"user_agent"`
-	MapType      string `json:"map_type,omitempty"`       // "raster" (default), "vector", "wms"
+	MapType      string `json:"map_type,omitempty"`       // "raster" (proxied), "raster-direct", "vector", "wms"
 	StyleURL     string `json:"style_url,omitempty"`      // vector: MapLibre GL style URL
 	WMSLayers    string `json:"wms_layers,omitempty"`     // wms: comma-separated layer names
 	Attribution  string `json:"attribution,omitempty"`    // attribution text shown on the map
+	MaxZoom      int    `json:"max_zoom,omitempty"`       // maximum usable zoom for this source (0 = source default)
 	MemCacheSize int    `json:"mem_cache_size,omitempty"` // L1 in-memory tile cache capacity (0 = default 512)
 }
 
@@ -66,54 +71,99 @@ type TileSourcePreset struct {
 	MaxZoom     int    `json:"max_zoom,omitempty"`
 }
 
+const (
+	bayernVectorAttribution = "Webkarte Vektor © Bayerische Vermessungsverwaltung – www.geodaten.bayern.de CC BY 4.0, © GeoBasis-DE / BKG 2022 (Daten verändert) CC BY 4.0"
+	bayernWMTSAttribution   = "© Datenquellen: Bayerische Vermessungsverwaltung, GeoBasis-DE / BKG 2023 – Daten verändert"
+	bayernWMTSWebkarte      = "https://wmtsod1.bayernwolke.de/wmts/by_webkarte/smerc/{z}/{x}/{y}"
+	bayernWMTSAerial        = "https://wmtsod1.bayernwolke.de/wmts/by_dop/smerc/{z}/{x}/{y}"
+	cartoLightTiles         = "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"
+	cartoDarkTiles          = "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"
+	cartoVoyagerTiles       = "https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png"
+	legacyBasemapDETiles    = "https://sgx.geodatenzentrum.de/wmts_basemapde/tile/1.0.0/basemap_de_webkarte/default/GLOBAL_WEBMERCATOR/{z}/{y}/{x}.png"
+	basemapDETiles          = "https://sgx.geodatenzentrum.de/wmts_basemapde/tile/1.0.0/de_basemapde_web_raster_farbe/default/GLOBAL_WEBMERCATOR/{z}/{y}/{x}.png"
+)
+
 // BuiltinTilePresets lists the map/tile sources available out of the box.
 // These are served via GET /api/v1/tile-sources.
 var BuiltinTilePresets = []TileSourcePreset{
 	{
-		ID: "osm", Label: "OpenStreetMap Standard", MapType: "raster",
-		Upstream:    "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-		Attribution: "© OpenStreetMap contributors", MaxZoom: 19,
-	},
-	{
-		ID: "osm_de", Label: "OpenStreetMap Deutschland", MapType: "raster",
-		Upstream:    "https://tile.openstreetmap.de/{z}/{x}/{y}.png",
-		Attribution: "© OpenStreetMap contributors", MaxZoom: 18,
-	},
-	{
-		ID: "osm_hot", Label: "OSM Humanitarian", MapType: "raster",
-		Upstream:    "https://a.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png",
-		Attribution: "© OpenStreetMap contributors, Tiles by HOT", MaxZoom: 19,
-	},
-	{
-		ID: "osm_topo", Label: "OpenTopoMap", MapType: "raster",
-		Upstream:    "https://tile.opentopomap.org/{z}/{x}/{y}.png",
-		Attribution: "© OpenStreetMap contributors, © OpenTopoMap", MaxZoom: 17,
-	},
-	{
-		ID: "carto_light", Label: "CartoDB Positron (hell)", MapType: "raster",
-		Upstream:    "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
+		ID: "carto_voyager", Label: "Globale Onlinekarte", MapType: "raster-direct",
+		Upstream:    cartoVoyagerTiles,
 		Attribution: "© OpenStreetMap contributors © CARTO", MaxZoom: 19,
 	},
 	{
-		ID: "carto_dark", Label: "CartoDB Dark Matter (dunkel)", MapType: "raster",
-		Upstream:    "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+		ID: "carto_light", Label: "Globale Onlinekarte (hell)", MapType: "raster-direct",
+		Upstream:    cartoLightTiles,
 		Attribution: "© OpenStreetMap contributors © CARTO", MaxZoom: 19,
 	},
 	{
-		ID: "basemap_de", Label: "Basemap.de (BKG)", MapType: "raster",
-		Upstream:    "https://sgx.geodatenzentrum.de/wmts_basemapde/tile/1.0.0/basemap_de_webkarte/default/GLOBAL_WEBMERCATOR/{z}/{y}/{x}.png",
+		ID: "carto_dark", Label: "Globale Onlinekarte (dunkel)", MapType: "raster-direct",
+		Upstream:    cartoDarkTiles,
+		Attribution: "© OpenStreetMap contributors © CARTO", MaxZoom: 19,
+	},
+	{
+		ID: "basemap_de", Label: "Basemap.de (BKG, direkt)", MapType: "raster-direct",
+		Upstream:    basemapDETiles,
 		Attribution: "© Bundesamt für Kartographie und Geodäsie (BKG)", MaxZoom: 18,
 	},
 	{
-		ID: "geodaten_bavaria", Label: "Geodaten Bayern – BayernAtlas", MapType: "wms",
-		Upstream:    "https://geoservices.bayern.de/od/wms/dop/v1/dop20?",
-		WMSLayers:   "by_dop20c",
-		Attribution: "© Bayerische Vermessungsverwaltung", MaxZoom: 18,
+		ID: "bayern_vector_standard", Label: "BayernAtlas – Webkarte Vektor", MapType: "vector",
+		StyleURL: "https://vtod1.bayernwolke.de/styles/by_style_standard.json",
+		// The raster WMTS is retained as an automatic fallback for browsers
+		// without WebGL or when the MapLibre assets cannot be loaded.
+		Upstream:    bayernWMTSWebkarte,
+		Attribution: bayernVectorAttribution, MaxZoom: 19,
 	},
 	{
-		ID: "maplibre_demo", Label: "MapLibre Demo Tiles (Vektor)", MapType: "vector",
-		StyleURL:    "https://demotiles.maplibre.org/style.json",
-		Attribution: "© MapLibre", MaxZoom: 19,
+		ID: "bayern_vector_nacht", Label: "BayernAtlas – Vektor Nacht", MapType: "vector",
+		StyleURL:    "https://vtod1.bayernwolke.de/styles/by_style_nacht.json",
+		Upstream:    bayernWMTSWebkarte,
+		Attribution: bayernVectorAttribution, MaxZoom: 19,
+	},
+	{
+		ID: "bayern_vector_wandern", Label: "BayernAtlas – Vektor Wandern", MapType: "vector",
+		StyleURL:    "https://vtod1.bayernwolke.de/styles/by_style_wandern.json",
+		Upstream:    bayernWMTSWebkarte,
+		Attribution: bayernVectorAttribution, MaxZoom: 19,
+	},
+	{
+		ID: "bayern_vector_radln", Label: "BayernAtlas – Vektor Radln", MapType: "vector",
+		StyleURL:    "https://vtod1.bayernwolke.de/styles/by_style_radln.json",
+		Upstream:    bayernWMTSWebkarte,
+		Attribution: bayernVectorAttribution, MaxZoom: 19,
+	},
+	{
+		ID: "bayern_vector_luftbild", Label: "BayernAtlas – Vektor Luftbild", MapType: "vector",
+		StyleURL:    "https://vtod1.bayernwolke.de/styles/by_style_luftbild.json",
+		Upstream:    bayernWMTSAerial,
+		Attribution: bayernVectorAttribution, MaxZoom: 19,
+	},
+	{
+		ID: "bayern_wmts_webkarte", Label: "BayernAtlas – Webkarte (WMTS)", MapType: "raster",
+		Upstream:    bayernWMTSWebkarte,
+		Attribution: bayernWMTSAttribution, MaxZoom: 19,
+	},
+	{
+		ID: "bayern_wmts_grau", Label: "BayernAtlas – Webkarte grau (WMTS)", MapType: "raster",
+		Upstream:    "https://wmtsod1.bayernwolke.de/wmts/by_webkarte_grau/smerc/{z}/{x}/{y}",
+		Attribution: bayernWMTSAttribution, MaxZoom: 19,
+	},
+	{
+		ID: "bayern_wmts_luftbild", Label: "BayernAtlas – Luftbild (WMTS)", MapType: "raster",
+		Upstream:    bayernWMTSAerial,
+		Attribution: bayernWMTSAttribution, MaxZoom: 19,
+	},
+	{
+		ID: "geodaten_bavaria", Label: "BayernAtlas – DOP20 Luftbild (WMS)", MapType: "wms",
+		Upstream:    "https://geoservices.bayern.de/od/wms/dop/v1/dop20?",
+		WMSLayers:   "by_dop20c",
+		Attribution: "© Bayerische Vermessungsverwaltung – CC BY 4.0", MaxZoom: 18,
+	},
+	{
+		ID: "tinytiles_local", Label: "tinyTiles lokal (offline)", MapType: "vector",
+		StyleURL:    "/static/styles/tinytiles-minimal.json",
+		Attribution: "© OpenStreetMap contributors",
+		MaxZoom:     14,
 	},
 }
 
@@ -152,15 +202,24 @@ var staticPOIMapping = map[string]map[string]string{
 }
 
 // brandAliasMap maps common user typos/aliases to a canonical normalized brand key
-var brandAliasMap = map[string]string{
-	"maci":        "mcdonalds",
-	"mcdo":        "mcdonalds",
-	"mcd":         "mcdonalds",
-	"mcdonald":    "mcdonalds",
-	"mcdonalds":   "mcdonalds",
-	"macdonalds":  "mcdonalds",
-	"maccdonalds": "mcdonalds",
-	"macca":       "mcdonalds",
+var (
+	brandAliasMu  sync.RWMutex
+	brandAliasMap = map[string]string{
+		"maci":        "mcdonalds",
+		"mcdo":        "mcdonalds",
+		"mcd":         "mcdonalds",
+		"mcdonald":    "mcdonalds",
+		"mcdonalds":   "mcdonalds",
+		"macdonalds":  "mcdonalds",
+		"maccdonalds": "mcdonalds",
+		"macca":       "mcdonalds",
+	}
+)
+
+func lookupBrandAlias(alias string) string {
+	brandAliasMu.RLock()
+	defer brandAliasMu.RUnlock()
+	return brandAliasMap[alias]
 }
 
 // buildBrandAliases inspects the loaded POI index and generates simple
@@ -168,6 +227,8 @@ var brandAliasMap = map[string]string{
 func (s *server) buildBrandAliases() {
 	s.poiMu.RLock()
 	defer s.poiMu.RUnlock()
+	brandAliasMu.Lock()
+	defer brandAliasMu.Unlock()
 
 	addAlias := func(raw string) {
 		if raw == "" {
@@ -200,6 +261,10 @@ func (s *server) buildBrandAliases() {
 	for _, r := range s.poiRels {
 		addAlias(r.Tags["brand"])
 		addAlias(r.Tags["name"])
+	}
+	for _, n := range s.poiTaggedNodes {
+		addAlias(n.Tags["brand"])
+		addAlias(n.Tags["name"])
 	}
 	// scan address entries
 	for _, a := range s.addrs {
@@ -255,11 +320,26 @@ type Settings struct {
 	AllowedHighwayTypes []string `json:"allowed_highway_types,omitempty"`
 }
 
+// publicSettings removes server-side secrets before Settings are embedded in
+// the page or returned from public API endpoints. The AI provider uses the key
+// only server-side; browsers never need to receive it.
+func publicSettings(v Settings) Settings {
+	v.AI.OpenAIAPIKey = ""
+	return v
+}
+
 // DefaultSettings returns a sane set of defaults used when no
 // settings.json exists. These defaults are chosen for Germany: the
 // routing objective is set to minimize duration and motorway speeds are
 // assumed higher (e.g. 150 km/h). Adjust `settings.json` to override.
 func DefaultSettings(cacheDir, upstream string) Settings {
+	mapType := "raster"
+	if isOSMStandardTileURL(upstream) {
+		// Browser requests retain the web page's Referer and use the browser's
+		// user agent, unlike the server-side proxy that OSM's public tile policy
+		// explicitly cautions against for general application traffic.
+		mapType = "raster-direct"
+	}
 	return Settings{
 		Routing: osmmini.RouteOptions{
 			Engine: osmmini.EngineAStar,
@@ -281,8 +361,9 @@ func DefaultSettings(cacheDir, upstream string) Settings {
 			CacheDir:     cacheDir,
 			Upstream:     upstream,
 			UserAgent:    "osmmini-routerd/1.0 (offline routing)",
-			MapType:      "raster",
-			Attribution:  "© OpenStreetMap contributors",
+			MapType:      mapType,
+			Attribution:  defaultTileAttribution(upstream),
+			MaxZoom:      19,
 			MemCacheSize: tileMemCacheDefaultMaxItems,
 		},
 		// persist POI cache files by default
@@ -308,6 +389,26 @@ func DefaultSettings(cacheDir, upstream string) Settings {
 			"service":       20,  // km/h - typical service road
 			"track":         25,  // km/h - typical unpaved track
 		},
+	}
+}
+
+func isOSMStandardTileURL(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && strings.EqualFold(u.Hostname(), "tile.openstreetmap.org")
+}
+
+func defaultTileAttribution(upstream string) string {
+	u, err := url.Parse(upstream)
+	if err != nil {
+		return ""
+	}
+	switch strings.ToLower(u.Hostname()) {
+	case "wmtsod1.bayernwolke.de":
+		return bayernWMTSAttribution
+	case "tile.openstreetmap.org":
+		return "© OpenStreetMap contributors"
+	default:
+		return ""
 	}
 }
 
@@ -367,17 +468,32 @@ func (s *SettingsStore) saveLocked() error {
 
 // ---- Tile cache proxy ----
 
-// tileCacheKey is the lookup key for a single tile (zoom / x / y).
-type tileCacheKey struct{ z, x, y int }
+// tileCacheKey is the lookup key for a single tile. The source namespace is
+// deliberately part of the key: the same z/x/y coordinate can represent
+// completely different imagery after the user switches map sources.
+type tileCacheKey struct {
+	source  string
+	z, x, y int
+}
 
 // tileMemEntry holds a tile's raw bytes and its L1 expiry time.
 type tileMemEntry struct {
-	data      []byte
-	expiresAt time.Time
+	data        []byte
+	contentType string
+	expiresAt   time.Time
 }
 
 // tileMemCacheDefaultMaxItems is the default in-memory tile cache capacity.
 const tileMemCacheDefaultMaxItems = 512
+
+// Keep browser, memory, and disk cache lifetimes intentionally bounded.
+// BayernAtlas raster maps are updated regularly, so a one-year immutable
+// browser response would otherwise make source updates effectively invisible.
+const (
+	tileMemCacheTTL   = 24 * time.Hour
+	tileDiskCacheTTL  = 7 * 24 * time.Hour
+	tileBrowserMaxAge = 24 * time.Hour
+)
 
 // tileCacheStats tracks hit/miss counters for observability.
 type tileCacheStats struct {
@@ -446,10 +562,13 @@ func (tc *TileCache) Update(cfg TileSettings) {
 		newMax = tileMemCacheDefaultMaxItems
 	}
 	tc.mu.Lock()
+	sourceChanged := tileSourceNamespace(tc.cfg) != tileSourceNamespace(cfg)
 	tc.cfg = cfg
-	if newMax != tc.memMax {
+	if newMax != tc.memMax || sourceChanged {
 		tc.memMax = newMax
-		// Clear L1 on capacity change so the new limit is respected immediately.
+		// Clear L1 when the source changes as well as when capacity changes.
+		// Disk entries are source-namespaced below, so no stale imagery can
+		// leak back in after a source switch.
 		tc.mem = make(map[tileCacheKey]*tileMemEntry, tc.memMax)
 	}
 	tc.mu.Unlock()
@@ -459,6 +578,28 @@ func (tc *TileCache) cfgCopy() TileSettings {
 	tc.mu.RLock()
 	defer tc.mu.RUnlock()
 	return tc.cfg
+}
+
+func normalizedMapType(mapType string) string {
+	mapType = strings.ToLower(strings.TrimSpace(mapType))
+	if mapType == "" {
+		return "raster"
+	}
+	return mapType
+}
+
+// tileSourceNamespace derives a stable, filesystem-safe namespace from the
+// settings that influence a proxied tile response. It prevents collisions in
+// both cache tiers when changing from OSM to BayernAtlas, another WMTS layer,
+// or a WMS layer.
+func tileSourceNamespace(cfg TileSettings) string {
+	material := strings.Join([]string{
+		normalizedMapType(cfg.MapType),
+		strings.TrimSpace(cfg.Upstream),
+		strings.TrimSpace(cfg.WMSLayers),
+	}, "\x00")
+	digest := sha256.Sum256([]byte(material))
+	return fmt.Sprintf("source-%x", digest[:6])
 }
 
 // Stats returns a snapshot of cache hit/miss counters.
@@ -515,21 +656,21 @@ func (tc *TileCache) evictMem() {
 
 // getFromMem checks the L1 cache while holding the read lock throughout,
 // ensuring the expiry check is race-free.
-func (tc *TileCache) getFromMem(key tileCacheKey) ([]byte, bool) {
+func (tc *TileCache) getFromMem(key tileCacheKey) ([]byte, string, bool) {
 	tc.mu.RLock()
 	defer tc.mu.RUnlock()
 	e, ok := tc.mem[key]
 	if !ok || time.Now().After(e.expiresAt) {
-		return nil, false
+		return nil, "", false
 	}
-	return e.data, true
+	return e.data, e.contentType, true
 }
 
 // setInMem inserts or updates an L1 entry with a 24-hour TTL.
 // When at capacity it first removes expired entries, then sorts and
 // removes the oldest 25% if still full.
-func (tc *TileCache) setInMem(key tileCacheKey, data []byte) {
-	expiry := time.Now().Add(24 * time.Hour)
+func (tc *TileCache) setInMem(key tileCacheKey, data []byte, contentType string) {
+	expiry := time.Now().Add(tileMemCacheTTL)
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	if len(tc.mem) >= tc.memMax {
@@ -553,10 +694,16 @@ func (tc *TileCache) setInMem(key tileCacheKey, data []byte) {
 			}
 		}
 	}
-	tc.mem[key] = &tileMemEntry{data: data, expiresAt: expiry}
+	tc.mem[key] = &tileMemEntry{data: data, contentType: contentType, expiresAt: expiry}
 }
 
 func (tc *TileCache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	// /tiles/{z}/{x}/{y}.png
 	p := strings.TrimPrefix(r.URL.Path, "/tiles/")
 	parts := strings.Split(p, "/")
@@ -581,26 +728,46 @@ func (tc *TileCache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	key := tileCacheKey{z, x, y}
 	cfg := tc.cfgCopy()
+	// "raster-direct" is a browser-only source type. Refuse requests to the
+	// proxy endpoint so a direct OSM configuration cannot accidentally be
+	// turned back into server-side tile traffic through a bookmarked /tiles URL.
+	if normalizedMapType(cfg.MapType) == "raster-direct" {
+		http.NotFound(w, r)
+		return
+	}
+	if cfg.MaxZoom > 0 && z > cfg.MaxZoom {
+		http.NotFound(w, r)
+		return
+	}
+	// Reject invalid slippy-map coordinates before touching cache or upstream.
+	// z is capped at 20 above, so this shift is safe on supported platforms.
+	dimension := 1 << uint(z)
+	if x >= dimension || y >= dimension {
+		http.NotFound(w, r)
+		return
+	}
+
+	source := tileSourceNamespace(cfg)
+	key := tileCacheKey{source: source, z: z, x: x, y: y}
 
 	// L1: in-memory
-	if data, ok := tc.getFromMem(key); ok {
+	if data, contentType, ok := tc.getFromMem(key); ok {
 		tc.mu.Lock()
 		tc.stats.memHits++
 		tc.mu.Unlock()
-		serveTile(w, data)
+		serveTile(w, data, contentType)
 		return
 	}
 
 	// L2: disk
-	cachePath := filepath.Join(cfg.CacheDir, strconv.Itoa(z), strconv.Itoa(x), fmt.Sprintf("%d.png", y))
-	if data, ok := readFileIfExists(cachePath); ok {
+	cachePath := filepath.Join(cfg.CacheDir, source, strconv.Itoa(z), strconv.Itoa(x), fmt.Sprintf("%d.tile", y))
+	if data, contentType, ok := readCachedTile(cachePath); ok {
 		tc.mu.Lock()
 		tc.stats.diskHits++
 		tc.mu.Unlock()
-		tc.setInMem(key, data) // warm L1
-		serveTile(w, data)
+		tc.setInMem(key, data, contentType) // warm L1
+		serveTile(w, data, contentType)
 		return
 	}
 
@@ -608,21 +775,17 @@ func (tc *TileCache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// WMS endpoints (when cfg.MapType == "wms"). For WMS we compute the
 	// EPSG:3857 bounding box for the tile and perform a GetMap request.
 	var req *http.Request
-	if cfg.MapType == "wms" {
+	if normalizedMapType(cfg.MapType) == "wms" {
 		// Compute EPSG:3857 bbox for the slippy tile
 		minx, miny, maxx, maxy := tileBBox3857(z, x, y)
-		layers := cfg.WMSLayers
-		// Build GetMap URL (WMS 1.3.0 using CRS=EPSG:3857)
-		// Many WMS servers also accept CRS param and width/height.
-		up := cfg.Upstream
-		// Ensure no trailing query markers
-		sep := "?"
-		if strings.Contains(up, "?") {
-			sep = "&"
+		wmsURL, err := buildWMSGetMapURL(cfg.Upstream, cfg.WMSLayers, minx, miny, maxx, maxy)
+		if err != nil {
+			tc.mu.Lock()
+			tc.stats.errors++
+			tc.mu.Unlock()
+			http.Error(w, "tile upstream error", http.StatusBadGateway)
+			return
 		}
-		wmsURL := fmt.Sprintf("%s%vSERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&CRS=EPSG:3857&LAYERS=%s&BBOX=%f,%f,%f,%f&WIDTH=256&HEIGHT=256&FORMAT=image/png",
-			up, sep, url.QueryEscape(layers), minx, miny, maxx, maxy)
-		var err error
 		req, err = http.NewRequestWithContext(r.Context(), http.MethodGet, wmsURL, nil)
 		if err != nil {
 			tc.mu.Lock()
@@ -674,31 +837,134 @@ func (tc *TileCache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "tile read error", http.StatusBadGateway)
 		return
 	}
+	contentType, ok := tileImageContentType(data)
+	if !ok {
+		tc.mu.Lock()
+		tc.stats.errors++
+		tc.mu.Unlock()
+		http.Error(w, "tile upstream did not return an image", http.StatusBadGateway)
+		return
+	}
 
 	// Persist to L2 (disk) and warm L1.
 	_ = os.MkdirAll(filepath.Dir(cachePath), 0o755)
 	_ = os.WriteFile(cachePath, data, 0o644)
-	tc.setInMem(key, data)
+	tc.setInMem(key, data, contentType)
 
 	tc.mu.Lock()
 	tc.stats.fetches++
 	tc.mu.Unlock()
 
-	serveTile(w, data)
+	serveTile(w, data, contentType)
 }
 
-func serveTile(w http.ResponseWriter, data []byte) {
-	w.Header().Set("Content-Type", "image/png")
-	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+func buildWMSGetMapURL(upstream, layers string, minx, miny, maxx, maxy float64) (string, error) {
+	u, err := url.Parse(upstream)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", errors.New("invalid WMS upstream")
+	}
+	q := u.Query()
+	q.Set("SERVICE", "WMS")
+	q.Set("REQUEST", "GetMap")
+	q.Set("VERSION", "1.3.0")
+	q.Set("CRS", "EPSG:3857")
+	q.Set("LAYERS", layers)
+	q.Set("STYLES", "")
+	q.Set("BBOX", fmt.Sprintf("%.6f,%.6f,%.6f,%.6f", minx, miny, maxx, maxy))
+	q.Set("WIDTH", "256")
+	q.Set("HEIGHT", "256")
+	q.Set("FORMAT", "image/png")
+	u.RawQuery = q.Encode()
+	return u.String(), nil
+}
+
+func tileImageContentType(data []byte) (string, bool) {
+	contentType := http.DetectContentType(data)
+	switch contentType {
+	case "image/png", "image/jpeg", "image/webp", "image/gif":
+		return contentType, true
+	default:
+		return "", false
+	}
+}
+
+func serveTile(w http.ResponseWriter, data []byte, contentType string) {
+	if contentType == "" {
+		contentType = "image/png"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d, stale-while-revalidate=3600", int(tileBrowserMaxAge.Seconds())))
 	_, _ = w.Write(data)
 }
 
-func readFileIfExists(path string) ([]byte, bool) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, false
+func readCachedTile(path string) ([]byte, string, bool) {
+	info, err := os.Stat(path)
+	if err != nil || time.Since(info.ModTime()) > tileDiskCacheTTL {
+		return nil, "", false
 	}
-	return b, true
+	b, err := os.ReadFile(path)
+	if err != nil || len(b) == 0 {
+		return nil, "", false
+	}
+	contentType, ok := tileImageContentType(b)
+	if !ok {
+		return nil, "", false
+	}
+	return b, contentType, true
+}
+
+func validateTileSettings(tiles *TileSettings) error {
+	tiles.MapType = normalizedMapType(tiles.MapType)
+	if tiles.CacheDir == "" {
+		return errors.New("tiles.cache_dir required")
+	}
+	if tiles.MaxZoom < 0 || tiles.MaxZoom > 22 {
+		return errors.New("tiles.max_zoom must be between 0 and 22")
+	}
+
+	validateURL := func(raw, field string) error {
+		u, err := url.ParseRequestURI(raw)
+		if err != nil || u.Scheme == "" || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+			return fmt.Errorf("%s must be an http(s) URL", field)
+		}
+		return nil
+	}
+
+	switch tiles.MapType {
+	case "raster", "raster-direct":
+		if tiles.Upstream == "" {
+			return errors.New("tiles.upstream required for raster maps")
+		}
+		return validateURL(tiles.Upstream, "tiles.upstream")
+	case "wms":
+		if tiles.Upstream == "" {
+			return errors.New("tiles.upstream required for WMS maps")
+		}
+		if strings.TrimSpace(tiles.WMSLayers) == "" {
+			return errors.New("tiles.wms_layers required for WMS maps")
+		}
+		return validateURL(tiles.Upstream, "tiles.upstream")
+	case "vector":
+		if tiles.StyleURL == "" {
+			return errors.New("tiles.style_url required for vector maps")
+		}
+		// A same-origin style is needed for a fully offline tinyTiles setup.
+		// Reject protocol-relative URLs so a setting cannot accidentally escape
+		// to a different host while looking like a local path.
+		isLocalStyle := strings.HasPrefix(tiles.StyleURL, "/") && !strings.HasPrefix(tiles.StyleURL, "//")
+		if !isLocalStyle {
+			if err := validateURL(tiles.StyleURL, "tiles.style_url"); err != nil {
+				return err
+			}
+		}
+		if tiles.Upstream != "" {
+			return validateURL(tiles.Upstream, "tiles.upstream")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported tiles.map_type %q", tiles.MapType)
+	}
 }
 
 // tileBBox3857 returns the bounding box (minx,miny,maxx,maxy) in EPSG:3857
@@ -845,12 +1111,20 @@ type routeCacheKey struct {
 	fromNode int64
 	toNode   int64
 	// include routing-relevant options in the key
-	engine    string
-	objective string
-	profile   string
-	maxSpeed  float64
-	heightM   float64
-	weightT   float64
+	engine              string
+	objective           string
+	profile             string
+	pro                 bool
+	emergency           bool
+	leftTurn            float64
+	rightTurn           float64
+	uTurn               float64
+	crossing            float64
+	maxSpeed            float64
+	heightM             float64
+	weightT             float64
+	noLeft              bool
+	trafficLightPenalty float64
 }
 
 // routeCacheEntry holds a cached route response with its expiry time.
@@ -897,14 +1171,22 @@ func newRouteCache(ttl time.Duration, maxItems int) *RouteCache {
 
 func (c *RouteCache) cacheKey(fromNode, toNode int64, opt osmmini.RouteOptions) routeCacheKey {
 	return routeCacheKey{
-		fromNode:  fromNode,
-		toNode:    toNode,
-		engine:    string(opt.Engine),
-		objective: string(opt.Objective),
-		profile:   string(opt.Profile),
-		maxSpeed:  opt.Weights.MaxSpeedKph,
-		heightM:   opt.Weights.VehicleHeightM,
-		weightT:   opt.Weights.VehicleWeightT,
+		fromNode:            fromNode,
+		toNode:              toNode,
+		engine:              string(opt.Engine),
+		objective:           string(opt.Objective),
+		profile:             string(opt.Profile),
+		pro:                 opt.Pro,
+		emergency:           opt.EmergencyMode,
+		leftTurn:            opt.Weights.LeftTurn,
+		rightTurn:           opt.Weights.RightTurn,
+		uTurn:               opt.Weights.UTurn,
+		crossing:            opt.Weights.Crossing,
+		maxSpeed:            opt.Weights.MaxSpeedKph,
+		heightM:             opt.Weights.VehicleHeightM,
+		weightT:             opt.Weights.VehicleWeightT,
+		noLeft:              opt.Weights.NoLeftTurn,
+		trafficLightPenalty: opt.Weights.TrafficLightPenalty,
 	}
 }
 
@@ -1024,6 +1306,7 @@ type server struct {
 	routeCache    *RouteCache
 	window        *osmmini.CoordWindow
 	enforceWindow bool
+	adminToken    string
 
 	indexTmpl *template.Template
 	openAPI   []byte
@@ -1033,10 +1316,11 @@ type server struct {
 
 	// POI / area index populated at startup (best-effort). These maps are
 	// populated by loadPOIIndex and protected by poiMu.
-	poiMu    sync.RWMutex
-	poiNodes map[int64]osmmini.Coord
-	poiWays  map[int64]osmmini.Way
-	poiRels  map[int64]osmmini.Relation
+	poiMu          sync.RWMutex
+	poiNodes       map[int64]osmmini.Coord
+	poiTaggedNodes map[int64]osmmini.Node
+	poiWays        map[int64]osmmini.Way
+	poiRels        map[int64]osmmini.Relation
 	// small in-memory cache for Wikipedia summaries (key: lang:title)
 	wikiMu    sync.RWMutex
 	wikiCache map[string]string
@@ -1045,6 +1329,17 @@ type server struct {
 	aiSessions map[string][]aiMessage
 	// aiProbe caches AI provider availability to avoid re-probing on every query
 	aiProbe aiProbeCache
+
+	// tinyTiles is optional until the user creates an offline tileset from the
+	// loaded PBF. The handler is swapped only after a complete artifact passes
+	// tinyTiles validation, so existing map requests never see partial output.
+	tinyTilesMu        sync.RWMutex
+	tinyTilesServer    *tinytilesserver.Server
+	tinyTilesDataset   *tinytiles.Dataset
+	tinyTilesHandler   http.Handler
+	tinyTilesDir       string
+	tinyTilesMaxMemory int64
+	tinyTilesBuild     tinyTilesBuildStatus
 }
 
 type aiMessage struct {
@@ -1061,8 +1356,11 @@ func main() {
 	listen := flag.String("listen", ":8080", "HTTP listen address")
 	settingsPath := flag.String("settings", "settings.json", "Settings JSON file")
 	tilesDir := flag.String("tiles-dir", "tiles-cache", "Tile cache directory")
-	tileUpstream := flag.String("tile-upstream", "https://tile.openstreetmap.org/{z}/{x}/{y}.png", "Tile upstream template")
-	buildCH := flag.Bool("build-ch", true, "Build Contraction Hierarchies (CH) after graph load")
+	tileUpstream := flag.String("tile-upstream", cartoLightTiles, "Tile upstream template")
+	buildCH := flag.Bool("build-ch", false, "Build experimental Contraction Hierarchies after graph load")
+	adminToken := flag.String("admin-token", os.Getenv("OSMMINI_ADMIN_TOKEN"), "Optional bearer token; when set, it is required for settings updates")
+	tinyTilesDir := flag.String("tinytiles-dir", "offline-tiles", "Directory for generated tinyTiles .ttiles artifacts")
+	tinyTilesMaxMemoryMB := flag.Int64("tinytiles-max-memory-mb", 768, "Maximum memory (MB) tinyTiles may use while importing a .ttiles artifact; raise this for larger PBF regions")
 
 	// Coord window support
 	windowStr := flag.String("window", "", "Coord window minLat,maxLat,minLon,maxLon (optional)")
@@ -1085,11 +1383,24 @@ func main() {
 	if err := store.Load(); err != nil {
 		log.Fatalf("settings load failed: %v", err)
 	}
-
-	// Apply default highway speeds from settings (if provided)
-	if m := store.Get().DefaultHighwaySpeeds; m != nil {
-		osmmini.DefaultHighwaySpeeds = m
+	// Normalize legacy settings before starting the tile cache. In particular,
+	// older Bayern vector styles lacked their WMTS fallback and older OSM
+	// settings routed public OSM tiles through the server proxy.
+	loadedSettings := store.Get()
+	if normalizeTileSettings(&loadedSettings.Tiles) {
+		if err := store.Put(loadedSettings); err != nil {
+			// Put updates the in-memory value before saving. Keep serving the
+			// repaired configuration even if a read-only deployment volume makes
+			// persistence impossible.
+			log.Printf("warning: persist Bayern tile fallback: %v", err)
+		}
 	}
+
+	// Apply configured speed values as overrides. Existing settings files often
+	// only specify motorway speed; replacing the complete map would silently
+	// make every other road type fall back to 50 km/h.
+	applyDefaultHighwaySpeedOverrides(store.Get().DefaultHighwaySpeeds)
+	applyAllowedHighwayTypes(store.Get().AllowedHighwayTypes)
 
 	log.Printf("Loading PBF %s and building router...", *pbf)
 	r, addrs, err := osmmini.BuildRouterWithAddressesOptions(*pbf, osmmini.BuildOptions{
@@ -1105,9 +1416,9 @@ func main() {
 	}
 	log.Printf("Graph ready: nodes=%d edges=%d addresses=%d", r.NodeCount(), r.EdgeCount(), len(addrs))
 	if *buildCH {
-		log.Printf("Building CH (upward graph)...")
+		log.Printf("Building experimental CH (upward graph)...")
 		r.BuildCH()
-		log.Printf("CH ready")
+		log.Printf("Experimental CH ready")
 	}
 
 	tileCache := NewTileCache(store.Get().Tiles)
@@ -1125,10 +1436,17 @@ func main() {
 		routeCache:    rCache,
 		window:        win,
 		enforceWindow: *enforceWindow,
+		adminToken:    strings.TrimSpace(*adminToken),
 		indexTmpl:     indexTmpl,
 		openAPI:       openapiBytes,
 		pbfPath:       *pbf,
+		tinyTilesDir:  *tinyTilesDir,
 	}
+	if *tinyTilesMaxMemoryMB > 0 {
+		srv.tinyTilesMaxMemory = *tinyTilesMaxMemoryMB << 20
+	}
+	defer srv.closeTinyTiles()
+	srv.loadTinyTilesIfPresent()
 
 	// Best-effort: load POI / area index (may be slow; non-fatal)
 	if err := srv.loadPOIIndex(*pbf); err != nil {
@@ -1146,6 +1464,84 @@ func main() {
 
 	log.Printf("Listening on %s", *listen)
 	log.Fatal(httpSrv.ListenAndServe())
+}
+
+// applyAllowedHighwayTypes configures graph import once at startup. The
+// setting affects which edges are built from the PBF, so changing it later
+// intentionally still requires a rebuild/restart.
+func applyAllowedHighwayTypes(allowed []string) {
+	if len(allowed) == 0 {
+		osmmini.AllowedHighwayTypesMap = nil
+		return
+	}
+	set := make(map[string]bool, len(allowed))
+	for _, highwayType := range allowed {
+		if highwayType = strings.TrimSpace(highwayType); highwayType != "" {
+			set[highwayType] = true
+		}
+	}
+	if len(set) == 0 {
+		osmmini.AllowedHighwayTypesMap = nil
+		return
+	}
+	osmmini.AllowedHighwayTypesMap = set
+}
+
+func applyDefaultHighwaySpeedOverrides(overrides map[string]float64) {
+	merged := make(map[string]float64, len(osmmini.DefaultHighwaySpeeds)+len(overrides))
+	for highwayType, speed := range osmmini.DefaultHighwaySpeeds {
+		merged[highwayType] = speed
+	}
+	for highwayType, speed := range overrides {
+		if highwayType = strings.TrimSpace(highwayType); highwayType != "" && speed > 0 {
+			merged[highwayType] = speed
+		}
+	}
+	osmmini.DefaultHighwaySpeeds = merged
+}
+
+// applyBayernVectorFallback upgrades legacy Bayern vector configurations that
+// only contain style_url. The raster WMTS fallback is needed when WebGL or the
+// MapLibre loader is unavailable. It intentionally applies only to official
+// BayernAtlas styles, never to arbitrary third-party vector sources.
+func applyBayernVectorFallback(tiles *TileSettings) bool {
+	if tiles == nil || normalizedMapType(tiles.MapType) != "vector" || strings.TrimSpace(tiles.Upstream) != "" {
+		return false
+	}
+	styleURL, err := url.Parse(tiles.StyleURL)
+	if err != nil || !strings.EqualFold(styleURL.Hostname(), "vtod1.bayernwolke.de") || !strings.HasPrefix(styleURL.Path, "/styles/by_style_") {
+		return false
+	}
+	if strings.Contains(strings.ToLower(styleURL.Path), "luftbild") {
+		tiles.Upstream = bayernWMTSAerial
+	} else {
+		tiles.Upstream = bayernWMTSWebkarte
+	}
+	if tiles.MaxZoom == 0 {
+		tiles.MaxZoom = 19
+	}
+	if strings.TrimSpace(tiles.Attribution) == "" {
+		tiles.Attribution = bayernVectorAttribution
+	}
+	return true
+}
+
+func applyOSMDirectRaster(tiles *TileSettings) bool {
+	if tiles == nil || normalizedMapType(tiles.MapType) != "raster" || !isOSMStandardTileURL(tiles.Upstream) {
+		return false
+	}
+	tiles.MapType = "raster-direct"
+	return true
+}
+
+func normalizeTileSettings(tiles *TileSettings) bool {
+	changed := applyBayernVectorFallback(tiles)
+	changed = applyOSMDirectRaster(tiles) || changed
+	if strings.TrimSpace(tiles.Upstream) == legacyBasemapDETiles {
+		tiles.Upstream = basemapDETiles
+		changed = true
+	}
+	return changed
 }
 
 func (s *server) routes() http.Handler {
@@ -1166,12 +1562,14 @@ func (s *server) routes() http.Handler {
 
 	// Tiles
 	mux.Handle("/tiles/", s.tiles)
+	mux.HandleFunc("/tinytiles/", s.serveTinyTiles)
 
 	// API
 	mux.HandleFunc("/api/v1/health", s.handleHealth)
 	mux.HandleFunc("/api/v1/status", s.handleStatus)
 	mux.HandleFunc("/api/v1/settings", s.handleSettings)
 	mux.HandleFunc("/api/v1/tile-sources", s.handleTileSources)
+	mux.HandleFunc("/api/v1/tinytiles/build", s.handleTinyTilesBuild)
 	mux.HandleFunc("/api/v1/profiles", s.handleProfiles)
 	mux.HandleFunc("/api/v1/search", s.handleSearch)
 	mux.HandleFunc("/api/v1/route", s.handleRoute)
@@ -1188,116 +1586,269 @@ func (s *server) routes() http.Handler {
 	return withLogging(withCORS(mux))
 }
 
-// loadPOIIndex performs a best-effort extraction of tagged ways and relations
-// from the PBF so area and POI queries can be answered. It's intentionally
-// permissive in the tags it keeps to capture landuse/natural/amenity/shop.
+// poiCacheVersion changes whenever the persisted POI representation changes.
+// Version 3 stores coordinates only for indexed POI geometry instead of every
+// node in the source PBF.
+const poiCacheVersion = 3
+
+// poiExtractFunc makes the two-pass index construction independently testable
+// while production continues to use osmmini.ExtractFile.
+type poiExtractFunc func(osmmini.Options, osmmini.Callbacks) error
+
+// loadPOIIndex builds a point, way, and relation POI index from the PBF. It
+// intentionally runs separately from graph construction so a large Bavarian
+// extract cannot block the routing service indefinitely.
 func (s *server) loadPOIIndex(pbfPath string) error {
 	if pbfPath == "" {
 		return nil
 	}
 	nodes := make(map[int64]osmmini.Coord)
+	taggedNodes := make(map[int64]osmmini.Node)
 	ways := make(map[int64]osmmini.Way)
 	rels := make(map[int64]osmmini.Relation)
-
-	keepTags := map[string]bool{
-		"name": true, "amenity": true, "shop": true, "brand": true,
-		"natural": true, "landuse": true, "leisure": true, "tourism": true,
-		"boundary": true, "admin_level": true,
-	}
-
-	opts := osmmini.Options{
-		EmitWayNodeIDs:      true,
-		EmitRelationMembers: true,
-		KeepTag: func(k string) bool {
-			return keepTags[k]
-		},
-	}
-
-	cb := osmmini.Callbacks{
-		Node: func(id int64, lat, lon float64) error {
-			nodes[id] = osmmini.Coord{Lat: lat, Lon: lon}
-			return nil
-		},
-		TaggedWay: func(w osmmini.Way) error {
-			ways[w.ID] = w
-			return nil
-		},
-		TaggedRelation: func(r osmmini.Relation) error {
-			rels[r.ID] = r
-			return nil
-		},
-	}
 
 	// ExtractFile can be slow on large PBFs; run with a background context
 	// and a modest timeout to avoid blocking startup indefinitely.
 	// Try loading from a cache file first
 	cachePath := pbfPath + ".poi.json"
-	if loadErr := s.loadPOICache(cachePath, nodes, ways, rels); loadErr == nil {
-		// loaded from cache
-		s.poiMu.Lock()
-		s.poiNodes = nodes
-		s.poiWays = ways
-		s.poiRels = rels
-		s.wikiMu.Lock()
-		s.wikiCache = make(map[string]string)
-		s.wikiMu.Unlock()
-		s.poiMu.Unlock()
-		// build brand aliases from indexed POIs to improve fuzzy matching
-		s.buildBrandAliases()
-		// ensure aiSessions map initialized
-		s.aiMu.Lock()
-		if s.aiSessions == nil {
-			s.aiSessions = make(map[string][]aiMessage)
+	if poiCacheIsFresh(pbfPath, cachePath) {
+		if loadErr := s.loadPOICache(cachePath, nodes, taggedNodes, ways, rels); loadErr == nil {
+			s.installPOIIndex(nodes, taggedNodes, ways, rels)
+			return nil
 		}
-		s.aiMu.Unlock()
-		return nil
 	}
 
 	done := make(chan error, 1)
 	go func() {
-		done <- osmmini.ExtractFile(pbfPath, opts, cb)
+		done <- buildPOIIndex(func(opts osmmini.Options, cb osmmini.Callbacks) error {
+			return osmmini.ExtractFile(pbfPath, opts, cb)
+		}, nodes, taggedNodes, ways, rels)
 	}()
 	select {
 	case err := <-done:
 		if err != nil {
 			return err
 		}
+		s.completePOIIndex(cachePath, nodes, taggedNodes, ways, rels)
 	case <-time.After(30 * time.Second):
-		// give up after 30s — this is best-effort indexing
+		// Keep extracting in the background and publish the complete index when
+		// ready. The old behavior discarded an index that merely took longer
+		// than 30 seconds, which is common for Bavaria-wide extracts.
+		log.Printf("POI index is still building in the background")
+		go func() {
+			if err := <-done; err != nil {
+				log.Printf("warning: POI index failed: %v", err)
+				return
+			}
+			s.completePOIIndex(cachePath, nodes, taggedNodes, ways, rels)
+			log.Printf("POI index ready: nodes=%d ways=%d relations=%d", len(taggedNodes), len(ways), len(rels))
+		}()
 		return nil
 	}
-
-	// persist cache asynchronously (best-effort)
-	if s.settings.Get().SavePOICache {
-		go func() {
-			_ = s.savePOICache(cachePath, nodes, ways, rels)
-		}()
-	}
-
-	s.poiMu.Lock()
-	s.poiNodes = nodes
-	s.poiWays = ways
-	s.poiRels = rels
-	s.poiMu.Unlock()
 	return nil
 }
 
+// buildPOIIndex collects POI entities first, then performs a second PBF pass
+// to retain coordinates only for nodes referenced by those entities. Keeping
+// every PBF node made a Bavaria-wide POI index consume substantially more
+// memory than the POIs themselves. Tagged point POIs keep their own coordinate
+// in taggedNodes and are also retained in nodes for legacy ID lookups.
+func buildPOIIndex(extract poiExtractFunc, nodes map[int64]osmmini.Coord, taggedNodes map[int64]osmmini.Node, ways map[int64]osmmini.Way, rels map[int64]osmmini.Relation) error {
+	keepTags := map[string]bool{
+		"name": true, "alt_name": true, "amenity": true, "shop": true,
+		"brand": true, "operator": true, "office": true, "craft": true,
+		"natural": true, "landuse": true, "leisure": true, "tourism": true,
+		"railway": true, "highway": true, "public_transport": true,
+		"aeroway": true, "man_made": true, "healthcare": true,
+		"emergency": true, "sport": true, "historic": true, "place": true,
+		"boundary": true, "admin_level": true, "wikipedia": true,
+		"website": true, "opening_hours": true, "phone": true,
+	}
+	// Keep labels such as name, but only fully decode entities that carry a
+	// POI/area category. In particular, this avoids decoding node references
+	// for every named road in a Bavaria-wide extract.
+	nodePOIKeys := tagKeySet("amenity", "shop", "tourism", "leisure", "office", "craft", "healthcare", "emergency", "sport", "historic", "place", "aeroway", "public_transport", "railway", "highway", "natural", "landuse", "boundary")
+	wayPOIKeys := tagKeySet("amenity", "shop", "tourism", "leisure", "office", "craft", "healthcare", "emergency", "sport", "historic", "place", "aeroway", "public_transport", "railway", "natural", "landuse", "boundary")
+	relationPOIKeys := tagKeySet("amenity", "shop", "tourism", "leisure", "historic", "place", "natural", "landuse", "boundary")
+
+	firstPassOpts := osmmini.Options{
+		EmitWayNodeIDs:      true,
+		EmitRelationMembers: true,
+		TaggedNodeKey: func(k string) bool {
+			return nodePOIKeys[k]
+		},
+		TaggedWayKey: func(k string) bool {
+			return wayPOIKeys[k]
+		},
+		TaggedRelationKey: func(k string) bool {
+			return relationPOIKeys[k]
+		},
+		KeepTag: func(k string) bool {
+			return keepTags[k]
+		},
+	}
+
+	firstPassCallbacks := osmmini.Callbacks{
+		TaggedNode: func(n osmmini.Node) error {
+			if isIndexablePOITags(n.Tags) {
+				taggedNodes[n.ID] = n
+				// Preserve historical lookups by numeric node ID without storing
+				// the much larger set of untagged PBF nodes.
+				nodes[n.ID] = osmmini.Coord{Lat: n.Lat, Lon: n.Lon}
+			}
+			return nil
+		},
+		TaggedWay: func(w osmmini.Way) error {
+			// Keep tagged roads out of the POI index: otherwise the broad
+			// highway/name extraction would store virtually every road in Bavaria.
+			if isIndexablePOITags(w.Tags) {
+				ways[w.ID] = w
+			}
+			return nil
+		},
+		TaggedRelation: func(r osmmini.Relation) error {
+			if isIndexablePOITags(r.Tags) {
+				rels[r.ID] = r
+			}
+			return nil
+		},
+	}
+	if err := extract(firstPassOpts, firstPassCallbacks); err != nil {
+		return err
+	}
+
+	neededNodeIDs := collectPOINodeReferences(ways, rels)
+	if len(neededNodeIDs) == 0 {
+		return nil
+	}
+
+	return extract(osmmini.Options{}, osmmini.Callbacks{
+		Node: func(id int64, lat, lon float64) error {
+			if _, needed := neededNodeIDs[id]; needed {
+				nodes[id] = osmmini.Coord{Lat: lat, Lon: lon}
+			}
+			return nil
+		},
+	})
+}
+
+// collectPOINodeReferences returns the exact node-coordinate set required to
+// preserve way centroids and direct relation-node coordinates in the POI API.
+// Relation member ways retain the existing behaviour: only independently
+// indexed POI ways have geometry available.
+func collectPOINodeReferences(ways map[int64]osmmini.Way, rels map[int64]osmmini.Relation) map[int64]struct{} {
+	needed := make(map[int64]struct{})
+	for _, way := range ways {
+		for _, nodeID := range way.NodeIDs {
+			needed[nodeID] = struct{}{}
+		}
+	}
+	for _, rel := range rels {
+		for _, member := range rel.Members {
+			if member.Type == osmmini.MemberNode {
+				needed[member.ID] = struct{}{}
+			}
+		}
+	}
+	return needed
+}
+
+func poiCacheIsFresh(pbfPath, cachePath string) bool {
+	pbfInfo, pbfErr := os.Stat(pbfPath)
+	cacheInfo, cacheErr := os.Stat(cachePath)
+	if pbfErr != nil || cacheErr != nil {
+		return cacheErr == nil
+	}
+	return !cacheInfo.ModTime().Before(pbfInfo.ModTime())
+}
+
+func tagKeySet(keys ...string) map[string]bool {
+	set := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		set[key] = true
+	}
+	return set
+}
+
+func isIndexablePOITags(tags osmmini.Tags) bool {
+	for _, key := range []string{"amenity", "shop", "tourism", "leisure", "office", "craft", "healthcare", "emergency", "sport", "historic", "place", "aeroway", "public_transport"} {
+		if tags[key] != "" {
+			return true
+		}
+	}
+	switch tags["railway"] {
+	case "station", "halt", "tram_stop", "platform", "subway_entrance":
+		return true
+	}
+	switch tags["highway"] {
+	case "bus_stop", "services", "rest_area":
+		return true
+	}
+	switch tags["natural"] {
+	case "water", "wood", "peak", "beach", "cave_entrance", "spring":
+		return true
+	}
+	switch tags["landuse"] {
+	case "forest", "reservoir", "recreation_ground", "village_green":
+		return true
+	}
+	return tags["boundary"] != "" && tags["name"] != ""
+}
+
+func (s *server) completePOIIndex(cachePath string, nodes map[int64]osmmini.Coord, taggedNodes map[int64]osmmini.Node, ways map[int64]osmmini.Way, rels map[int64]osmmini.Relation) {
+	if s.settings != nil && s.settings.Get().SavePOICache {
+		go func() {
+			if err := s.savePOICache(cachePath, nodes, taggedNodes, ways, rels); err != nil {
+				log.Printf("warning: save POI cache: %v", err)
+			}
+		}()
+	}
+	s.installPOIIndex(nodes, taggedNodes, ways, rels)
+}
+
+func (s *server) installPOIIndex(nodes map[int64]osmmini.Coord, taggedNodes map[int64]osmmini.Node, ways map[int64]osmmini.Way, rels map[int64]osmmini.Relation) {
+	s.poiMu.Lock()
+	s.poiNodes = nodes
+	s.poiTaggedNodes = taggedNodes
+	s.poiWays = ways
+	s.poiRels = rels
+	s.poiMu.Unlock()
+
+	s.wikiMu.Lock()
+	s.wikiCache = make(map[string]string)
+	s.wikiMu.Unlock()
+	s.buildBrandAliases()
+	s.aiMu.Lock()
+	if s.aiSessions == nil {
+		s.aiSessions = make(map[string][]aiMessage)
+	}
+	s.aiMu.Unlock()
+}
+
 // loadPOICache attempts to populate the provided maps from a JSON cache file.
-func (s *server) loadPOICache(path string, nodes map[int64]osmmini.Coord, ways map[int64]osmmini.Way, rels map[int64]osmmini.Relation) error {
+func (s *server) loadPOICache(path string, nodes map[int64]osmmini.Coord, taggedNodes map[int64]osmmini.Node, ways map[int64]osmmini.Way, rels map[int64]osmmini.Relation) error {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
 	var payload struct {
-		Nodes map[int64]osmmini.Coord    `json:"nodes"`
-		Ways  map[int64]osmmini.Way      `json:"ways"`
-		Rels  map[int64]osmmini.Relation `json:"rels"`
+		Version     int                        `json:"version"`
+		Nodes       map[int64]osmmini.Coord    `json:"nodes"`
+		TaggedNodes map[int64]osmmini.Node     `json:"tagged_nodes"`
+		Ways        map[int64]osmmini.Way      `json:"ways"`
+		Rels        map[int64]osmmini.Relation `json:"rels"`
 	}
 	if err := json.Unmarshal(b, &payload); err != nil {
 		return err
 	}
+	if payload.Version != poiCacheVersion {
+		return fmt.Errorf("unsupported POI cache version %d", payload.Version)
+	}
 	for k, v := range payload.Nodes {
 		nodes[k] = v
+	}
+	for k, v := range payload.TaggedNodes {
+		taggedNodes[k] = v
 	}
 	for k, v := range payload.Ways {
 		ways[k] = v
@@ -1309,12 +1860,14 @@ func (s *server) loadPOICache(path string, nodes map[int64]osmmini.Coord, ways m
 }
 
 // savePOICache writes the POI index to a JSON cache file (best-effort).
-func (s *server) savePOICache(path string, nodes map[int64]osmmini.Coord, ways map[int64]osmmini.Way, rels map[int64]osmmini.Relation) error {
+func (s *server) savePOICache(path string, nodes map[int64]osmmini.Coord, taggedNodes map[int64]osmmini.Node, ways map[int64]osmmini.Way, rels map[int64]osmmini.Relation) error {
 	payload := struct {
-		Nodes map[int64]osmmini.Coord    `json:"nodes"`
-		Ways  map[int64]osmmini.Way      `json:"ways"`
-		Rels  map[int64]osmmini.Relation `json:"rels"`
-	}{Nodes: nodes, Ways: ways, Rels: rels}
+		Version     int                        `json:"version"`
+		Nodes       map[int64]osmmini.Coord    `json:"nodes"`
+		TaggedNodes map[int64]osmmini.Node     `json:"tagged_nodes"`
+		Ways        map[int64]osmmini.Way      `json:"ways"`
+		Rels        map[int64]osmmini.Relation `json:"rels"`
+	}{Version: poiCacheVersion, Nodes: nodes, TaggedNodes: taggedNodes, Ways: ways, Rels: rels}
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -1659,10 +2212,13 @@ func withLogging(next http.Handler) http.Handler {
 
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS")
+		// The UI and API are served from the same origin. Do not emit a wildcard
+		// CORS policy here: it would let arbitrary websites read settings and
+		// drive the configuration endpoint from a visitor's browser. Deployments
+		// that intentionally expose a cross-origin API can
+		// add a narrowly-scoped policy in their reverse proxy.
 		if r.Method == http.MethodOptions {
+			w.Header().Set("Allow", "GET, POST, PUT, OPTIONS")
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -1715,17 +2271,17 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
-	// Attempt to refresh settings from disk before serving the page.
-	// Any load error is intentionally ignored — Get() returns the last
-	// successfully loaded settings in that case.
-	_ = s.settings.Load()
-
-	settings := s.settings.Get()
-	settingsJSON, _ := json.Marshal(settings)
+	// Settings are loaded at startup and updated atomically through the API.
+	// Reloading here could overwrite a runtime-normalized tile fallback while
+	// the tile cache still uses that normalized configuration.
+	settings := publicSettings(s.settings.Get())
 
 	_ = s.indexTmpl.Execute(w, map[string]any{
-		"Version":  buildVersion,
-		"Settings": string(settingsJSON),
+		"Version": buildVersion,
+		// html/template serializes structs in a script context as JSON. Passing
+		// a pre-marshaled string here would encode it a second time and make the
+		// browser receive a JSON string instead of a settings object.
+		"Settings": settings,
 	})
 }
 
@@ -1801,6 +2357,7 @@ func (s *server) handleAgentQuery(w http.ResponseWriter, r *http.Request) {
 		// fuzzy fallback over address names/brands
 		if len(matches) == 0 {
 			placeNorm := normalizeForCompare(place)
+			brandAlias := lookupBrandAlias(placeNorm)
 			s.poiMu.RLock()
 			for _, a := range s.addrs {
 				nameNorm := normalizeForCompare(a.Tags["name"])
@@ -1813,8 +2370,8 @@ func (s *server) handleAgentQuery(w http.ResponseWriter, r *http.Request) {
 					matches = append(matches, a)
 					continue
 				}
-				if canon, ok := brandAliasMap[placeNorm]; ok {
-					if brandNorm != "" && strings.Contains(brandNorm, canon) {
+				if brandAlias != "" {
+					if brandNorm != "" && strings.Contains(brandNorm, brandAlias) {
 						matches = append(matches, a)
 						continue
 					}
@@ -2221,7 +2778,7 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	uptime := time.Since(s.startedAt).Seconds()
-	set := s.settings.Get()
+	set := publicSettings(s.settings.Get())
 
 	out := map[string]any{
 		"uptime_s":  uptime,
@@ -2259,32 +2816,54 @@ func (s *server) handleProfiles(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, osmmini.BuiltinProfiles)
 }
 
+func (s *server) requireSettingsAdmin(w http.ResponseWriter, r *http.Request) bool {
+	if s.adminToken == "" {
+		return true
+	}
+	expected := "Bearer " + s.adminToken
+	provided := r.Header.Get("Authorization")
+	if len(provided) != len(expected) || subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="osmmini settings"`)
+		writeJSONError(w, http.StatusUnauthorized, "settings update requires an admin token")
+		return false
+	}
+	return true
+}
+
 func (s *server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, s.settings.Get())
+		writeJSON(w, http.StatusOK, publicSettings(s.settings.Get()))
 		return
 	case http.MethodPut:
+		if !s.requireSettingsAdmin(w, r) {
+			return
+		}
 		var v Settings
 		if err := readJSON(w, r, &v, 1<<20); err != nil {
 			writeJSONError(w, http.StatusBadRequest, "invalid json: "+err.Error())
 			return
 		}
-		if v.Tiles.CacheDir == "" {
-			writeJSONError(w, http.StatusBadRequest, "tiles.cache_dir required")
+		normalizeTileSettings(&v.Tiles)
+		if err := validateTileSettings(&v.Tiles); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		// upstream is required for raster/wms; for vector map_type, style_url is used instead
-		if v.Tiles.Upstream == "" && v.Tiles.StyleURL == "" {
-			writeJSONError(w, http.StatusBadRequest, "tiles.upstream or tiles.style_url required")
-			return
+		// GET and the initial page intentionally redact the key. Preserve the
+		// configured value when the settings form is saved without a replacement.
+		if v.AI.OpenAIAPIKey == "" {
+			v.AI.OpenAIAPIKey = s.settings.Get().AI.OpenAIAPIKey
 		}
 		if err := s.settings.Put(v); err != nil {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		s.tiles.Update(v.Tiles)
-		writeJSON(w, http.StatusOK, v)
+		if s.routeCache != nil {
+			s.routeCache.Invalidate()
+		}
+		s.aiProbe.invalidate()
+		writeJSON(w, http.StatusOK, publicSettings(v))
 		return
 	default:
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -2385,7 +2964,9 @@ func (s *server) searchPOIMatches(raw string, limit int) []apiSearchResult {
 	}
 
 	type scored struct {
-		way   osmmini.Way
+		id    int64
+		kind  string
+		tags  osmmini.Tags
 		coord osmmini.Coord
 		score int
 	}
@@ -2395,14 +2976,14 @@ func (s *server) searchPOIMatches(raw string, limit int) []apiSearchResult {
 	scoredPOIs := make([]scored, 0, limit*4)
 
 	s.poiMu.RLock()
-	for _, w := range s.poiWays {
-		score := scorePOIResult(w.Tags, qNorm, tokens)
+	for _, poiWay := range s.poiWays {
+		score := scorePOIResult(poiWay.Tags, qNorm, tokens)
 		if score <= 0 {
 			continue
 		}
 		var cx, cy float64
 		var cnt int
-		for _, nid := range w.NodeIDs {
+		for _, nid := range poiWay.NodeIDs {
 			if c, ok := s.poiNodes[nid]; ok {
 				cx += c.Lat
 				cy += c.Lon
@@ -2416,7 +2997,18 @@ func (s *server) searchPOIMatches(raw string, limit int) []apiSearchResult {
 		if s.window != nil && !s.window.Contains(coord) {
 			continue
 		}
-		scoredPOIs = append(scoredPOIs, scored{way: w, coord: coord, score: score})
+		scoredPOIs = append(scoredPOIs, scored{id: poiWay.ID, kind: "poi", tags: poiWay.Tags, coord: coord, score: score})
+	}
+	for _, poiNode := range s.poiTaggedNodes {
+		score := scorePOIResult(poiNode.Tags, qNorm, tokens)
+		if score <= 0 {
+			continue
+		}
+		coord := osmmini.Coord{Lat: poiNode.Lat, Lon: poiNode.Lon}
+		if s.window != nil && !s.window.Contains(coord) {
+			continue
+		}
+		scoredPOIs = append(scoredPOIs, scored{id: poiNode.ID, kind: "node", tags: poiNode.Tags, coord: coord, score: score})
 	}
 	s.poiMu.RUnlock()
 
@@ -2427,8 +3019,8 @@ func (s *server) searchPOIMatches(raw string, limit int) []apiSearchResult {
 			}
 			return 1
 		}
-		al := formatSearchResultLabel("poi", a.way.Tags)
-		bl := formatSearchResultLabel("poi", b.way.Tags)
+		al := formatSearchResultLabel(a.kind, a.tags)
+		bl := formatSearchResultLabel(b.kind, b.tags)
 		return strings.Compare(al, bl)
 	})
 
@@ -2438,7 +3030,7 @@ func (s *server) searchPOIMatches(raw string, limit int) []apiSearchResult {
 
 	out := make([]apiSearchResult, 0, len(scoredPOIs))
 	for _, item := range scoredPOIs {
-		out = append(out, buildSearchResult("poi", item.way.ID, item.coord, item.way.Tags, raw))
+		out = append(out, buildSearchResult(item.kind, item.id, item.coord, item.tags, raw))
 	}
 	return out
 }
@@ -2486,6 +3078,18 @@ func (s *server) findNearestPlaceLabel(lat, lon float64, maxDistM float64) (stri
 			lbl := firstNonEmpty(w.Tags["name"], w.Tags["brand"], formatAddressLabel(w.Tags))
 			if lbl == "" {
 				lbl = primarySearchCategory(w.Tags)
+			}
+			bestDist = d
+			bestLabel = lbl
+		}
+	}
+	for _, n := range s.poiTaggedNodes {
+		coord := osmmini.Coord{Lat: n.Lat, Lon: n.Lon}
+		d := haversineMeters(lat, lon, coord.Lat, coord.Lon)
+		if d < bestDist && d <= maxDistM {
+			lbl := firstNonEmpty(n.Tags["name"], n.Tags["brand"], formatAddressLabel(n.Tags))
+			if lbl == "" {
+				lbl = primarySearchCategory(n.Tags)
 			}
 			bestDist = d
 			bestLabel = lbl
@@ -3812,7 +4416,7 @@ func (s *server) handleAIQuery(w http.ResponseWriter, r *http.Request) {
 	var sysB strings.Builder
 	sysB.WriteString("Du bist ein Routing-Assistent für OSMmini, ein Offline-Routing-System. " +
 		"Du kannst Fragen zu Routenplanung, Navigation und Verkehr beantworten. " +
-		"Verfügbare Features: A*-, Dijkstra- und CH-Routing, TSP-Optimierung (bis 16 Stops exakt, " +
+		"Verfügbare Features: A*- und Dijkstra-Routing, TSP-Optimierung (bis 16 Stops exakt, " +
 		"darüber hinaus Greedy mit 2-opt), Linksabbiege-Vermeidung, Ampelstrafen, " +
 		"BOS/Einsatzmodus (Feuerwehr, Rettungsdienst), Fahrzeugbeschränkungen (Höhe, Gewicht). " +
 		"Antworte kurz und hilfreich auf Deutsch.")
@@ -4049,6 +4653,7 @@ func (s *server) handleAIQuery(w http.ResponseWriter, r *http.Request) {
 		// If no structured matches, try fuzzy name/brand scan over addresses
 		if len(matches) == 0 {
 			placeNormCmp := normalizeForCompare(place)
+			brandAlias := lookupBrandAlias(placeNormCmp)
 			for _, a := range s.addrs {
 				nameNorm := normalizeForCompare(a.Tags["name"])
 				brandNorm := normalizeForCompare(a.Tags["brand"])
@@ -4062,12 +4667,12 @@ func (s *server) handleAIQuery(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				// alias lookup (e.g., user typed 'maci')
-				if canon, ok := brandAliasMap[placeNormCmp]; ok {
-					if brandNorm != "" && strings.Contains(brandNorm, canon) {
+				if brandAlias != "" {
+					if brandNorm != "" && strings.Contains(brandNorm, brandAlias) {
 						matches = append(matches, a)
 						continue
 					}
-					if a.Tags["amenity"] == "fast_food" && (strings.Contains(nameNorm, canon) || strings.Contains(brandNorm, canon)) {
+					if a.Tags["amenity"] == "fast_food" && (strings.Contains(nameNorm, brandAlias) || strings.Contains(brandNorm, brandAlias)) {
 						matches = append(matches, a)
 						continue
 					}
@@ -4351,10 +4956,27 @@ func (s *server) handlePOIInfo(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	// path is /api/v1/poi/{id}
-	idStr := strings.TrimPrefix(r.URL.Path, "/api/v1/poi/")
-	if idStr == "" {
+	// Paths may be /api/v1/poi/{id} (legacy) or
+	// /api/v1/poi/{node|way|relation}/{id}. The typed form avoids collisions
+	// because OSM node, way, and relation IDs occupy separate namespaces.
+	tail := strings.TrimPrefix(r.URL.Path, "/api/v1/poi/")
+	if tail == "" {
 		writeJSONError(w, http.StatusBadRequest, "missing id")
+		return
+	}
+	parts := strings.Split(tail, "/")
+	var kind, idStr string
+	switch len(parts) {
+	case 1:
+		idStr = parts[0]
+	case 2:
+		kind, idStr = parts[0], parts[1]
+		if kind != "node" && kind != "way" && kind != "relation" {
+			writeJSONError(w, http.StatusBadRequest, "invalid POI kind")
+			return
+		}
+	default:
+		writeJSONError(w, http.StatusBadRequest, "invalid POI path")
 		return
 	}
 	id, err := strconv.ParseInt(idStr, 10, 64)
@@ -4364,64 +4986,79 @@ func (s *server) handlePOIInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.poiMu.RLock()
-	// prefer way, then node, then relation
-	if wv, ok := s.poiWays[id]; ok {
-		// compute centroid
-		var cx, cy float64
-		var cnt int
-		for _, nid := range wv.NodeIDs {
-			if c, ok := s.poiNodes[nid]; ok {
-				cx += c.Lat
-				cy += c.Lon
-				cnt++
+	// Legacy requests retain the historical preference: way, node, relation.
+	if kind == "" || kind == "way" {
+		wv, ok := s.poiWays[id]
+		if ok {
+			// compute centroid
+			var cx, cy float64
+			var cnt int
+			for _, nid := range wv.NodeIDs {
+				if c, ok := s.poiNodes[nid]; ok {
+					cx += c.Lat
+					cy += c.Lon
+					cnt++
+				}
 			}
-		}
-		lat, lon := 0.0, 0.0
-		if cnt > 0 {
-			lat = cx / float64(cnt)
-			lon = cy / float64(cnt)
-		}
-		resp := poiInfoResponse{ID: id, Kind: "way", Label: wv.Tags["name"], Lat: lat, Lon: lon, Tags: wv.Tags}
-		s.poiMu.RUnlock()
-		// optional distance
-		if qlatS := r.URL.Query().Get("lat"); qlatS != "" {
-			if qlonS := r.URL.Query().Get("lon"); qlonS != "" {
-				if qlat, err1 := strconv.ParseFloat(qlatS, 64); err1 == nil {
-					if qlon, err2 := strconv.ParseFloat(qlonS, 64); err2 == nil {
-						d := haversineMeters(qlat, qlon, resp.Lat, resp.Lon)
-						resp.DistanceM = &d
+			lat, lon := 0.0, 0.0
+			if cnt > 0 {
+				lat = cx / float64(cnt)
+				lon = cy / float64(cnt)
+			}
+			resp := poiInfoResponse{ID: id, Kind: "way", Label: wv.Tags["name"], Lat: lat, Lon: lon, Tags: wv.Tags}
+			s.poiMu.RUnlock()
+			// optional distance
+			if qlatS := r.URL.Query().Get("lat"); qlatS != "" {
+				if qlonS := r.URL.Query().Get("lon"); qlonS != "" {
+					if qlat, err1 := strconv.ParseFloat(qlatS, 64); err1 == nil {
+						if qlon, err2 := strconv.ParseFloat(qlonS, 64); err2 == nil {
+							d := haversineMeters(qlat, qlon, resp.Lat, resp.Lon)
+							resp.DistanceM = &d
+						}
 					}
 				}
 			}
-		}
-		// wikipedia summary if available
-		if tag, ok := resp.Tags["wikipedia"]; ok && tag != "" {
-			lang := ""
-			title := tag
-			if strings.Contains(tag, ":") {
-				parts := strings.SplitN(tag, ":", 2)
-				lang = parts[0]
-				title = parts[1]
+			// wikipedia summary if available
+			if tag, ok := resp.Tags["wikipedia"]; ok && tag != "" {
+				lang := ""
+				title := tag
+				if strings.Contains(tag, ":") {
+					parts := strings.SplitN(tag, ":", 2)
+					lang = parts[0]
+					title = parts[1]
+				}
+				if summary := s.fetchWikiSummary(r.Context(), lang, title); summary != "" {
+					resp.WikiSummary = summary
+				}
 			}
-			if summary := s.fetchWikiSummary(r.Context(), lang, title); summary != "" {
-				resp.WikiSummary = summary
-			}
+			writeJSON(w, http.StatusOK, resp)
+			return
 		}
-		writeJSON(w, http.StatusOK, resp)
-		return
 	}
-	if nv, ok := s.poiNodes[id]; ok {
-		// node may not have tags in node index; search in ways/relations for tag info
-		// build minimal response
-		resp := poiInfoResponse{ID: id, Kind: "node", Label: "", Lat: nv.Lat, Lon: nv.Lon, Tags: nil}
-		s.poiMu.RUnlock()
-		writeJSON(w, http.StatusOK, resp)
-		return
+
+	if kind == "" || kind == "node" {
+		if tagged, ok := s.poiTaggedNodes[id]; ok {
+			resp := poiInfoResponse{ID: id, Kind: "node", Label: formatSearchResultLabel("node", tagged.Tags), Lat: tagged.Lat, Lon: tagged.Lon, Tags: tagged.Tags}
+			s.poiMu.RUnlock()
+			writeJSON(w, http.StatusOK, resp)
+			return
+		}
+		if nv, ok := s.poiNodes[id]; ok {
+			// Coordinates without POI tags remain available for legacy requests.
+			resp := poiInfoResponse{ID: id, Kind: "node", Label: "", Lat: nv.Lat, Lon: nv.Lon, Tags: nil}
+			s.poiMu.RUnlock()
+			writeJSON(w, http.StatusOK, resp)
+			return
+		}
 	}
-	if rv, ok := s.poiRels[id]; ok {
+	if kind == "" || kind == "relation" {
+		rv, ok := s.poiRels[id]
+		if !ok {
+			s.poiMu.RUnlock()
+			writeJSONError(w, http.StatusNotFound, "POI not found")
+			return
+		}
 		// relation: return centroid of member ways/nodes when possible
-		s.poiMu.RUnlock()
-		// try to assemble centroid from members
 		var sumLat, sumLon float64
 		var cnt int
 		for _, m := range rv.Members {
@@ -4449,6 +5086,7 @@ func (s *server) handlePOIInfo(w http.ResponseWriter, r *http.Request) {
 			lon = sumLon / float64(cnt)
 		}
 		resp := poiInfoResponse{ID: id, Kind: "relation", Label: rv.Tags["name"], Lat: lat, Lon: lon, Tags: rv.Tags}
+		s.poiMu.RUnlock()
 		// optional wiki
 		if tag, ok := resp.Tags["wikipedia"]; ok && tag != "" {
 			lang := ""
@@ -4771,6 +5409,22 @@ func (s *server) searchPOIsNear(lat, lon float64, tagKey, tagVal string, limit i
 		}
 		results = append(results, poiNearResult{
 			AddressEntry: osmmini.AddressEntry{ID: w.ID, Coord: coord, Tags: w.Tags},
+			DistM:        haversineMeters(lat, lon, coord.Lat, coord.Lon),
+			Label:        lbl,
+		})
+	}
+	for _, n := range s.poiTaggedNodes {
+		v, ok := n.Tags[tagKey]
+		if !ok || (tagVal != "" && !strings.EqualFold(v, tagVal)) {
+			continue
+		}
+		coord := osmmini.Coord{Lat: n.Lat, Lon: n.Lon}
+		lbl := firstNonEmpty(n.Tags["name"], n.Tags["brand"])
+		if lbl == "" {
+			lbl = tagKey + "=" + tagVal
+		}
+		results = append(results, poiNearResult{
+			AddressEntry: osmmini.AddressEntry{ID: n.ID, Coord: coord, Tags: n.Tags},
 			DistM:        haversineMeters(lat, lon, coord.Lat, coord.Lon),
 			Label:        lbl,
 		})
@@ -5158,6 +5812,20 @@ func (s *server) resolvePOIFuzzyNear(query string, lat, lon float64) (osmmini.Co
 		}
 		cands = append(cands, cand{coord: coord, label: lbl, dist: haversineMeters(lat, lon, coord.Lat, coord.Lon)})
 	}
+	for _, n := range s.poiTaggedNodes {
+		name := normalizeForCompare(n.Tags["name"])
+		brand := normalizeForCompare(n.Tags["brand"])
+		if !strings.Contains(name, norm) && !strings.Contains(norm, name) &&
+			!strings.Contains(brand, norm) && !strings.Contains(norm, brand) {
+			continue
+		}
+		label := firstNonEmpty(n.Tags["name"], n.Tags["brand"])
+		if label == "" {
+			continue
+		}
+		coord := osmmini.Coord{Lat: n.Lat, Lon: n.Lon}
+		cands = append(cands, cand{coord: coord, label: label, dist: haversineMeters(lat, lon, coord.Lat, coord.Lon)})
+	}
 	s.poiMu.RUnlock()
 	for _, a := range s.addrs {
 		name := normalizeForCompare(a.Tags["name"])
@@ -5218,6 +5886,19 @@ func (s *server) resolvePOIFuzzy(query string) (osmmini.Coord, string, bool) {
 			label = w.Tags["brand"]
 		}
 		return osmmini.Coord{Lat: cx / float64(cnt), Lon: cy / float64(cnt)}, label, true
+	}
+	for _, n := range s.poiTaggedNodes {
+		name := normalizeForCompare(n.Tags["name"])
+		brand := normalizeForCompare(n.Tags["brand"])
+		if name == "" && brand == "" {
+			continue
+		}
+		if !strings.Contains(name, norm) && !strings.Contains(norm, name) &&
+			!strings.Contains(brand, norm) && !strings.Contains(norm, brand) {
+			continue
+		}
+		label := firstNonEmpty(n.Tags["name"], n.Tags["brand"])
+		return osmmini.Coord{Lat: n.Lat, Lon: n.Lon}, label, true
 	}
 	// Fall back to address entries.
 	for _, a := range s.addrs {

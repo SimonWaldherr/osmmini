@@ -7,9 +7,6 @@
     <meta name="app-version" content="{{.Version}}">
     <meta name="theme-color" content="#050d1f">
     <meta http-equiv="X-UA-Compatible" content="IE=edge">
-    <link rel="dns-prefetch" href="https://unpkg.com">
-    <link rel="preconnect" href="https://unpkg.com">
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <link rel="stylesheet" href="/static/style.css?v={{.Version}}" />
     <script id="initialSettings" type="application/json">{{.Settings}}</script>
     <style>
@@ -52,6 +49,15 @@
             </button>
           </div>
         </div>
+
+        <section class="workspace-context" aria-label="Aktiver Kartenmodus" aria-live="polite">
+          <span id="mapModeIcon" class="workspace-context-icon" aria-hidden="true">◌</span>
+          <div class="workspace-context-copy">
+            <strong id="mapModeTitle">Karte wird vorbereitet</strong>
+            <span id="mapModeMeta">Routing &amp; Suche: lokale PBF.</span>
+          </div>
+          <button id="openMapSources" type="button" class="workspace-context-action">Karte</button>
+        </section>
 
         <!-- ── Route card ── -->
         <section class="card route-card">
@@ -225,12 +231,11 @@
                   <select id="profile" class="setting-select"><option value="">— Standard —</option></select>
                 </div>
                 <div class="setting-item">
-                  <label class="setting-label">Engine <span class="info-icon" title="A* schnell, CH sehr schnell">ⓘ</span></label>
+                  <label class="setting-label">Engine <span class="info-icon" title="A* ist der Standard; Dijkstra eignet sich zum Vergleichen">ⓘ</span></label>
                   <select id="engine" class="setting-select">
                     <option value="astar">A* (schnell)</option>
                     <option value="dijkstra">Dijkstra (exakt)</option>
                     <option value="dijkstra-node">Dijkstra Node</option>
-                    <option value="ch">CH (sehr schnell)</option>
                   </select>
                 </div>
                 <div class="setting-item">
@@ -292,15 +297,32 @@
                 <span class="collapse-indicator">›</span>
               </div>
               <div id="mapSettings" style="display:none">
-                <div class="settings-grid">
-                  <div class="setting-item">
-                    <label class="setting-label">Preset <span class="info-icon" title="Vordefinierte Kartenquelle">ⓘ</span></label>
-                    <select id="tilePreset" class="setting-select"><option value="">— Benutzerdefiniert —</option></select>
+                <div class="tile-source-picker" aria-label="Kartenquelle auswählen">
+                  <div class="tile-source-picker-heading">
+                    <div>
+                      <span class="setting-label">Karte auswählen</span>
+                      <p class="settings-hint">Vorschau wählen, dann bei Bedarf mit „Speichern“ dauerhaft übernehmen.</p>
+                    </div>
+                    <button id="tileSourceAdvancedToggle" type="button" class="btn btn-ghost tile-source-advanced-toggle" aria-expanded="false">Eigene Quelle</button>
                   </div>
+                  <div class="tile-source-filters" id="tileSourceFilters" role="tablist" aria-label="Kartenquellen filtern">
+                    <button type="button" class="tile-source-filter is-active" data-tile-filter="recommended" role="tab" aria-selected="true">Empfohlen</button>
+                    <button type="button" class="tile-source-filter" data-tile-filter="online" role="tab" aria-selected="false">Online</button>
+                    <button type="button" class="tile-source-filter" data-tile-filter="bayern" role="tab" aria-selected="false">Bayern</button>
+                    <button type="button" class="tile-source-filter" data-tile-filter="offline" role="tab" aria-selected="false">Offline</button>
+                  </div>
+                  <div id="tileSourceCards" class="tile-source-cards" role="list" aria-live="polite" aria-busy="true">
+                    <div class="tile-source-empty">Kartenquellen werden geladen …</div>
+                  </div>
+                  <p id="tileSourceSelectionHint" class="tile-source-selection-hint" aria-live="polite"></p>
+                </div>
+                <div id="tileSourceAdvanced" class="tile-source-advanced" hidden>
+                  <div class="settings-grid">
                   <div class="setting-item">
                     <label class="setting-label">Kartentyp</label>
                     <select id="mapType" class="setting-select">
                       <option value="raster">Raster (Leaflet)</option>
+                      <option value="raster-direct">Raster direkt (ohne Proxy)</option>
                       <option value="vector">Vektor (MapLibre GL)</option>
                       <option value="wms">WMS</option>
                     </select>
@@ -318,9 +340,51 @@
                     <input id="wmsLayers" type="text" class="setting-input" placeholder="layer1,layer2"/>
                   </div>
                   <div class="setting-item">
+                    <label class="setting-label">Maximaler Zoom</label>
+                    <input id="tileMaxZoom" type="number" min="0" max="22" step="1" class="setting-input" placeholder="19"/>
+                  </div>
+                  <div class="setting-item">
                     <label class="setting-label">Attribution</label>
                     <input id="tileAttribution" type="text" class="setting-input" placeholder="© OpenStreetMap contributors"/>
                   </div>
+                </div>
+                <div class="settings-actions">
+                  <button id="previewTileSource" type="button" class="btn btn-ghost">Karte Vorschau</button>
+                </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="settings-section collapsible" id="tinyTilesSection">
+              <div class="section-header clickable" id="tinyTilesHeader">
+                <span class="section-icon">📦</span><h3>Offline-Karte (tinyTiles)</h3>
+                <span class="collapse-indicator">›</span>
+              </div>
+              <div id="tinyTilesSettings" style="display:none">
+                <p class="settings-hint">Erzeugt aus der beim Server geladenen OSM-PBF eine lokale Straßen-, Gebäude-, Gewässer- und Landbedeckungskarte. Während des Builds bleibt Routing verfügbar; der Build benötigt freien lokalen Speicher.</p>
+                <div class="settings-grid">
+                  <div class="setting-item">
+                    <label class="setting-label" for="tinyTilesMinZoom">Minimaler Zoom</label>
+                    <input id="tinyTilesMinZoom" type="number" min="5" max="14" step="1" value="8" class="setting-input" inputmode="numeric"/>
+                  </div>
+                  <div class="setting-item">
+                    <label class="setting-label" for="tinyTilesMaxZoom">Maximaler Zoom</label>
+                    <input id="tinyTilesMaxZoom" type="number" min="5" max="14" step="1" value="14" class="setting-input" inputmode="numeric"/>
+                  </div>
+                </div>
+                <div class="tinytiles-actions">
+                  <button id="tinyTilesBuild" type="button" class="btn btn-primary">Offline-Karte erzeugen</button>
+                  <button id="tinyTilesActivate" type="button" class="btn btn-ghost" style="display:none">Offline-Karte anzeigen</button>
+                </div>
+                <div id="tinyTilesBuildStatus" class="tinytiles-status" role="status" aria-live="polite" data-state="idle">
+                  <span id="tinyTilesStatusIcon" class="tinytiles-status-icon" aria-hidden="true">○</span>
+                  <div class="tinytiles-status-copy">
+                    <strong id="tinyTilesStatusTitle">Noch keine Offline-Karte</strong>
+                    <span id="tinyTilesStatusMessage">Die lokale Karte wird aus der geladenen PBF erzeugt.</span>
+                  </div>
+                </div>
+                <div id="tinyTilesProgress" class="tinytiles-progress" role="progressbar" aria-label="Erzeugung der Offline-Karte" aria-valuemin="0" aria-valuemax="100" aria-valuetext="Nicht gestartet" hidden>
+                  <div class="tinytiles-progress-bar"><span></span></div>
                 </div>
               </div>
             </div>
@@ -366,6 +430,18 @@
               </div>
             </div>
 
+            <div class="settings-section">
+              <div class="section-header">
+                <span class="section-icon">🔒</span>
+                <h3>Administrationsschutz</h3>
+              </div>
+              <p class="settings-hint">Speichern ist standardmäßig ohne Token möglich. Nur wenn der Server mit <code>-admin-token</code> gestartet wurde, ist hier der passende Token nötig. Er bleibt nur für diese Browser-Sitzung gespeichert.</p>
+              <div class="setting-item">
+                <label class="setting-label" for="adminToken">Admin-Token</label>
+                <input id="adminToken" type="password" class="setting-input" placeholder="Optionaler Bearer-Token" autocomplete="off" spellcheck="false"/>
+              </div>
+            </div>
+
             <div class="settings-actions">
               <button id="save" class="btn btn-primary">Speichern</button>
               <button id="resetSettings" class="btn btn-ghost">Zurücksetzen</button>
@@ -394,15 +470,57 @@
 
       </aside>
 
-      <main id="map" class="map"></main>
+      <div class="map-pane">
+        <main id="map" class="map"></main>
+        <div id="tileLoadOverlay" class="tile-load-overlay" role="status" aria-live="polite" aria-atomic="true" hidden>
+          <div class="tile-load-card">
+            <span id="tileLoadIcon" class="tile-load-icon" aria-hidden="true">◌</span>
+            <div class="tile-load-copy">
+              <strong id="tileLoadTitle">Karte wird geladen</strong>
+              <span id="tileLoadMessage">Die Kartenquelle wird vorbereitet.</span>
+            </div>
+            <div id="tileLoadProgress" class="tile-load-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuetext="Wird geladen">
+              <span id="tileLoadProgressBar"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="mapWelcomeOverlay" class="map-welcome-overlay" hidden>
+      <section id="mapWelcomeDialog" class="map-welcome-dialog" role="dialog" aria-modal="true" aria-labelledby="mapWelcomeTitle" tabindex="-1">
+        <button id="mapWelcomeLater" type="button" class="map-welcome-close" aria-label="Auswahl später treffen">×</button>
+        <div id="mapWelcomeMain">
+          <span class="map-welcome-kicker">Kartenstart</span>
+          <h2 id="mapWelcomeTitle">Wie möchtest du die Karte nutzen?</h2>
+          <p>Du kannst eine lokale Offline-Karte aus deiner PBF erzeugen oder eine Online-Karte verwenden. Die Auswahl lässt sich später jederzeit ändern.</p>
+          <div class="map-welcome-options">
+            <button id="mapWelcomeOffline" type="button" class="map-welcome-option map-welcome-option-offline">
+              <span class="map-welcome-option-icon" aria-hidden="true">📦</span>
+              <span><strong>Lokale Offline-Karte</strong><small>tinyTiles aus der geladenen PBF erzeugen</small></span>
+              <span class="map-welcome-option-arrow" aria-hidden="true">›</span>
+            </button>
+            <button id="mapWelcomeOnline" type="button" class="map-welcome-option">
+              <span class="map-welcome-option-icon" aria-hidden="true">🗺️</span>
+              <span><strong>Online-Karte</strong><small>Globale und Bayern-Karten auswählen</small></span>
+              <span class="map-welcome-option-arrow" aria-hidden="true">›</span>
+            </button>
+          </div>
+        </div>
+        <div id="mapWelcomeOnlineChoices" hidden>
+          <button id="mapWelcomeBack" type="button" class="map-welcome-back">‹ Zurück</button>
+          <span class="map-welcome-kicker">Online-Karte</span>
+          <h2>Wähle eine Kartenquelle</h2>
+          <div id="mapWelcomeOnlineCards" class="map-welcome-online-cards" role="list"></div>
+          <button id="mapWelcomeMoreSources" type="button" class="btn btn-ghost map-welcome-more">Alle Kartenquellen ansehen</button>
+        </div>
+      </section>
     </div>
 
     <script>
       (function(){
         const localCss = '/static/leaflet/leaflet.css';
-        const cdnCss   = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
         const localJs  = '/static/leaflet/leaflet.js';
-        const cdnJs    = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
 
         function loadCss(href){
           return new Promise((res,rej)=>{ const l=document.createElement('link'); l.rel='stylesheet'; l.href=href; l.onload=()=>res(href); l.onerror=()=>rej(href); document.head.appendChild(l); });
@@ -411,20 +529,27 @@
           return new Promise((res,rej)=>{ const s=document.createElement('script'); s.src=src; s.defer=true; s.onload=()=>res(src); s.onerror=()=>rej(src); document.head.appendChild(s); });
         }
 
-        loadCss(localCss).catch(()=>loadCss(cdnCss)).catch(()=>{});
+        // All browser dependencies are part of osmmini's static bundle. Do
+        // not fall back to a CDN here: the local tinyTiles profile must also
+        // work after the machine has been taken completely offline.
+        loadCss(localCss).catch(()=>{});
 
-        loadScript(localJs).catch(()=>loadScript(cdnJs)).then(()=>{
+        loadScript(localJs).then(()=>{
           const mcCss1  = '/static/leaflet/MarkerCluster.css';
           const mcCss2  = '/static/leaflet/MarkerCluster.Default.css';
           const mcJsLoc = '/static/leaflet/leaflet.markercluster.js';
-          const mcJsCdn = 'https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js';
-          loadCss(mcCss1).catch(()=>loadCss('https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css')).catch(()=>{});
-          loadCss(mcCss2).catch(()=>loadCss('https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css')).catch(()=>{});
-          loadScript(mcJsLoc).catch(()=>loadScript(mcJsCdn)).finally(()=>{
+          loadCss(mcCss1).catch(()=>{});
+          loadCss(mcCss2).catch(()=>{});
+          loadScript(mcJsLoc).catch(()=>{}).finally(()=>{
             const a=document.createElement('script'); a.src='/static/app.js?v={{.Version}}'; a.defer=true; document.head.appendChild(a);
           });
         }).catch(()=>{
-          const a=document.createElement('script'); a.src='/static/app.js?v={{.Version}}'; a.defer=true; document.head.appendChild(a);
+          const spinner=document.getElementById('pageSpinner');
+          const app=document.querySelector('.app');
+          const map=document.getElementById('map');
+          if (spinner) spinner.style.display='none';
+          if (app) app.style.opacity='1';
+          if (map) map.textContent='Lokale Kartenbibliothek konnte nicht geladen werden. Bitte die ausgelieferten statischen Dateien prüfen.';
         });
       })();
 

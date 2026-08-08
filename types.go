@@ -107,14 +107,24 @@ type Options struct {
 	KeepTag             func(string) bool
 	EmitWayNodeIDs      bool
 	EmitRelationMembers bool
+	// Tagged*Key optionally limits which entities are considered for the
+	// corresponding Tagged* callback. Kept tags such as "name" can otherwise
+	// make a broad index inspect every named road in a large extract.
+	TaggedNodeKey     func(string) bool
+	TaggedWayKey      func(string) bool
+	TaggedRelationKey func(string) bool
 }
 
 // Callbacks passed to Extract to receive parsed entities.
 type Callbacks struct {
 	Node        func(id int64, lat, lon float64) error
 	AddressNode func(n Node) error
-	HighwayWay  func(w Way) error
-	AddressWay  func(w Way) error
+	// TaggedNode is called for any node that has at least one tag requested
+	// through Options.KeepTag. This is useful for point POIs such as
+	// restaurants, charging stations, bus stops, and parking entrances.
+	TaggedNode func(n Node) error
+	HighwayWay func(w Way) error
+	AddressWay func(w Way) error
 	// TaggedWay is called for any way that has at least one tag that
 	// the caller requested via Options.KeepTag. This allows callers to
 	// receive POI/area ways (landuse, natural, amenity, shop, etc.).

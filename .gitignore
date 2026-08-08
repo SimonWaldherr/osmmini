@@ -1,7 +1,13 @@
 tiles-cache
+tiles-cache-*
+offline-tiles/
+bin/
 region.osm.pbf
 osmmini.wasm
 wasm_exec.js
 leaflet.css
 leaflet.js
+maplibre-gl.js
+maplibre-gl.css
+leaflet-maplibre-gl.js
 osmmini-server
