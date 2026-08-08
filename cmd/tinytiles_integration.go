@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	tinytiles "github.com/Karte-Bayern/tinyTiles"
-	tinytilesserver "github.com/Karte-Bayern/tinyTiles/server"
+	tinytiles "github.com/Karte-Bayern/tinyTiles/v2"
+	tinytilesserver "github.com/Karte-Bayern/tinyTiles/v2/server"
 )
 
 const (

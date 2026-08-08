@@ -6,7 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	tinytiles "github.com/Karte-Bayern/tinyTiles"
+	tinytiles "github.com/Karte-Bayern/tinyTiles/v2"
 	tiles "github.com/SimonWaldherr/tinySQL/tiles"
 )
 

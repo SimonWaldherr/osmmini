@@ -2,10 +2,12 @@ module simonwaldherr.de/go/osmmini
 
 go 1.26.5
 
-require github.com/Karte-Bayern/tinyTiles v0.0.0
+require (
+	github.com/Karte-Bayern/tinyTiles/v2 v2.1.1
+	github.com/SimonWaldherr/tinySQL v0.31.0
+)
 
 require (
-	github.com/SimonWaldherr/tinySQL v0.30.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/jonas-p/go-shp v0.1.1 // indirect
@@ -17,10 +19,8 @@ require (
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	modernc.org/libc v1.75.2 // indirect
+	modernc.org/libc v1.75.3 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.0 // indirect
 	modernc.org/sqlite v1.56.0 // indirect
 )
-
-replace github.com/Karte-Bayern/tinyTiles => ../tinyTiles
