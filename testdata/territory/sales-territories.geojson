@@ -1,0 +1,187 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "area_km2": 261.3525,
+        "delivery_zone": [
+          "Zone-1",
+          "Zone-2"
+        ],
+        "depot": "Depot-Passau",
+        "salesperson": [
+          "Huber",
+          "Meier"
+        ],
+        "service_region": [
+          "Region-A",
+          "Region-B"
+        ],
+        "source_feature_count": 4,
+        "source_values": [
+          "84130",
+          "84131",
+          "84137",
+          "84140"
+        ],
+        "technician": [
+          "Alice",
+          "Bob"
+        ],
+        "territory_id": "North",
+        "territory_name": "North",
+        "vehicle": [
+          "VAN-01",
+          "VAN-02"
+        ]
+      },
+      "geometry": {
+        "type": "MultiPolygon",
+        "coordinates": [
+          [
+            [
+              [
+                12.6,
+                48.6
+              ],
+              [
+                12.7,
+                48.6
+              ],
+              [
+                12.8,
+                48.6
+              ],
+              [
+                12.9,
+                48.6
+              ],
+              [
+                12.9,
+                48.68
+              ],
+              [
+                12.8,
+                48.68
+              ],
+              [
+                12.7,
+                48.68
+              ],
+              [
+                12.7,
+                48.76
+              ],
+              [
+                12.6,
+                48.76
+              ],
+              [
+                12.6,
+                48.68
+              ],
+              [
+                12.6,
+                48.6
+              ]
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "area_km2": 196.2243,
+        "delivery_zone": [
+          "Zone-2",
+          "Zone-3"
+        ],
+        "depot": "Depot-Freyung",
+        "salesperson": "Mueller",
+        "service_region": [
+          "Region-B",
+          "Region-C"
+        ],
+        "source_feature_count": 3,
+        "source_values": [
+          "84307",
+          "84323",
+          "94405"
+        ],
+        "technician": [
+          "Carla",
+          "Dieter"
+        ],
+        "territory_id": "South",
+        "territory_name": "South",
+        "vehicle": [
+          "VAN-02",
+          "VAN-03"
+        ]
+      },
+      "geometry": {
+        "type": "MultiPolygon",
+        "coordinates": [
+          [
+            [
+              [
+                13.2,
+                48.3
+              ],
+              [
+                13.3,
+                48.3
+              ],
+              [
+                13.4,
+                48.3
+              ],
+              [
+                13.4,
+                48.38
+              ],
+              [
+                13.3,
+                48.38
+              ],
+              [
+                13.2,
+                48.38
+              ],
+              [
+                13.2,
+                48.3
+              ]
+            ]
+          ],
+          [
+            [
+              [
+                12.95,
+                48.95
+              ],
+              [
+                13.05,
+                48.95
+              ],
+              [
+                13.05,
+                49.03
+              ],
+              [
+                12.95,
+                49.03
+              ],
+              [
+                12.95,
+                48.95
+              ]
+            ]
+          ]
+        ]
+      }
+    }
+  ]
+}

@@ -3,7 +3,7 @@ module simonwaldherr.de/go/osmmini
 go 1.26.5
 
 require (
-	github.com/Karte-Bayern/tinyTiles/v2 v2.1.1
+	github.com/Karte-Bayern/tinyTiles/v2 v2.2.0
 	github.com/SimonWaldherr/tinySQL v0.31.0
 )
 

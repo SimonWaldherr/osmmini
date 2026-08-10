@@ -1340,6 +1340,13 @@ type server struct {
 	tinyTilesDir       string
 	tinyTilesMaxMemory int64
 	tinyTilesBuild     tinyTilesBuildStatus
+
+	// territories and territoryRaw are populated once at startup by
+	// loadTerritories and read-only afterward (same lifecycle as pbfPath),
+	// so no mutex guards them. territories is never nil after startup, even
+	// when no layers were found -- it is an optional feature, not an error.
+	territories  *osmmini.TerritoryStore
+	territoryRaw map[string][]byte
 }
 
 type aiMessage struct {
@@ -1349,6 +1356,28 @@ type aiMessage struct {
 }
 
 func main() {
+	// Territory/dispatch subcommands (git-style: `osmmini <verb> ...`) are
+	// self-contained CLI tools built on the same osmmini package, not part
+	// of the HTTP server below. Dispatching on them here, before any flag
+	// registration, leaves `osmmini -pbf region.osm.pbf` (no subcommand)
+	// completely unaffected.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "territories":
+			runTerritoriesCLI(os.Args[2:])
+			return
+		case "territory":
+			runTerritoryCLI(os.Args[2:])
+			return
+		case "dispatch":
+			runDispatchCLI(os.Args[2:])
+			return
+		case "route":
+			runRouteCLI(os.Args[2:])
+			return
+		}
+	}
+
 	// Command-line flags. `-pbf` should point at the OSM PBF used to
 	// build the routing graph (e.g. a regional extract). If the file
 	// is missing the server will fail to build the router.
@@ -1360,6 +1389,7 @@ func main() {
 	buildCH := flag.Bool("build-ch", false, "Build experimental Contraction Hierarchies after graph load")
 	adminToken := flag.String("admin-token", os.Getenv("OSMMINI_ADMIN_TOKEN"), "Optional bearer token; when set, it is required for settings updates")
 	tinyTilesDir := flag.String("tinytiles-dir", "offline-tiles", "Directory for generated tinyTiles .ttiles artifacts")
+	territoriesDir := flag.String("territories-dir", "territories", "Directory of *.geojson territory layers (file name without extension = layer name); optional")
 	tinyTilesMaxMemoryMB := flag.Int64("tinytiles-max-memory-mb", 768, "Maximum memory (MB) tinyTiles may use while importing a .ttiles artifact; raise this for larger PBF regions")
 
 	// Coord window support
@@ -1452,6 +1482,9 @@ func main() {
 	if err := srv.loadPOIIndex(*pbf); err != nil {
 		log.Printf("warning: POI index failed: %v", err)
 	}
+
+	// Best-effort: load territory layers (optional feature; missing dir is fine)
+	srv.loadTerritories(*territoriesDir)
 
 	httpSrv := &http.Server{
 		Addr:              *listen,
@@ -1579,6 +1612,8 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/api/v1/agent/query", s.handleAgentQuery)
 	mux.HandleFunc("/api/v1/agent/execute", s.handleAgentExecute)
 	mux.HandleFunc("/api/v1/poi/", s.handlePOIInfo)
+	mux.HandleFunc("/api/v1/territories", s.handleTerritoriesList)
+	mux.HandleFunc("/api/v1/territories/", s.handleTerritoriesLayer)
 
 	// UI
 	mux.HandleFunc("/", s.handleIndex)

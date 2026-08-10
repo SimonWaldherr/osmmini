@@ -1,0 +1,12 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {"type": "Feature", "properties": {"postcode": "84130"}, "geometry": {"type": "Polygon", "coordinates": [[[12.60, 48.60], [12.70, 48.60], [12.70, 48.68], [12.60, 48.68], [12.60, 48.60]]]}},
+    {"type": "Feature", "properties": {"postcode": "84131"}, "geometry": {"type": "Polygon", "coordinates": [[[12.70, 48.60], [12.80, 48.60], [12.80, 48.68], [12.70, 48.68], [12.70, 48.60]]]}},
+    {"type": "Feature", "properties": {"postcode": "84137"}, "geometry": {"type": "Polygon", "coordinates": [[[12.60, 48.68], [12.70, 48.68], [12.70, 48.76], [12.60, 48.76], [12.60, 48.68]]]}},
+    {"type": "Feature", "properties": {"postcode": "84140"}, "geometry": {"type": "Polygon", "coordinates": [[[12.80, 48.60], [12.90, 48.60], [12.90, 48.68], [12.80, 48.68], [12.80, 48.60]]]}},
+    {"type": "Feature", "properties": {"postcode": "84307"}, "geometry": {"type": "Polygon", "coordinates": [[[13.20, 48.30], [13.30, 48.30], [13.30, 48.38], [13.20, 48.38], [13.20, 48.30]]]}},
+    {"type": "Feature", "properties": {"postcode": "84323"}, "geometry": {"type": "Polygon", "coordinates": [[[13.30, 48.30], [13.40, 48.30], [13.40, 48.38], [13.30, 48.38], [13.30, 48.30]]]}},
+    {"type": "Feature", "properties": {"postcode": "94405"}, "geometry": {"type": "Polygon", "coordinates": [[[12.95, 48.95], [13.05, 48.95], [13.05, 49.03], [12.95, 49.03], [12.95, 48.95]]]}}
+  ]
+}

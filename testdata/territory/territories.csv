@@ -1,0 +1,8 @@
+postcode,sales_territory,salesperson,service_region,technician,delivery_zone,depot,vehicle
+84130,North,Huber,Region-A,Alice,Zone-1,Depot-Passau,VAN-01
+84131,North,Huber,Region-A,Alice,Zone-1,Depot-Passau,VAN-01
+84137,North,Huber,Region-A,Bob,Zone-1,Depot-Passau,VAN-01
+84140,North,Meier,Region-B,Bob,Zone-2,Depot-Passau,VAN-02
+84307,South,Mueller,Region-B,Carla,Zone-2,Depot-Freyung,VAN-02
+84323,South,Mueller,Region-B,Carla,Zone-2,Depot-Freyung,VAN-02
+94405,South,Mueller,Region-C,Dieter,Zone-3,Depot-Freyung,VAN-03

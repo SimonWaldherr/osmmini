@@ -1,0 +1,213 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "area_km2": 195.9987,
+        "depot": "Depot-Passau",
+        "sales_territory": "North",
+        "salesperson": "Huber",
+        "service_region": "Region-A",
+        "source_feature_count": 3,
+        "source_values": [
+          "84130",
+          "84131",
+          "84137"
+        ],
+        "technician": [
+          "Alice",
+          "Bob"
+        ],
+        "territory_id": "Zone-1",
+        "territory_name": "Zone-1",
+        "vehicle": "VAN-01"
+      },
+      "geometry": {
+        "type": "MultiPolygon",
+        "coordinates": [
+          [
+            [
+              [
+                12.6,
+                48.6
+              ],
+              [
+                12.7,
+                48.6
+              ],
+              [
+                12.8,
+                48.6
+              ],
+              [
+                12.8,
+                48.68
+              ],
+              [
+                12.7,
+                48.68
+              ],
+              [
+                12.7,
+                48.76
+              ],
+              [
+                12.6,
+                48.76
+              ],
+              [
+                12.6,
+                48.68
+              ],
+              [
+                12.6,
+                48.6
+              ]
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "area_km2": 196.7903,
+        "depot": [
+          "Depot-Freyung",
+          "Depot-Passau"
+        ],
+        "sales_territory": [
+          "North",
+          "South"
+        ],
+        "salesperson": [
+          "Meier",
+          "Mueller"
+        ],
+        "service_region": "Region-B",
+        "source_feature_count": 3,
+        "source_values": [
+          "84140",
+          "84307",
+          "84323"
+        ],
+        "technician": [
+          "Bob",
+          "Carla"
+        ],
+        "territory_id": "Zone-2",
+        "territory_name": "Zone-2",
+        "vehicle": "VAN-02"
+      },
+      "geometry": {
+        "type": "MultiPolygon",
+        "coordinates": [
+          [
+            [
+              [
+                12.8,
+                48.6
+              ],
+              [
+                12.9,
+                48.6
+              ],
+              [
+                12.9,
+                48.68
+              ],
+              [
+                12.8,
+                48.68
+              ],
+              [
+                12.8,
+                48.6
+              ]
+            ]
+          ],
+          [
+            [
+              [
+                13.2,
+                48.3
+              ],
+              [
+                13.3,
+                48.3
+              ],
+              [
+                13.4,
+                48.3
+              ],
+              [
+                13.4,
+                48.38
+              ],
+              [
+                13.3,
+                48.38
+              ],
+              [
+                13.2,
+                48.38
+              ],
+              [
+                13.2,
+                48.3
+              ]
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "area_km2": 64.9174,
+        "depot": "Depot-Freyung",
+        "sales_territory": "South",
+        "salesperson": "Mueller",
+        "service_region": "Region-C",
+        "source_feature_count": 1,
+        "source_values": [
+          "94405"
+        ],
+        "technician": "Dieter",
+        "territory_id": "Zone-3",
+        "territory_name": "Zone-3",
+        "vehicle": "VAN-03"
+      },
+      "geometry": {
+        "type": "MultiPolygon",
+        "coordinates": [
+          [
+            [
+              [
+                12.95,
+                48.95
+              ],
+              [
+                13.05,
+                48.95
+              ],
+              [
+                13.05,
+                49.03
+              ],
+              [
+                12.95,
+                49.03
+              ],
+              [
+                12.95,
+                48.95
+              ]
+            ]
+          ]
+        ]
+      }
+    }
+  ]
+}

@@ -1,5 +1,5 @@
-github.com/Karte-Bayern/tinyTiles/v2 v2.1.1 h1:HYL64garr3ps2Lbx2eQk46qFjPHAIW1u7TCdHJRVjmg=
-github.com/Karte-Bayern/tinyTiles/v2 v2.1.1/go.mod h1:jzB6sYg5wFKIkr5gH4cDZgOJ8+fjFiJvxq1JeFL5tO8=
+github.com/Karte-Bayern/tinyTiles/v2 v2.2.0 h1:59Un7h/5iA43y9wnpUoreoHPZoJHppWwfjU3nluMR9Y=
+github.com/Karte-Bayern/tinyTiles/v2 v2.2.0/go.mod h1:aVYizV8QcCkEwMoUkWiESxSZU5PLgfiTKJaWpgqlH6o=
 github.com/SimonWaldherr/tinySQL v0.31.0 h1:1JfBEH+n1SEFyvnmk9i3feKW9zohjQWuQfjJG/w8o5U=
 github.com/SimonWaldherr/tinySQL v0.31.0/go.mod h1:VXJ25ctfK7gaDkbMRtfSqmzfTxOffYm/wjh0MU5gDsI=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=

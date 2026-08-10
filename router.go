@@ -169,6 +169,12 @@ type RouteOptions struct {
 	Pro           bool           `json:"pro"`
 	Weights       ProWeights     `json:"weights"`
 	EmergencyMode bool           `json:"emergency_mode,omitempty"`
+	// TerritoryCost optionally scales edge costs by which territory they
+	// fall in, relative to a home territory (see TerritoryCostPolicy). It
+	// is nil by default, in which case routing behaves exactly as before --
+	// territory boundaries are metadata, not a routing restriction, unless
+	// a caller sets this explicitly. Not settable from client JSON.
+	TerritoryCost *TerritoryCostPolicy `json:"-"`
 }
 
 func (o RouteOptions) withDefaults() RouteOptions {
@@ -1530,7 +1536,21 @@ func (r *Router) heuristic(from, to int64, opt RouteOptions) float64 {
 	}
 }
 
+// edgeCost is baseEdgeCost, optionally scaled by opt.TerritoryCost. The
+// scaling is a no-op (factor 1) whenever TerritoryCost is nil, which is the
+// default -- territory boundaries never affect routing unless a caller
+// opts in explicitly.
 func (r *Router) edgeCost(e Edge, opt RouteOptions) float64 {
+	cost := r.baseEdgeCost(e, opt)
+	if opt.TerritoryCost != nil {
+		if c, ok := r.g.coords[e.To]; ok {
+			cost *= opt.TerritoryCost.factorFor(c)
+		}
+	}
+	return cost
+}
+
+func (r *Router) baseEdgeCost(e Edge, opt RouteOptions) float64 {
 	if opt.EmergencyMode {
 		// BOS/emergency: minimize time, use higher assumed speeds
 		v := e.SpeedKph

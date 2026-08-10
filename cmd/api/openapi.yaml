@@ -125,6 +125,43 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/TileSourcePreset"
+  /api/v1/territories:
+    get:
+      summary: List territory layers loaded from the optional territories directory
+      responses:
+        "200":
+          description: Loaded layers and their territory counts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  layers:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        territories: { type: integer, minimum: 0 }
+  /api/v1/territories/{layer}:
+    get:
+      summary: Get one loaded territory layer as GeoJSON
+      parameters:
+        - name: layer
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Original GeoJSON FeatureCollection
+          content:
+            application/geo+json:
+              schema: { type: object }
+        "404":
+          description: Unknown territory layer
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
   /api/v1/search:
     get:
       summary: Address and street search
