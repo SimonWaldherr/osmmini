@@ -113,6 +113,43 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+  /api/v1/offline-labels:
+    get:
+      summary: Get local town and street labels for the tinyTiles map
+      description: Labels are read from the locally loaded PBF data. They are intended for the current viewport and do not require an external font or tile service.
+      parameters:
+        - name: bbox
+          in: query
+          required: true
+          description: Visible WGS84 bounds as minLon,minLat,maxLon,maxLat.
+          schema: { type: string }
+        - name: zoom
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0, maximum: 22 }
+      responses:
+        "200":
+          description: Local labels for the requested viewport
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  labels:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        lat: { type: number }
+                        lon: { type: number }
+                        kind: { type: string, enum: [place, road] }
+        "400":
+          description: Invalid bounding box
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
   /api/v1/tile-sources:
     get:
       summary: List built-in map-source presets
@@ -415,6 +452,16 @@ components:
       properties:
         min_zoom: { type: integer, minimum: 5, maximum: 14, default: 5 }
         max_zoom: { type: integer, minimum: 5, maximum: 14, default: 14 }
+        postal_codes:
+          type: boolean
+          default: false
+          description: Also extract OSM boundary=postal_code relations and publish a PLZ territory layer.
+        postal_prefix_length:
+          type: integer
+          minimum: 1
+          maximum: 5
+          default: 3
+          description: PLZ prefix length used when postal_codes is true.
     TinyTilesBuildStatus:
       type: object
       required: [state, phase, progress]
@@ -422,7 +469,7 @@ components:
         state: { type: string, enum: [idle, building, ready, failed] }
         phase:
           type: string
-          enum: [idle, preparing, generating, importing, finalizing, activating, processing, ready, failed]
+          enum: [idle, preparing, generating, importing, finalizing, activating, territories, processing, ready, failed]
           description: Public build phase; does not expose local paths or tinyTiles internals.
         progress:
           type: integer
@@ -436,3 +483,7 @@ components:
         artifact: { type: string, description: Artifact file name only }
         min_zoom: { type: integer }
         max_zoom: { type: integer }
+        postal_codes: { type: boolean }
+        postal_prefix_length: { type: integer, minimum: 1, maximum: 5 }
+        territory_layer: { type: string, example: plz3 }
+        territories: { type: integer, minimum: 0 }

@@ -67,3 +67,16 @@ func TestLoadTerritoriesMissingDirectoryIsEmpty(t *testing.T) {
 		t.Fatalf("layers = %v, want none", got)
 	}
 }
+
+func TestIsPostalTerritoryLayer(t *testing.T) {
+	for _, layer := range []string{"plz1", "plz3", "PLZ5"} {
+		if !isPostalTerritoryLayer(layer) {
+			t.Errorf("isPostalTerritoryLayer(%q) = false", layer)
+		}
+	}
+	for _, layer := range []string{"plz", "plz0", "plz6", "postal", "delivery"} {
+		if isPostalTerritoryLayer(layer) {
+			t.Errorf("isPostalTerritoryLayer(%q) = true", layer)
+		}
+	}
+}

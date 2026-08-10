@@ -29,6 +29,13 @@ let userLocationMarker = null;
 let userLocation = null; // {lat, lon} from browser geolocation (explicit user permission)
 let searchResultMarkers = [];
 let searchResultCluster = null;
+// tinyTiles deliberately has no MapLibre glyph dependency. Text labels for
+// the local map are therefore rendered as small Leaflet DOM overlays from the
+// loaded PBF, which keeps names available without a font CDN.
+const offlineLabelsLayer = L.layerGroup();
+let offlineLabelsEnabled = false;
+let offlineLabelsTimer = null;
+let offlineLabelsRequest = null;
 
 // Dynamic script/css loader helpers (used for MapLibre GL lazy-loading)
 function _loadScript(src) {
@@ -142,6 +149,81 @@ function updateMapModeUI(tiles = {}) {
     title.textContent = 'Online-Karte aktiv';
     meta.textContent = 'Routing & Suche: lokale PBF.';
   }
+}
+
+function isTinyTilesSettings(tiles = {}) {
+  return String(tiles.style_url || '') === '/static/styles/tinytiles-minimal.json';
+}
+
+function queueOfflineLabels() {
+  if (!offlineLabelsEnabled) return;
+  window.clearTimeout(offlineLabelsTimer);
+  offlineLabelsTimer = window.setTimeout(refreshOfflineLabels, 160);
+}
+
+async function refreshOfflineLabels() {
+  if (!offlineLabelsEnabled) return;
+  const zoom = map.getZoom();
+  if (zoom < 7) {
+    offlineLabelsLayer.clearLayers();
+    return;
+  }
+  const bounds = map.getBounds();
+  const bbox = [
+    bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth(),
+  ].map((value) => Number(value).toFixed(6)).join(',');
+  offlineLabelsRequest?.abort();
+  const controller = new AbortController();
+  offlineLabelsRequest = controller;
+  try {
+    const response = await fetch(`/api/v1/offline-labels?bbox=${encodeURIComponent(bbox)}&zoom=${Math.round(zoom)}`, {
+      signal: controller.signal,
+      headers: { Accept: 'application/json' },
+    });
+    if (!response.ok) throw new Error(`offline labels: ${response.status}`);
+    const payload = await response.json();
+    if (!offlineLabelsEnabled || offlineLabelsRequest !== controller) return;
+    offlineLabelsLayer.clearLayers();
+    for (const label of Array.isArray(payload.labels) ? payload.labels : []) {
+      const lat = Number(label.lat);
+      const lon = Number(label.lon);
+      const name = String(label.name || '').trim();
+      if (!Number.isFinite(lat) || !Number.isFinite(lon) || !name) continue;
+      const kind = label.kind === 'place' ? 'place' : 'road';
+      const icon = L.divIcon({
+        className: `offline-label-anchor offline-label-${kind}`,
+        html: `<span class="offline-map-label">${escapeHtml(name)}</span>`,
+        iconSize: [0, 0],
+        iconAnchor: [0, 0],
+      });
+      L.marker([lat, lon], { icon, interactive: false, keyboard: false, zIndexOffset: kind === 'place' ? 80 : 40 })
+        .addTo(offlineLabelsLayer);
+    }
+  } catch (error) {
+    if (error?.name !== 'AbortError') console.debug('Offline labels are temporarily unavailable', error);
+  }
+}
+
+function setOfflineLabelsVisible(enabled) {
+  if (offlineLabelsEnabled === enabled) {
+    if (enabled) queueOfflineLabels();
+    return;
+  }
+  offlineLabelsEnabled = enabled;
+  window.clearTimeout(offlineLabelsTimer);
+  offlineLabelsRequest?.abort();
+  offlineLabelsRequest = null;
+  if (!enabled) {
+    map.off('moveend', queueOfflineLabels);
+    map.off('zoomend', queueOfflineLabels);
+    offlineLabelsLayer.clearLayers();
+    map.removeLayer(offlineLabelsLayer);
+    return;
+  }
+  offlineLabelsLayer.addTo(map);
+  map.on('moveend', queueOfflineLabels);
+  map.on('zoomend', queueOfflineLabels);
+  queueOfflineLabels();
 }
 
 // Use a compact, non-secret fingerprint for browser-cache namespacing. Passing
@@ -263,6 +345,7 @@ async function applyTileLayer(settings, { directPreview = false } = {}) {
       currentTileLayer = layer;
       await waitForMapLayerPaint();
       updateMapModeUI(tiles);
+      setOfflineLabelsVisible(isTinyTilesSettings(tiles));
       return true;
     } catch (e) {
       console.warn('MapLibre GL load failed, falling back to raster tiles', e);
@@ -286,7 +369,10 @@ async function applyTileLayer(settings, { directPreview = false } = {}) {
       console.warn('Map WMS tile could not be loaded');
     });
     const applied = await activateRasterLayer(layer, generation);
-    if (applied) updateMapModeUI(tiles);
+    if (applied) {
+      updateMapModeUI(tiles);
+      setOfflineLabelsVisible(isTinyTilesSettings(tiles));
+    }
     return applied;
   }
   const rasterFallback = tiles.upstream
@@ -313,7 +399,10 @@ async function applyTileLayer(settings, { directPreview = false } = {}) {
     console.warn('Map tile could not be loaded');
   });
   const applied = await activateRasterLayer(layer, generation);
-  if (applied) updateMapModeUI(tiles);
+  if (applied) {
+    updateMapModeUI(tiles);
+    setOfflineLabelsVisible(isTinyTilesSettings(tiles));
+  }
   return applied;
 }
 
@@ -426,6 +515,7 @@ const debouncedCompute = debounce(function(){ try{ compute(); } catch(e){} }, 30
 let polyline = null;
 let startMarker = null, endMarker = null;
 let currentRouteBBox = null; // {minLat, minLon, maxLat, maxLon} of the last rendered route
+let lastRoutePath = null; // [{lat, lon}, ...] of the last rendered route, for territory transition lookups
 const stops = []; // map markers
 const waypoints = []; // input waypoints
 let stopSeq = 1;
@@ -750,7 +840,8 @@ function renderPath(path, meta){
   const coords = path.map(p=>[p.lat,p.lon]);
   if(polyline) polyline.remove();
   if(startMarker) startMarker.remove(); if(endMarker) endMarker.remove();
-  if(coords.length===0) return;
+  lastRoutePath = path;
+  if(coords.length===0) { updateTerritoryRouteTransitions(null); return; }
   // Track route bounding box for poi_on_route queries
   currentRouteBBox = coords.reduce((bb, c) => ({
     minLat: Math.min(bb.minLat, c[0]),
@@ -785,6 +876,8 @@ function renderPath(path, meta){
   // Show route actions
   const actionsEl = document.getElementById('routeActions');
   if (actionsEl) actionsEl.style.display = 'flex';
+
+  updateTerritoryRouteTransitions(path);
 }
 
 async function compute() {
@@ -2424,6 +2517,21 @@ function handleTinyTilesStatus(status) {
     renderTileSourceCards();
     sourceSelectionHint(tilePresets.find((preset) => preset.id === 'tinytiles_local') || null);
   }
+  const postalButton = document.getElementById('territoryBuildPostal');
+  if (postalButton) {
+    const buildingPostal = state === 'building' && safeStatus.postal_codes;
+    postalButton.disabled = buildingPostal;
+    postalButton.textContent = buildingPostal ? 'PLZ-Gebiete werden erzeugt …' : 'PLZ-Gebiete erzeugen';
+  }
+  const postalStatus = document.getElementById('territoryBuildStatus');
+  if (postalStatus) {
+    const showPostalStatus = Boolean(safeStatus.postal_codes) && (state === 'building' || state === 'ready' || state === 'failed');
+    postalStatus.hidden = !showPostalStatus;
+    if (showPostalStatus) {
+      const progress = Number.isFinite(Number(safeStatus.progress)) ? ` (${Math.max(0, Math.min(100, Math.round(Number(safeStatus.progress))))} %)` : '';
+      postalStatus.textContent = `${safeStatus.message || (state === 'failed' ? 'PLZ-Gebiete konnten nicht erzeugt werden.' : 'PLZ-Gebiete werden verarbeitet.')}${progress}`;
+    }
+  }
   if (state === 'building') {
     scheduleTinyTilesPolling();
     return;
@@ -2444,6 +2552,13 @@ function handleTinyTilesStatus(status) {
         console.error('Failed to activate tinyTiles map', error);
         showToast('Offline-Karte ist bereit, konnte aber nicht angezeigt werden.', 'error', 5500);
       });
+  }
+  if (state === 'ready' && safeStatus.territory_layer && safeStatus.territory_layer !== territoryBuildAnnouncedLayer) {
+    territoryBuildAnnouncedLayer = safeStatus.territory_layer;
+    delete territoryGeoJSONCache[safeStatus.territory_layer];
+    void loadTerritoryLayers();
+    const count = Number.isInteger(safeStatus.territories) ? safeStatus.territories : 0;
+    showToast(`${safeStatus.territory_layer.toUpperCase()} ist bereit${count ? ` (${count} Gebiete)` : ''}.`, 'success', 5000);
   }
 }
 
@@ -2521,7 +2636,7 @@ async function selectTinyTilesSource({ fromWelcome = false } = {}) {
   await startTinyTilesBuild();
 }
 
-async function startTinyTilesBuild() {
+async function startTinyTilesBuild({ postalCodes = false, postalPrefixLength = 3, autoActivate = true, showMapOverlay = true } = {}) {
   let zooms;
   try {
     zooms = tinyTilesZoomsFromUI();
@@ -2532,20 +2647,20 @@ async function startTinyTilesBuild() {
 
   const build = tinyTilesElements().build;
   if (build) build.disabled = true;
-  tinyTilesLoadRequested = true;
+  tinyTilesLoadRequested = showMapOverlay;
   handleTinyTilesStatus({ state: 'building', phase: 'preparing', progress: 0, message: 'Offline-Karte wird vorbereitet …' });
   try {
     const res = await fetch(tinyTilesBuildEndpoint, {
       method: 'POST',
       headers: adminAuthHeaders({ 'Content-Type': 'application/json', Accept: 'application/json' }),
-      body: JSON.stringify(zooms),
+      body: JSON.stringify({ ...zooms, postal_codes: postalCodes, postal_prefix_length: postalPrefixLength }),
     });
     if (!res.ok) {
       const message = await tinyTilesResponseError(res, 'Offline-Karte konnte nicht gestartet werden');
       // A second tab may already have started exactly the same job. Treat that
       // as a status refresh rather than pretending the existing build failed.
       if (res.status === 409) {
-        tinyTilesAutoActivateWhenReady = true;
+        tinyTilesAutoActivateWhenReady = autoActivate;
         const status = await fetchTinyTilesStatus({ silent: false });
         if (status) {
           if (normalizedTinyTilesState(status.state) === 'building') {
@@ -2557,7 +2672,7 @@ async function startTinyTilesBuild() {
       throw new Error(message);
     }
     const status = await res.json().catch(() => ({ state: 'building' }));
-    tinyTilesAutoActivateWhenReady = true;
+    tinyTilesAutoActivateWhenReady = autoActivate;
     handleTinyTilesStatus(status || { state: 'building' });
     showToast('Offline-Karte wird im Hintergrund erzeugt.', 'info', 3500);
   } catch (error) {
@@ -2613,6 +2728,243 @@ async function loadVehicleProfiles() {
   }
 }
 loadVehicleProfiles();
+
+// ─── Territories ────────────────────────────────────────────────────────
+// The backend only exposes a minimal, read-only surface (list of layers +
+// raw GeoJSON passthrough per layer, see /api/v1/territories). Point-in-
+// territory lookups and route transition detection happen client-side here,
+// reusing the same GeoJSON already fetched to draw the overlay -- this
+// keeps the whole feature frontend-only, with no extra round-trips and no
+// changes to the shared route handler/cache on the server.
+const territoryGeoJSONCache = {}; // layer name -> parsed FeatureCollection
+let territoryOverlayLayer = null;
+let territoryBuildAnnouncedLayer = '';
+
+function territoryColor(id) {
+  const s = String(id ?? '');
+  let hash = 0;
+  for (let i = 0; i < s.length; i++) hash = (hash * 31 + s.charCodeAt(i)) >>> 0;
+  // Murmur3-style finalizer: a plain multiplicative hash leaves adjacent
+  // inputs (e.g. "Zone-1"/"Zone-2") only 1-2 apart before the mod, which
+  // clusters their hues together. This avalanches the bits first so
+  // similar territory_ids still get visually distinct colors.
+  hash = Math.imul(hash ^ (hash >>> 16), 2246822507);
+  hash = Math.imul(hash ^ (hash >>> 13), 3266489909);
+  hash = (hash ^ (hash >>> 16)) >>> 0;
+  return `hsl(${hash % 360}, 65%, 50%)`;
+}
+
+function territoryPopupHtml(props) {
+  props = props || {};
+  const id = props.territory_id ?? '';
+  const rows = Object.keys(props).filter(k => k !== 'territory_id').sort().map(k => {
+    const v = Array.isArray(props[k]) ? props[k].join(', ') : props[k];
+    return `<div class="territory-popup-row"><span class="territory-popup-key">${escapeHtml(k)}</span><span class="territory-popup-val">${escapeHtml(String(v))}</span></div>`;
+  }).join('');
+  return `<div class="territory-popup"><strong>${escapeHtml(String(id))}</strong>${rows}</div>`;
+}
+
+async function fetchTerritoryGeoJSON(layer) {
+  if (territoryGeoJSONCache[layer]) return territoryGeoJSONCache[layer];
+  const res = await fetch(`/api/v1/territories/${encodeURIComponent(layer)}`, { headers: { 'Accept': 'application/json' } });
+  if (!res.ok) throw new Error(`territory layer ${layer} fetch failed`);
+  const data = await res.json();
+  territoryGeoJSONCache[layer] = data;
+  return data;
+}
+
+// Even-odd (PNPOLY) point-in-ring test. GeoJSON rings are [lon, lat] pairs.
+function territoryPointInRing(ring, lon, lat) {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i][0], yi = ring[i][1];
+    const xj = ring[j][0], yj = ring[j][1];
+    const crosses = ((yi > lat) !== (yj > lat)) && (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi);
+    if (crosses) inside = !inside;
+  }
+  return inside;
+}
+
+function territoryPolygonContains(rings, lon, lat) {
+  if (!rings || rings.length === 0 || !territoryPointInRing(rings[0], lon, lat)) return false;
+  for (let h = 1; h < rings.length; h++) {
+    if (territoryPointInRing(rings[h], lon, lat)) return false; // inside a hole
+  }
+  return true;
+}
+
+function territoryGeometryContains(geometry, lon, lat) {
+  if (!geometry) return false;
+  if (geometry.type === 'Polygon') return territoryPolygonContains(geometry.coordinates, lon, lat);
+  if (geometry.type === 'MultiPolygon') return geometry.coordinates.some(poly => territoryPolygonContains(poly, lon, lat));
+  return false;
+}
+
+function territoryFindFeature(geojson, lat, lon) {
+  if (!geojson || !Array.isArray(geojson.features)) return null;
+  const matches = geojson.features.filter(f => territoryGeometryContains(f.geometry, lon, lat));
+  if (matches.length === 0) return null;
+  // Deterministic tie-break when territories in one layer overlap, mirroring
+  // the backend's own FindTerritory (lowest territory_id wins).
+  matches.sort((a, b) => String(a.properties?.territory_id ?? '').localeCompare(String(b.properties?.territory_id ?? '')));
+  return matches[0];
+}
+
+function territoryHaversineMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371000, toRad = d => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1), dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// Mirrors the server's TerritoryEventsForPath: walks the route polyline,
+// grouping consecutive same-territory points into entered/left-at-km events.
+function territoryEventsForPath(geojson, path) {
+  if (!geojson || !path || path.length === 0) return [];
+  const events = [];
+  let cur = null, km = 0;
+  for (let i = 0; i < path.length; i++) {
+    if (i > 0) km += territoryHaversineMeters(path[i - 1].lat, path[i - 1].lon, path[i].lat, path[i].lon) / 1000;
+    const feature = territoryFindFeature(geojson, path[i].lat, path[i].lon);
+    const id = feature ? (feature.properties?.territory_id ?? '') : '';
+    if (!id) {
+      if (cur) { cur.left_at_km = km; events.push(cur); cur = null; }
+    } else if (!cur) {
+      cur = { territory_id: id, entered_at_km: km };
+    } else if (cur.territory_id !== id) {
+      cur.left_at_km = km; events.push(cur);
+      cur = { territory_id: id, entered_at_km: km };
+    }
+  }
+  if (cur) { cur.left_at_km = km; events.push(cur); }
+  return events;
+}
+
+function renderTerritoryTransitionsList(events) {
+  const el = document.getElementById('territoryTransitions');
+  if (!el) return;
+  if (!events || events.length === 0) { el.style.display = 'none'; el.innerHTML = ''; return; }
+  el.innerHTML = '<div class="territory-transitions-title">Gebietswechsel</div>' + events.map(ev =>
+    `<div class="territory-transition-row">` +
+    `<span class="territory-swatch" style="background:${territoryColor(ev.territory_id)}"></span>` +
+    `<span class="territory-transition-id">${escapeHtml(ev.territory_id)}</span>` +
+    `<span class="territory-transition-range">${ev.entered_at_km.toFixed(1)}–${ev.left_at_km.toFixed(1)} km</span>` +
+    `</div>`
+  ).join('');
+  el.style.display = 'block';
+}
+
+async function updateTerritoryRouteTransitions(path) {
+  const el = document.getElementById('territoryTransitions');
+  if (!el) return;
+  const toggle = document.getElementById('territoryRouteEvents');
+  const layerName = document.getElementById('territoryLayer')?.value;
+  if (!toggle?.checked || !layerName || !path || path.length === 0) {
+    el.style.display = 'none'; el.innerHTML = '';
+    return;
+  }
+  try {
+    const geojson = await fetchTerritoryGeoJSON(layerName);
+    renderTerritoryTransitionsList(territoryEventsForPath(geojson, path));
+  } catch (e) {
+    console.warn('Territory route transitions failed:', e);
+    el.style.display = 'none';
+  }
+}
+
+async function setTerritoryOverlayVisible(visible) {
+  if (territoryOverlayLayer) { map.removeLayer(territoryOverlayLayer); territoryOverlayLayer = null; }
+  if (!visible) return;
+  const layerName = document.getElementById('territoryLayer')?.value;
+  const checkbox = document.getElementById('territoryShowOnMap');
+  if (!layerName) {
+    showToast('Bitte zuerst eine Gebietsebene wählen', 'info', 2200);
+    if (checkbox) checkbox.checked = false;
+    return;
+  }
+  try {
+    const geojson = await fetchTerritoryGeoJSON(layerName);
+    territoryOverlayLayer = L.geoJSON(geojson, {
+      // A PLZ3 feature is a MultiPolygon made from genuine PLZ5 boundaries.
+      // Do not stroke every retained component: those internal edges made one
+      // correctly grouped PLZ3 region look like many incorrectly recognised
+      // regions. Different prefix groups remain clearly visible by fill.
+      style: feature => ({ color: territoryColor(feature.properties?.territory_id), stroke: false, fillOpacity: 0.18 }),
+      onEachFeature: (feature, lyr) => lyr.bindPopup(territoryPopupHtml(feature.properties)),
+    }).addTo(map);
+  } catch (e) {
+    console.error('Territory overlay failed:', e);
+    showToast('Gebiete konnten nicht geladen werden', 'error', 3000);
+    if (checkbox) checkbox.checked = false;
+  }
+}
+
+async function loadTerritoryLayers() {
+  const select = document.getElementById('territoryLayer');
+  const empty = document.getElementById('territoryEmpty');
+  const content = document.getElementById('territoryContent');
+  const badge = document.getElementById('territoryStatusBadge');
+  if (!select) return;
+  let layers = [];
+  try {
+    const res = await fetch('/api/v1/territories', { headers: { 'Accept': 'application/json' } });
+    if (res.ok) layers = (await res.json()).layers || [];
+  } catch (e) { /* territories are optional; silently show the empty state */ }
+
+  select.innerHTML = '';
+  if (layers.length === 0) {
+    if (empty) empty.style.display = 'block';
+    if (content) content.style.display = 'none';
+    if (badge) badge.style.display = 'none';
+    return;
+  }
+  if (empty) empty.style.display = 'none';
+  if (content) content.style.display = 'block';
+  if (badge) { badge.textContent = `${layers.length} Ebene${layers.length === 1 ? '' : 'n'}`; badge.className = 'status-badge ok'; badge.style.display = 'inline-block'; }
+  layers.forEach(l => {
+    const opt = document.createElement('option');
+    opt.value = l.id;
+    opt.textContent = `${l.id} (${l.territories})`;
+    select.appendChild(opt);
+  });
+  if (territoryBuildAnnouncedLayer && layers.some(l => l.id === territoryBuildAnnouncedLayer)) {
+    select.value = territoryBuildAnnouncedLayer;
+  }
+  if (document.getElementById('territoryShowOnMap')?.checked) void setTerritoryOverlayVisible(true);
+}
+
+// Territories card collapse/expand (same pattern as the settings/AI cards)
+const territoryToggleEl = document.getElementById('territoryToggle');
+const territoryBodyEl = document.getElementById('territoryBody');
+const territoryCardEl = document.getElementById('territoryCard');
+if (territoryToggleEl && territoryBodyEl && territoryCardEl) {
+  const setTerritoryOpen = (open) => {
+    territoryBodyEl.style.display = open ? 'block' : 'none';
+    territoryCardEl.classList.toggle('collapsed', !open);
+    territoryToggleEl.setAttribute('aria-expanded', open ? 'true' : 'false');
+    territoryToggleEl.textContent = open ? '‹' : '›';
+    localStorage.setItem('territoryOpen', open ? '1' : '0');
+  };
+  territoryToggleEl.addEventListener('click', () => setTerritoryOpen(territoryBodyEl.style.display === 'none'));
+  setTerritoryOpen(localStorage.getItem('territoryOpen') === '1');
+}
+
+document.getElementById('territoryLayer')?.addEventListener('change', () => {
+  if (document.getElementById('territoryShowOnMap')?.checked) setTerritoryOverlayVisible(true);
+  updateTerritoryRouteTransitions(lastRoutePath);
+});
+document.getElementById('territoryShowOnMap')?.addEventListener('change', (e) => setTerritoryOverlayVisible(e.target.checked));
+document.getElementById('territoryRouteEvents')?.addEventListener('change', () => updateTerritoryRouteTransitions(lastRoutePath));
+document.getElementById('territoryBuildPostal')?.addEventListener('click', () => {
+  const prefixLength = Number.parseInt(document.getElementById('territoryPostalPrefix')?.value, 10);
+  if (!Number.isInteger(prefixLength) || prefixLength < 1 || prefixLength > 5) {
+    showToast('Bitte eine PLZ-Gliederung von 1 bis 5 wählen.', 'error', 4000);
+    return;
+  }
+  void startTinyTilesBuild({ postalCodes: true, postalPrefixLength: prefixLength, autoActivate: false, showMapOverlay: false });
+});
+
+loadTerritoryLayers();
 
 // When a profile is selected, auto-apply its default objective if the user
 // hasn't explicitly changed it.

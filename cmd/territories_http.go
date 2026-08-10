@@ -16,14 +16,18 @@ import (
 // layer. A missing directory is deliberately harmless: territory overlays
 // are optional for the main map server.
 func (s *server) loadTerritories(dir string) {
-	s.territories = osmmini.NewTerritoryStore()
-	s.territoryRaw = make(map[string][]byte)
+	store := osmmini.NewTerritoryStore()
+	rawByLayer := make(map[string][]byte)
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
 			log.Printf("warning: read territories directory %s: %v", dir, err)
 		}
+		s.territoriesMu.Lock()
+		s.territories = store
+		s.territoryRaw = rawByLayer
+		s.territoriesMu.Unlock()
 		return
 	}
 
@@ -46,17 +50,37 @@ func (s *server) loadTerritories(dir string) {
 			log.Printf("warning: load territory layer %s: %v", path, err)
 			continue
 		}
-		if err := s.territories.LoadLayerTerritories(layer, territories); err != nil {
-			log.Printf("warning: load territory layer %s: %v", path, err)
+		// Postal-code groups can contain very detailed shared boundary rings.
+		// They are map/search overlays, so skip the otherwise useful but costly
+		// all-pairs neighbour calculation performed for ordinary territory layers.
+		var loadErr error
+		if isPostalTerritoryLayer(layer) {
+			loadErr = store.LoadLayerTerritoriesWithoutNeighbors(layer, territories)
+		} else {
+			loadErr = store.LoadLayerTerritories(layer, territories)
+		}
+		if loadErr != nil {
+			log.Printf("warning: load territory layer %s: %v", path, loadErr)
 			continue
 		}
-		s.territoryRaw[layer] = raw
+		rawByLayer[layer] = raw
 	}
 
-	layers := s.territories.Layers()
+	layers := store.Layers()
+	s.territoriesMu.Lock()
+	s.territories = store
+	s.territoryRaw = rawByLayer
+	s.territoriesMu.Unlock()
 	if len(layers) > 0 {
 		log.Printf("Loaded %d territory layer(s): %s", len(layers), strings.Join(layers, ", "))
 	}
+}
+
+func isPostalTerritoryLayer(layer string) bool {
+	if len(layer) != 4 || !strings.HasPrefix(strings.ToLower(layer), "plz") {
+		return false
+	}
+	return layer[3] >= '1' && layer[3] <= '5'
 }
 
 type territoryLayerSummary struct {
@@ -75,14 +99,17 @@ func (s *server) handleTerritoriesList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	layers := []territoryLayerSummary{}
-	if s.territories != nil {
-		for _, layer := range s.territories.Layers() {
+	s.territoriesMu.RLock()
+	store := s.territories
+	if store != nil {
+		for _, layer := range store.Layers() {
 			layers = append(layers, territoryLayerSummary{
 				ID:          layer,
-				Territories: len(s.territories.Territories(layer)),
+				Territories: len(store.Territories(layer)),
 			})
 		}
 	}
+	s.territoriesMu.RUnlock()
 	writeJSON(w, http.StatusOK, map[string]any{"layers": layers})
 }
 
@@ -99,7 +126,12 @@ func (s *server) handleTerritoriesLayer(w http.ResponseWriter, r *http.Request) 
 		writeJSONError(w, http.StatusNotFound, "territory layer not found")
 		return
 	}
+	s.territoriesMu.RLock()
 	raw, ok := s.territoryRaw[layer]
+	if ok {
+		raw = append([]byte(nil), raw...)
+	}
+	s.territoriesMu.RUnlock()
 	if !ok {
 		writeJSONError(w, http.StatusNotFound, "territory layer not found")
 		return

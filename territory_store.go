@@ -47,6 +47,18 @@ func (s *TerritoryStore) LoadLayer(layer, path string) error {
 // programmatic construction (tests, or a future non-GeoJSON source loaded
 // elsewhere) as well as for LoadLayer itself.
 func (s *TerritoryStore) LoadLayerTerritories(layer string, territories []*Territory) error {
+	return s.loadLayerTerritories(layer, territories, true)
+}
+
+// LoadLayerTerritoriesWithoutNeighbors installs a layer without calculating
+// polygon adjacency. It is intended for large display-oriented layers such as
+// generated postal-code areas: point lookup and map overlays remain available,
+// while the expensive all-pairs boundary comparison is deliberately skipped.
+func (s *TerritoryStore) LoadLayerTerritoriesWithoutNeighbors(layer string, territories []*Territory) error {
+	return s.loadLayerTerritories(layer, territories, false)
+}
+
+func (s *TerritoryStore) loadLayerTerritories(layer string, territories []*Territory, withNeighbors bool) error {
 	sorted := make([]*Territory, len(territories))
 	copy(sorted, territories)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].ID < sorted[j].ID })
@@ -60,11 +72,15 @@ func (s *TerritoryStore) LoadLayerTerritories(layer string, territories []*Terri
 		byID[t.ID] = t
 	}
 
+	neighbors := make(map[string][]string, len(sorted))
+	if withNeighbors {
+		neighbors = computeNeighbors(sorted)
+	}
 	tl := &territoryLayer{
 		territories: byID,
 		order:       sorted,
 		index:       buildTerritoryIndex(sorted),
-		neighbors:   computeNeighbors(sorted),
+		neighbors:   neighbors,
 	}
 
 	s.mu.Lock()

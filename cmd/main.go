@@ -1341,12 +1341,12 @@ type server struct {
 	tinyTilesMaxMemory int64
 	tinyTilesBuild     tinyTilesBuildStatus
 
-	// territories and territoryRaw are populated once at startup by
-	// loadTerritories and read-only afterward (same lifecycle as pbfPath),
-	// so no mutex guards them. territories is never nil after startup, even
-	// when no layers were found -- it is an optional feature, not an error.
-	territories  *osmmini.TerritoryStore
-	territoryRaw map[string][]byte
+	// Territory layers can be reloaded after a local PLZ3 build completes.
+	// Keep the store and its raw GeoJSON snapshot together under this lock.
+	territoriesMu  sync.RWMutex
+	territories    *osmmini.TerritoryStore
+	territoryRaw   map[string][]byte
+	territoriesDir string
 }
 
 type aiMessage struct {
@@ -1458,33 +1458,25 @@ func main() {
 	openapiBytes, _ := embedded.ReadFile("api/openapi.yaml")
 
 	srv := &server{
-		router:        r,
-		addrs:         addrs,
-		startedAt:     time.Now(),
-		settings:      store,
-		tiles:         tileCache,
-		routeCache:    rCache,
-		window:        win,
-		enforceWindow: *enforceWindow,
-		adminToken:    strings.TrimSpace(*adminToken),
-		indexTmpl:     indexTmpl,
-		openAPI:       openapiBytes,
-		pbfPath:       *pbf,
-		tinyTilesDir:  *tinyTilesDir,
+		router:         r,
+		addrs:          addrs,
+		startedAt:      time.Now(),
+		settings:       store,
+		tiles:          tileCache,
+		routeCache:     rCache,
+		window:         win,
+		enforceWindow:  *enforceWindow,
+		adminToken:     strings.TrimSpace(*adminToken),
+		indexTmpl:      indexTmpl,
+		openAPI:        openapiBytes,
+		pbfPath:        *pbf,
+		tinyTilesDir:   *tinyTilesDir,
+		territoriesDir: *territoriesDir,
 	}
 	if *tinyTilesMaxMemoryMB > 0 {
 		srv.tinyTilesMaxMemory = *tinyTilesMaxMemoryMB << 20
 	}
 	defer srv.closeTinyTiles()
-	srv.loadTinyTilesIfPresent()
-
-	// Best-effort: load POI / area index (may be slow; non-fatal)
-	if err := srv.loadPOIIndex(*pbf); err != nil {
-		log.Printf("warning: POI index failed: %v", err)
-	}
-
-	// Best-effort: load territory layers (optional feature; missing dir is fine)
-	srv.loadTerritories(*territoriesDir)
 
 	httpSrv := &http.Server{
 		Addr:              *listen,
@@ -1496,6 +1488,19 @@ func main() {
 	}
 
 	log.Printf("Listening on %s", *listen)
+	// Optional data must never postpone opening the port. In particular,
+	// opening a generated .ttiles artifact can validate a sizeable local file.
+	// The corresponding handlers return a short "not ready" response until the
+	// background activation has completed; routing is immediately available.
+	go func() {
+		srv.loadTinyTilesIfPresent()
+		// loadPOIIndex itself publishes the completed index asynchronously when
+		// a fresh cache does not exist.
+		if err := srv.loadPOIIndex(*pbf); err != nil {
+			log.Printf("warning: POI index failed: %v", err)
+		}
+		srv.loadTerritories(*territoriesDir)
+	}()
 	log.Fatal(httpSrv.ListenAndServe())
 }
 
@@ -1603,6 +1608,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/api/v1/settings", s.handleSettings)
 	mux.HandleFunc("/api/v1/tile-sources", s.handleTileSources)
 	mux.HandleFunc("/api/v1/tinytiles/build", s.handleTinyTilesBuild)
+	mux.HandleFunc("/api/v1/offline-labels", s.handleOfflineLabels)
 	mux.HandleFunc("/api/v1/profiles", s.handleProfiles)
 	mux.HandleFunc("/api/v1/search", s.handleSearch)
 	mux.HandleFunc("/api/v1/route", s.handleRoute)
@@ -1630,9 +1636,10 @@ const poiCacheVersion = 3
 // while production continues to use osmmini.ExtractFile.
 type poiExtractFunc func(osmmini.Options, osmmini.Callbacks) error
 
-// loadPOIIndex builds a point, way, and relation POI index from the PBF. It
-// intentionally runs separately from graph construction so a large Bavarian
-// extract cannot block the routing service indefinitely.
+// loadPOIIndex loads a cached point, way, and relation POI index immediately,
+// or builds it in the background when no current cache exists. Routing and
+// local tinyTiles road labels must be available as soon as graph construction
+// completes; a second full PBF pass must never delay opening the HTTP port.
 func (s *server) loadPOIIndex(pbfPath string) error {
 	if pbfPath == "" {
 		return nil
@@ -1642,9 +1649,9 @@ func (s *server) loadPOIIndex(pbfPath string) error {
 	ways := make(map[int64]osmmini.Way)
 	rels := make(map[int64]osmmini.Relation)
 
-	// ExtractFile can be slow on large PBFs; run with a background context
-	// and a modest timeout to avoid blocking startup indefinitely.
-	// Try loading from a cache file first
+	// Try loading from a cache file first. This is the only synchronous path;
+	// it avoids a redundant PBF scan on restart while keeping the normal first
+	// startup responsive.
 	cachePath := pbfPath + ".poi.json"
 	if poiCacheIsFresh(pbfPath, cachePath) {
 		if loadErr := s.loadPOICache(cachePath, nodes, taggedNodes, ways, rels); loadErr == nil {
@@ -1653,33 +1660,18 @@ func (s *server) loadPOIIndex(pbfPath string) error {
 		}
 	}
 
-	done := make(chan error, 1)
+	log.Printf("POI index is building in the background; routing is ready")
 	go func() {
-		done <- buildPOIIndex(func(opts osmmini.Options, cb osmmini.Callbacks) error {
+		err := buildPOIIndex(func(opts osmmini.Options, cb osmmini.Callbacks) error {
 			return osmmini.ExtractFile(pbfPath, opts, cb)
 		}, nodes, taggedNodes, ways, rels)
-	}()
-	select {
-	case err := <-done:
 		if err != nil {
-			return err
+			log.Printf("warning: POI index failed: %v", err)
+			return
 		}
 		s.completePOIIndex(cachePath, nodes, taggedNodes, ways, rels)
-	case <-time.After(30 * time.Second):
-		// Keep extracting in the background and publish the complete index when
-		// ready. The old behavior discarded an index that merely took longer
-		// than 30 seconds, which is common for Bavaria-wide extracts.
-		log.Printf("POI index is still building in the background")
-		go func() {
-			if err := <-done; err != nil {
-				log.Printf("warning: POI index failed: %v", err)
-				return
-			}
-			s.completePOIIndex(cachePath, nodes, taggedNodes, ways, rels)
-			log.Printf("POI index ready: nodes=%d ways=%d relations=%d", len(taggedNodes), len(ways), len(rels))
-		}()
-		return nil
-	}
+		log.Printf("POI index ready: nodes=%d ways=%d relations=%d", len(taggedNodes), len(ways), len(rels))
+	}()
 	return nil
 }
 

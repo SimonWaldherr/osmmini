@@ -934,6 +934,74 @@ input:-webkit-autofill:focus {
 :root.light-mode .checkbox.switch input { background: rgba(0,0,0,0.12); }
 :root.light-mode .checkbox.switch input::before { background: rgba(0,0,0,0.35); }
 
+/* Territories */
+.territory-empty {
+  font-size: 12.5px;
+  color: var(--text-2);
+  line-height: 1.5;
+  margin: 0;
+}
+.territory-empty p { margin: 0; }
+.territory-empty code {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 11.5px;
+}
+.territory-generator {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.territory-generator-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 6px;
+}
+.territory-generator-actions .setting-select { flex: 0 0 88px; }
+.territory-generator-actions .btn { flex: 1; }
+.territory-hint {
+  font-size: 11.5px;
+  color: var(--text-2);
+  line-height: 1.5;
+  margin: 8px 0 0;
+}
+.territory-transitions {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.territory-transitions-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-2);
+  margin-bottom: 6px;
+}
+.territory-transition-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 12.5px;
+}
+.territory-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.territory-transition-id { font-weight: 600; color: var(--text); }
+.territory-transition-range { color: var(--text-2); margin-left: auto; font-variant-numeric: tabular-nums; }
+.territory-popup { font-size: 12.5px; max-width: 240px; }
+.territory-popup strong { display: block; margin-bottom: 4px; font-size: 13px; }
+.territory-popup-row { display: flex; justify-content: space-between; gap: 10px; padding: 2px 0; }
+.territory-popup-key { color: var(--text-2); }
+.territory-popup-val { color: var(--text); text-align: right; word-break: break-word; }
+
 /* Allowed highways + speed defaults */
 .allowed-highways {
   display: grid;
@@ -1509,6 +1577,37 @@ body.map-welcome-open { overflow: hidden; }
 .toast.success { border-left: 3px solid var(--success); }
 .toast.error   { border-left: 3px solid var(--error); }
 .toast.info    { border-left: 3px solid var(--primary); }
+
+/* ─── Local tinyTiles labels ───
+   These are Leaflet DOM labels, not MapLibre symbol layers. This makes the
+   minimal local vector style readable even when no glyph/font files exist. */
+.offline-label-anchor {
+  background: transparent !important;
+  border: 0 !important;
+  pointer-events: none !important;
+}
+.offline-map-label {
+  display: block;
+  width: max-content;
+  transform: translate(-50%, -50%);
+  white-space: nowrap;
+  pointer-events: none;
+  color: #243346;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-weight: 600;
+  line-height: 1.15;
+  text-shadow: -1px -1px 2px rgba(255,255,255,.95), 1px -1px 2px rgba(255,255,255,.95), -1px 1px 2px rgba(255,255,255,.95), 1px 1px 2px rgba(255,255,255,.95);
+}
+.offline-label-place .offline-map-label {
+  font-size: 13px;
+  font-weight: 750;
+  letter-spacing: .01em;
+}
+.offline-label-road .offline-map-label {
+  color: #4c5d71;
+  font-size: 11px;
+  font-weight: 550;
+}
 
 /* ─── Animations ─── */
 @keyframes fadeSlide {

@@ -580,6 +580,72 @@ type StreetMatch struct {
 	Coord  Coord  `json:"coord"`
 }
 
+// MapLabel is a small, display-ready label anchor extracted from the local
+// routing graph. It deliberately contains no graph internals, so callers can
+// render named streets without re-reading the source PBF.
+type MapLabel struct {
+	Name  string `json:"name"`
+	Coord Coord  `json:"coord"`
+}
+
+// StreetLabels returns at most one named-street anchor per street in window.
+// It is intended for lightweight map labelling rather than search: callers
+// should keep the limit low and query only the visible map area.
+func (r *Router) StreetLabels(window CoordWindow, limit int) []MapLabel {
+	if !window.Valid() || limit <= 0 || len(r.streets) == 0 {
+		return nil
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	center := window.Center()
+	type candidate struct {
+		label MapLabel
+		dist  float64
+	}
+	candidates := make([]candidate, 0, min(len(r.streets), limit*3))
+	for _, entry := range r.streets {
+		if entry.Display == "" {
+			continue
+		}
+		var best Coord
+		bestDist := math.Inf(1)
+		for _, id := range entry.NodeIDs {
+			coord, ok := r.g.coords[id]
+			if !ok || !window.Contains(coord) {
+				continue
+			}
+			// Squared degrees are sufficient for ordering candidates inside one
+			// viewport and avoid an expensive geodesic calculation per label.
+			dLat, dLon := coord.Lat-center.Lat, coord.Lon-center.Lon
+			d := dLat*dLat + dLon*dLon
+			if d < bestDist {
+				best, bestDist = coord, d
+			}
+		}
+		if bestDist != math.Inf(1) {
+			candidates = append(candidates, candidate{label: MapLabel{Name: entry.Display, Coord: best}, dist: bestDist})
+		}
+	}
+	slices.SortFunc(candidates, func(a, b candidate) int {
+		if a.dist < b.dist {
+			return -1
+		}
+		if a.dist > b.dist {
+			return 1
+		}
+		return strings.Compare(a.label.Name, b.label.Name)
+	})
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	out := make([]MapLabel, len(candidates))
+	for i, candidate := range candidates {
+		out[i] = candidate.label
+	}
+	return out
+}
+
 func (r *Router) SearchStreets(q string, limit int) []StreetMatch {
 	nq := normalize(q)
 	if nq == "" {

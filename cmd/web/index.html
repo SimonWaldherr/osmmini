@@ -135,6 +135,7 @@
                 <span id="detailEngine">—</span>
               </div>
             </div>
+            <div id="territoryTransitions" class="territory-transitions" style="display:none"></div>
           </div>
 
           <!-- Route action buttons -->
@@ -205,6 +206,57 @@
               <button id="aiSend" class="btn-send" disabled title="Senden" aria-label="Nachricht senden">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
               </button>
+            </div>
+          </div>
+        </section>
+
+        <!-- ── Territories card ── -->
+        <section class="card territory-card collapsed" id="territoryCard">
+          <div class="card-header" id="territoryCardHeader" tabindex="0" title="Gebiete ein-/ausklappen">
+            <div class="card-header-left">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="3 6 9 3 15 6 21 3 21 18 15 21 9 18 3 21"/><line x1="9" y1="3" x2="9" y2="18"/><line x1="15" y1="6" x2="15" y2="21"/></svg>
+              <h2>Gebiete</h2>
+            </div>
+            <div style="display:flex;align-items:center;gap:6px">
+              <span id="territoryStatusBadge" class="status-badge" style="display:none"></span>
+              <button id="territoryToggle" class="btn-collapse" aria-expanded="false" title="Ein-/ausklappen" aria-label="Gebiete ein-/ausklappen">›</button>
+            </div>
+          </div>
+          <div class="card-body" id="territoryBody" style="display:none">
+            <div id="territoryEmpty" class="territory-empty" style="display:none">
+              <p>Keine Gebietsdaten geladen. Du kannst eigene GeoJSON-Dateien im Server-Verzeichnis <code>territories/</code> ablegen.</p>
+            </div>
+            <div id="territoryContent" style="display:none">
+              <div class="settings-grid">
+                <div class="setting-item">
+                  <label class="setting-label" for="territoryLayer">Ebene</label>
+                  <select id="territoryLayer" class="setting-select"></select>
+                </div>
+              </div>
+              <label class="checkbox switch" title="Gebietsgrenzen der gewählten Ebene einblenden">
+                <input id="territoryShowOnMap" type="checkbox" role="switch" aria-checked="false"/>
+                <span>Auf Karte anzeigen</span>
+              </label>
+              <label class="checkbox switch" title="Gebietswechsel entlang der berechneten Route auflisten">
+                <input id="territoryRouteEvents" type="checkbox" role="switch" aria-checked="false"/>
+                <span>Gebietswechsel bei Routen anzeigen</span>
+              </label>
+              <p class="territory-hint">Klick auf ein eingeblendetes Gebiet zeigt dessen Eigenschaften (z.B. Fahrzeug, Depot, Zuständige).</p>
+            </div>
+            <div class="territory-generator">
+              <label class="setting-label" for="territoryPostalPrefix">Weitere PLZ-Ebene aus OSM-Grenzen erzeugen</label>
+              <div class="territory-generator-actions">
+                <select id="territoryPostalPrefix" class="setting-select" aria-label="PLZ-Gliederung">
+                  <option value="1">PLZ1</option>
+                  <option value="2">PLZ2</option>
+                  <option value="3" selected>PLZ3</option>
+                  <option value="4">PLZ4</option>
+                  <option value="5">PLZ5</option>
+                </select>
+                <button id="territoryBuildPostal" type="button" class="btn btn-primary">PLZ-Ebene erzeugen</button>
+              </div>
+              <p id="territoryBuildStatus" class="territory-hint" hidden></p>
+              <p class="territory-hint">Nutzt echte <code>boundary=postal_code</code>-Grenzen aus der lokalen PBF. Bereits erzeugte PLZ-Grenzen werden direkt wiederverwendet; keine externen APIs.</p>
             </div>
           </div>
         </section>
