@@ -3120,6 +3120,35 @@ setupCollapsibleSection('speedHeader', 'speedDefaults', 'speedsOpen');
 setupCollapsibleSection('mapHeader', 'mapSettings', 'mapSettingsOpen');
 setupCollapsibleSection('tinyTilesHeader', 'tinyTilesSettings', 'tinyTilesSettingsOpen');
 
+// Sidebar shortcuts expose the three common next steps without requiring a
+// long scroll through the tool cards. They reuse the existing expansion
+// controls so keyboard, stored collapse state and all normal interactions
+// stay identical.
+function revealSidebarTool(kind) {
+  if (kind === 'map') {
+    showMapSourcePicker();
+    return;
+  }
+  const targets = {
+    offline: { card: 'settingsCard', body: 'settingsBody', toggle: 'settingsToggle', section: 'tinyTilesHeader' },
+    territories: { card: 'territoryCard', body: 'territoryBody', toggle: 'territoryToggle' },
+  };
+  const target = targets[kind];
+  if (!target) return;
+  const body = document.getElementById(target.body);
+  if (body?.style.display === 'none') document.getElementById(target.toggle)?.click();
+  if (target.section) {
+    const header = document.getElementById(target.section);
+    const content = header?.nextElementSibling;
+    if (content?.style.display === 'none') header?.click();
+  }
+  window.setTimeout(() => document.getElementById(target.section || target.card)?.scrollIntoView({ block: 'start', behavior: 'smooth' }), 0);
+}
+
+document.querySelectorAll('[data-sidebar-open]').forEach((button) => {
+  button.addEventListener('click', () => revealSidebarTool(button.dataset.sidebarOpen));
+});
+
 // Intersection Observer for lazy rendering of collapsed sections
 if ('IntersectionObserver' in window) {
   const lazyObserver = new IntersectionObserver((entries) => {

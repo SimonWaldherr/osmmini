@@ -21,6 +21,8 @@ type offlineMapLabel struct {
 	Rank int     `json:"rank"`
 }
 
+const offlineLabelCellSize = 0.02
+
 func (s *server) handleOfflineLabels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -103,14 +105,29 @@ func (s *server) placeLabels(window osmmini.CoordWindow, limit int) []offlineMap
 	}
 	labels := make([]offlineMapLabel, 0, limit)
 	s.poiMu.RLock()
-	for _, node := range s.poiTaggedNodes {
-		name := strings.TrimSpace(node.Tags["name"])
-		rank := placeLabelRank(node.Tags["place"])
-		coord := osmmini.Coord{Lat: node.Lat, Lon: node.Lon}
-		if name == "" || rank == 0 || !window.Contains(coord) {
-			continue
+	if len(s.poiPlaceCells) > 0 {
+		minX, minY, maxX, maxY := offlineLabelCellRange(window)
+		for x := minX; x <= maxX; x++ {
+			for y := minY; y <= maxY; y++ {
+				for _, label := range s.poiPlaceCells[offlineLabelCellKey(x, y)] {
+					if window.Contains(osmmini.Coord{Lat: label.Lat, Lon: label.Lon}) {
+						labels = append(labels, label)
+					}
+				}
+			}
 		}
-		labels = append(labels, offlineMapLabel{Name: name, Lat: coord.Lat, Lon: coord.Lon, Kind: "place", Rank: rank})
+	} else {
+		// Keep direct server construction in integrations/tests compatible; a
+		// running server always has the compact grid published with the POI index.
+		for _, node := range s.poiTaggedNodes {
+			name := strings.TrimSpace(node.Tags["name"])
+			rank := placeLabelRank(node.Tags["place"])
+			coord := osmmini.Coord{Lat: node.Lat, Lon: node.Lon}
+			if name == "" || rank == 0 || !window.Contains(coord) {
+				continue
+			}
+			labels = append(labels, offlineMapLabel{Name: name, Lat: coord.Lat, Lon: coord.Lon, Kind: "place", Rank: rank})
+		}
 	}
 	s.poiMu.RUnlock()
 	slices.SortFunc(labels, func(a, b offlineMapLabel) int {
@@ -123,6 +140,35 @@ func (s *server) placeLabels(window osmmini.CoordWindow, limit int) []offlineMap
 		labels = labels[:limit]
 	}
 	return labels
+}
+
+func buildPlaceLabelCells(nodes map[int64]osmmini.Node) map[int64][]offlineMapLabel {
+	cells := make(map[int64][]offlineMapLabel)
+	for _, node := range nodes {
+		name := strings.TrimSpace(node.Tags["name"])
+		rank := placeLabelRank(node.Tags["place"])
+		if name == "" || rank == 0 {
+			continue
+		}
+		x, y := offlineLabelCell(node.Lat, node.Lon)
+		key := offlineLabelCellKey(x, y)
+		cells[key] = append(cells[key], offlineMapLabel{Name: name, Lat: node.Lat, Lon: node.Lon, Kind: "place", Rank: rank})
+	}
+	return cells
+}
+
+func offlineLabelCell(lat, lon float64) (int32, int32) {
+	return int32(math.Floor((lat + 90) / offlineLabelCellSize)), int32(math.Floor((lon + 180) / offlineLabelCellSize))
+}
+
+func offlineLabelCellRange(window osmmini.CoordWindow) (minX, minY, maxX, maxY int32) {
+	minX, minY = offlineLabelCell(window.MinLat, window.MinLon)
+	maxX, maxY = offlineLabelCell(window.MaxLat, window.MaxLon)
+	return minX, minY, maxX, maxY
+}
+
+func offlineLabelCellKey(x, y int32) int64 {
+	return int64(x)<<32 | int64(uint32(y))
 }
 
 func placeLabelRank(place string) int {

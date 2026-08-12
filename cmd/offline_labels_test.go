@@ -37,3 +37,15 @@ func TestHandleOfflineLabelsReturnsLocalPlaces(t *testing.T) {
 		t.Fatalf("unexpected labels: %s", body)
 	}
 }
+
+func TestPlaceLabelsUseVisibleCellOnly(t *testing.T) {
+	nodes := map[int64]osmmini.Node{
+		1: {ID: 1, Lat: 48.65, Lon: 12.49, Tags: osmmini.Tags{"name": "Landshut", "place": "town"}},
+		2: {ID: 2, Lat: 49.20, Lon: 12.10, Tags: osmmini.Tags{"name": "Außerhalb", "place": "village"}},
+	}
+	s := &server{poiTaggedNodes: nodes, poiPlaceCells: buildPlaceLabelCells(nodes)}
+	labels := s.placeLabels(osmmini.CoordWindow{MinLat: 48.6, MaxLat: 48.7, MinLon: 12.4, MaxLon: 12.6}, 10)
+	if len(labels) != 1 || labels[0].Name != "Landshut" {
+		t.Fatalf("placeLabels() = %#v", labels)
+	}
+}

@@ -1319,6 +1319,7 @@ type server struct {
 	poiMu          sync.RWMutex
 	poiNodes       map[int64]osmmini.Coord
 	poiTaggedNodes map[int64]osmmini.Node
+	poiPlaceCells  map[int64][]offlineMapLabel
 	poiWays        map[int64]osmmini.Way
 	poiRels        map[int64]osmmini.Relation
 	// small in-memory cache for Wikipedia summaries (key: lang:title)
@@ -1834,9 +1835,11 @@ func (s *server) completePOIIndex(cachePath string, nodes map[int64]osmmini.Coor
 }
 
 func (s *server) installPOIIndex(nodes map[int64]osmmini.Coord, taggedNodes map[int64]osmmini.Node, ways map[int64]osmmini.Way, rels map[int64]osmmini.Relation) {
+	placeCells := buildPlaceLabelCells(taggedNodes)
 	s.poiMu.Lock()
 	s.poiNodes = nodes
 	s.poiTaggedNodes = taggedNodes
+	s.poiPlaceCells = placeCells
 	s.poiWays = ways
 	s.poiRels = rels
 	s.poiMu.Unlock()

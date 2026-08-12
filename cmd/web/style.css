@@ -290,6 +290,36 @@ a { color: var(--primary); text-decoration: none; }
   border-color: color-mix(in srgb, var(--border) 80%, var(--primary) 20%);
   box-shadow: 0 10px 24px -20px rgba(0,0,0,.8);
 }
+.sidebar-quick-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin-top: 8px;
+}
+.sidebar-quick-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 31px;
+  padding: 5px 7px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-2);
+  background: var(--surface);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease), background var(--dur) var(--ease), transform var(--dur) var(--ease);
+}
+.sidebar-quick-action:hover {
+  border-color: color-mix(in srgb, var(--border-focus) 80%, var(--border));
+  color: var(--primary);
+  background: var(--primary-dim);
+}
+.sidebar-quick-action:active { transform: translateY(1px); }
+.sidebar-quick-action:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 
 /* Collapsed tool cards work as a dense, scannable command list. */
 .sidebar-secondary .card {
@@ -1699,6 +1729,7 @@ body.map-welcome-open { overflow: hidden; }
   .sidebar-secondary { gap: 7px; padding: 2px 10px 16px; }
   .sidebar-secondary::before { padding-top: 6px; }
   .route-card { margin-top: 7px; padding: 10px; }
+  .sidebar-quick-actions { margin-top: 7px; }
   .map { height: 100%; }
   .map-pane { min-height: 48vh; }
   .settings-grid { grid-template-columns: 1fr; }

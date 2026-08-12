@@ -261,10 +261,11 @@ type Graph struct {
 // Router wraps a road graph built from OSM highways and provides
 // nearest-node lookup, street search and pathfinding (A*/Dijkstra).
 type Router struct {
-	g       Graph
-	streets map[string]streetEntry // normalized -> display + sample nodes
-	idx     *spatialIndex
-	bounds  *CoordWindow
+	g                Graph
+	streets          map[string]streetEntry // normalized -> display + sample nodes
+	streetLabelCells map[int64][]streetLabelRef
+	idx              *spatialIndex
+	bounds           *CoordWindow
 
 	// CH data
 	ch *chData
@@ -273,6 +274,20 @@ type Router struct {
 type streetEntry struct {
 	Display string
 	NodeIDs []int64
+}
+
+// streetLabelRef is deliberately smaller than MapLabel: coordinates remain in
+// the graph and are resolved only for cells intersecting the current viewport.
+// A Bavaria-sized graph has many named streets, while one map frame normally
+// touches only a few dozen of these references.
+type streetLabelRef struct {
+	streetKey string
+	nodeID    int64
+}
+
+type mapLabelCandidate struct {
+	label MapLabel
+	dist  float64
 }
 
 // BuildOptions controls router graph extraction.
@@ -457,6 +472,7 @@ func BuildRouterWithAddressesOptions(path string, bo BuildOptions) (*Router, []A
 	}
 
 	idx := buildSpatialIndex(coords)
+	streetLabelCells := buildStreetLabelCells(streets, coords)
 
 	var bounds *CoordWindow
 	if b, ok := computeBounds(coords); ok {
@@ -464,10 +480,11 @@ func BuildRouterWithAddressesOptions(path string, bo BuildOptions) (*Router, []A
 	}
 
 	return &Router{
-		g:       Graph{coords: coords, adj: adj},
-		streets: streets,
-		idx:     idx,
-		bounds:  bounds,
+		g:                Graph{coords: coords, adj: adj},
+		streets:          streets,
+		streetLabelCells: streetLabelCells,
+		idx:              idx,
+		bounds:           bounds,
 	}, addrs, nil
 }
 
@@ -599,11 +616,39 @@ func (r *Router) StreetLabels(window CoordWindow, limit int) []MapLabel {
 		limit = 500
 	}
 	center := window.Center()
-	type candidate struct {
-		label MapLabel
-		dist  float64
+	if len(r.streetLabelCells) == 0 {
+		return r.streetLabelsScan(window, center, limit)
 	}
-	candidates := make([]candidate, 0, min(len(r.streets), limit*3))
+	// The old implementation walked every named street for every map movement.
+	// Querying the fixed grid makes cost proportional to the visible map area.
+	// Duplicated samples of a street are reduced to the nearest visible one.
+	byStreet := make(map[string]mapLabelCandidate, limit*2)
+	minX, minY, maxX, maxY := labelCellRange(window)
+	for x := minX; x <= maxX; x++ {
+		for y := minY; y <= maxY; y++ {
+			for _, ref := range r.streetLabelCells[cellKey(x, y)] {
+				coord, ok := r.g.coords[ref.nodeID]
+				if !ok || !window.Contains(coord) {
+					continue
+				}
+				dLat, dLon := coord.Lat-center.Lat, coord.Lon-center.Lon
+				dist := dLat*dLat + dLon*dLon
+				if previous, exists := byStreet[ref.streetKey]; exists && previous.dist <= dist {
+					continue
+				}
+				entry, ok := r.streets[ref.streetKey]
+				if !ok || entry.Display == "" {
+					continue
+				}
+				byStreet[ref.streetKey] = mapLabelCandidate{label: MapLabel{Name: entry.Display, Coord: coord}, dist: dist}
+			}
+		}
+	}
+	return sortStreetLabelCandidates(byStreet, limit)
+}
+
+func (r *Router) streetLabelsScan(window CoordWindow, center Coord, limit int) []MapLabel {
+	candidates := make([]mapLabelCandidate, 0, min(len(r.streets), limit*3))
 	for _, entry := range r.streets {
 		if entry.Display == "" {
 			continue
@@ -624,10 +669,34 @@ func (r *Router) StreetLabels(window CoordWindow, limit int) []MapLabel {
 			}
 		}
 		if bestDist != math.Inf(1) {
-			candidates = append(candidates, candidate{label: MapLabel{Name: entry.Display, Coord: best}, dist: bestDist})
+			candidates = append(candidates, mapLabelCandidate{label: MapLabel{Name: entry.Display, Coord: best}, dist: bestDist})
 		}
 	}
-	slices.SortFunc(candidates, func(a, b candidate) int {
+	slices.SortFunc(candidates, func(a, b mapLabelCandidate) int {
+		if a.dist < b.dist {
+			return -1
+		}
+		if a.dist > b.dist {
+			return 1
+		}
+		return strings.Compare(a.label.Name, b.label.Name)
+	})
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	out := make([]MapLabel, len(candidates))
+	for i, candidate := range candidates {
+		out[i] = candidate.label
+	}
+	return out
+}
+
+func sortStreetLabelCandidates(byStreet map[string]mapLabelCandidate, limit int) []MapLabel {
+	candidates := make([]mapLabelCandidate, 0, len(byStreet))
+	for _, candidate := range byStreet {
+		candidates = append(candidates, candidate)
+	}
+	slices.SortFunc(candidates, func(a, b mapLabelCandidate) int {
 		if a.dist < b.dist {
 			return -1
 		}
@@ -1771,6 +1840,39 @@ type spatialIndex struct {
 	maxX     int32
 	maxY     int32
 	cells    map[int64][]int64
+}
+
+// mapLabelCellSize keeps label lookups small at interactive map zoom levels
+// (~2.2 km latitude). It is intentionally independent of the nearest-node
+// index so label queries retain stable bounds even for a clipped graph.
+const mapLabelCellSize = 0.02
+
+func buildStreetLabelCells(streets map[string]streetEntry, coords map[int64]Coord) map[int64][]streetLabelRef {
+	if len(streets) == 0 {
+		return nil
+	}
+	cells := make(map[int64][]streetLabelRef, min(len(streets), 4096))
+	for key, entry := range streets {
+		for _, nodeID := range entry.NodeIDs {
+			coord, ok := coords[nodeID]
+			if !ok {
+				continue
+			}
+			x, y := mapLabelCell(coord.Lat, coord.Lon)
+			cells[cellKey(x, y)] = append(cells[cellKey(x, y)], streetLabelRef{streetKey: key, nodeID: nodeID})
+		}
+	}
+	return cells
+}
+
+func mapLabelCell(lat, lon float64) (int32, int32) {
+	return int32(math.Floor((lat + 90) / mapLabelCellSize)), int32(math.Floor((lon + 180) / mapLabelCellSize))
+}
+
+func labelCellRange(window CoordWindow) (minX, minY, maxX, maxY int32) {
+	minX, minY = mapLabelCell(window.MinLat, window.MinLon)
+	maxX, maxY = mapLabelCell(window.MaxLat, window.MaxLon)
+	return minX, minY, maxX, maxY
 }
 
 func buildSpatialIndex(coords map[int64]Coord) *spatialIndex {
