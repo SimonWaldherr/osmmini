@@ -27,7 +27,8 @@
     <div id="pageSpinner" class="spinner-page"></div>
     <div class="app" style="opacity:0;transition:opacity 0.25s ease;">
 
-      <aside class="sidebar">
+      <aside class="sidebar" aria-label="Routenplanung und Werkzeuge">
+        <div class="sidebar-primary">
 
         <!-- ── Header ── -->
         <div class="header">
@@ -177,6 +178,9 @@
 
         </section>
 
+        </div>
+
+        <div class="sidebar-secondary" aria-label="Weitere Werkzeuge">
         <!-- ── AI Assistant card ── -->
         <section class="card ai-card collapsed" id="aiCard">
           <div class="card-header" id="aiCardHeader" tabindex="0" title="KI-Assistent ein-/ausklappen">
@@ -519,6 +523,8 @@
             </div>
           </div>
         </section>
+
+        </div>
 
       </aside>
 
