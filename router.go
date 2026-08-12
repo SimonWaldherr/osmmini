@@ -264,6 +264,7 @@ type Router struct {
 	g                Graph
 	streets          map[string]streetEntry // normalized -> display + sample nodes
 	streetLabelCells map[int64][]streetLabelRef
+	streetNameByNode map[int64]string
 	idx              *spatialIndex
 	bounds           *CoordWindow
 
@@ -473,6 +474,7 @@ func BuildRouterWithAddressesOptions(path string, bo BuildOptions) (*Router, []A
 
 	idx := buildSpatialIndex(coords)
 	streetLabelCells := buildStreetLabelCells(streets, coords)
+	streetNameByNode := buildStreetNameIndex(streets)
 
 	var bounds *CoordWindow
 	if b, ok := computeBounds(coords); ok {
@@ -483,6 +485,7 @@ func BuildRouterWithAddressesOptions(path string, bo BuildOptions) (*Router, []A
 		g:                Graph{coords: coords, adj: adj},
 		streets:          streets,
 		streetLabelCells: streetLabelCells,
+		streetNameByNode: streetNameByNode,
 		idx:              idx,
 		bounds:           bounds,
 	}, addrs, nil
@@ -1083,8 +1086,15 @@ func (r *Router) RouteWithOptions(ctx context.Context, from, to int64, opt Route
 	}, nil
 }
 
-// helper: find street display name for a node by scanning street samples.
+// streetNameForNode returns the display name captured for a sampled road node.
+// The lookup is used for every interior point when generating maneuvers, so a
+// pre-built index avoids repeatedly scanning all named streets on long routes.
 func (r *Router) streetNameForNode(node int64) string {
+	if name, ok := r.streetNameByNode[node]; ok {
+		return name
+	}
+	// Keep manually constructed Router values and older serialized test data
+	// working. Normal PBF-built routers always have streetNameByNode.
 	for _, se := range r.streets {
 		for _, id := range se.NodeIDs {
 			if id == node {
@@ -1863,6 +1873,26 @@ func buildStreetLabelCells(streets map[string]streetEntry, coords map[int64]Coor
 		}
 	}
 	return cells
+}
+
+func buildStreetNameIndex(streets map[string]streetEntry) map[int64]string {
+	if len(streets) == 0 {
+		return nil
+	}
+	byNode := make(map[int64]string, len(streets))
+	for _, entry := range streets {
+		if entry.Display == "" {
+			continue
+		}
+		for _, nodeID := range entry.NodeIDs {
+			// Junctions can belong to multiple named ways. Pick one stable name;
+			// the former map iteration happened to pick an arbitrary one anyway.
+			if prior, exists := byNode[nodeID]; !exists || entry.Display < prior {
+				byNode[nodeID] = entry.Display
+			}
+		}
+	}
+	return byNode
 }
 
 func mapLabelCell(lat, lon float64) (int32, int32) {

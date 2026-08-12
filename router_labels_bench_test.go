@@ -35,3 +35,40 @@ func BenchmarkStreetLabels(b *testing.B) {
 		}
 	})
 }
+
+func BenchmarkManeuverStreetNames(b *testing.B) {
+	const (
+		extraStreets = 10000
+		pathNodes    = 400
+	)
+	coords := make(map[int64]Coord, pathNodes)
+	path := make([]int64, pathNodes)
+	for i := range path {
+		id := int64(i + 1)
+		path[i] = id
+		coords[id] = Coord{Lat: 48 + float64(i)*0.0001, Lon: 12}
+	}
+	streets := make(map[string]streetEntry, extraStreets+1)
+	streets["route"] = streetEntry{Display: "Schnellstraße", NodeIDs: path}
+	for i := 0; i < extraStreets; i++ {
+		key := "other-" + strconv.Itoa(i)
+		streets[key] = streetEntry{Display: key, NodeIDs: []int64{int64(1_000_000 + i)}}
+	}
+	opt := RouteOptions{Objective: ObjectiveDuration}.withDefaults()
+	b.Run("node-index", func(b *testing.B) {
+		r := &Router{g: Graph{coords: coords}, streets: streets, streetNameByNode: buildStreetNameIndex(streets)}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_ = r.ManeuversForPath(path, opt)
+		}
+	})
+	b.Run("street-scan", func(b *testing.B) {
+		r := &Router{g: Graph{coords: coords}, streets: streets}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_ = r.ManeuversForPath(path, opt)
+		}
+	})
+}
