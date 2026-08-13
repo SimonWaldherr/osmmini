@@ -2277,6 +2277,23 @@ func writeJSONErrorDetails(w http.ResponseWriter, status int, msg string, detail
 	writeJSON(w, status, out)
 }
 
+// routeErrorMessage translates known routing engine errors into actionable
+// German messages instead of leaking internal Go error text to the UI.
+func routeErrorMessage(err error) string {
+	switch {
+	case errors.Is(err, osmmini.ErrRouteNoPath):
+		return "Zwischen Start und Ziel wurde keine Route gefunden. Liegen beide Punkte im geladenen Kartenausschnitt und sind sie über das Straßennetz verbunden?"
+	case errors.Is(err, osmmini.ErrRouteStartUnreachable):
+		return "Der Startpunkt liegt außerhalb des geladenen Kartenausschnitts oder ist nicht an das Straßennetz angebunden."
+	case errors.Is(err, osmmini.ErrRouteTargetUnreachable):
+		return "Der Zielpunkt liegt außerhalb des geladenen Kartenausschnitts oder ist nicht an das Straßennetz angebunden."
+	case errors.Is(err, osmmini.ErrRouteEngineNotReady):
+		return "Das gewählte Routing-Verfahren ist gerade nicht verfügbar. Bitte versuche es mit einem anderen Profil erneut."
+	default:
+		return "Route konnte nicht berechnet werden: " + err.Error()
+	}
+}
+
 func readJSON(w http.ResponseWriter, r *http.Request, dst any, maxBytes int64) error {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 	defer r.Body.Close()
@@ -2759,7 +2776,7 @@ func (s *server) handleAgentExecute(w http.ResponseWriter, r *http.Request) {
 			}
 			res, err := s.router.RouteWithOptions(r.Context(), startID, endID, opt)
 			if err != nil {
-				results = append(results, map[string]any{"type": t, "error": err.Error()})
+				results = append(results, map[string]any{"type": t, "error": routeErrorMessage(err)})
 				continue
 			}
 			// build minimal response payload similar to RouteResponse
@@ -3468,11 +3485,11 @@ func (s *server) handleRoute(w http.ResponseWriter, r *http.Request) {
 
 	res, err := s.router.RouteWithOptions(r.Context(), startID, endID, opt)
 	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
+		writeJSONError(w, http.StatusBadRequest, routeErrorMessage(err))
 		return
 	}
 	if len(res.PathCoords) == 0 {
-		writeJSONError(w, http.StatusInternalServerError, "empty path")
+		writeJSONError(w, http.StatusInternalServerError, "Route konnte nicht berechnet werden: leerer Pfad.")
 		return
 	}
 
@@ -3533,7 +3550,7 @@ func (s *server) handleTripSolve(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.solveTrip(r.Context(), req.Plan, opt)
 	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
+		writeJSONError(w, http.StatusBadRequest, routeErrorMessage(err))
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -5550,7 +5567,7 @@ func (s *server) handleIntentLocally(ctx context.Context, w http.ResponseWriter,
 		}
 		rr, fromAI, toAI, err := s.computeRouteFromLocQuery(ctx, from, destStr, opt)
 		if err != nil {
-			writeJSONError(w, http.StatusNotFound, "Route nicht gefunden: "+err.Error())
+			writeJSONError(w, http.StatusNotFound, routeErrorMessage(err))
 			return true
 		}
 		resp := fmt.Sprintf("Route nach **%s**: %.1f km, ca. %s.", toAI.Label, rr.DistanceM/1000, formatDur(rr.DurationS))
@@ -5567,7 +5584,7 @@ func (s *server) handleIntentLocally(ctx context.Context, w http.ResponseWriter,
 		}
 		rr, fromAI, toAI, err := s.computeRouteFromLocQuery(ctx, origin, intent.Destination, opt)
 		if err != nil {
-			writeJSONError(w, http.StatusNotFound, "Route nicht gefunden: "+err.Error())
+			writeJSONError(w, http.StatusNotFound, routeErrorMessage(err))
 			return true
 		}
 		resp := fmt.Sprintf("Von **%s** nach **%s**: %.1f km, ca. %s.", fromAI.Label, toAI.Label, rr.DistanceM/1000, formatDur(rr.DurationS))

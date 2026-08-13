@@ -13,6 +13,16 @@ import (
 	"unicode"
 )
 
+// Sentinel routing errors. Callers (e.g. the HTTP API) can match these with
+// errors.Is to present a translated, user-facing message instead of the raw
+// internal error text.
+var (
+	ErrRouteEngineNotReady    = errors.New("ch: not built")
+	ErrRouteNoPath            = errors.New("no path found")
+	ErrRouteStartUnreachable  = errors.New("start node missing in graph")
+	ErrRouteTargetUnreachable = errors.New("target node missing in graph")
+)
+
 // RouteEngine selects the pathfinding engine implementation.
 // - "astar": A* with admissible heuristic
 // - "dijkstra": A* with h=0 (equivalent to Dijkstra)
@@ -1069,7 +1079,7 @@ func (r *Router) RouteCostWithOptions(ctx context.Context, from, to int64, opt R
 	}
 	if opt.Engine == EngineCH {
 		if r.ch == nil {
-			return 0, errors.New("ch: not built")
+			return 0, ErrRouteEngineNotReady
 		}
 		_, cost, err := r.chQuery(ctx, from, to, opt)
 		return cost, err
@@ -1099,7 +1109,7 @@ func (r *Router) RouteWithOptions(ctx context.Context, from, to int64, opt Route
 	}
 	if opt.Engine == EngineCH {
 		if r.ch == nil {
-			return RouteResult{}, errors.New("ch: not built")
+			return RouteResult{}, ErrRouteEngineNotReady
 		}
 		path, cost, err := r.chQuery(ctx, from, to, opt)
 		if err != nil {
@@ -1169,7 +1179,7 @@ func (r *Router) ManeuversForPath(path []int64, opt RouteOptions) []Maneuver {
 	// trivial single-node route
 	if n == 1 {
 		c := coords[0]
-		return []Maneuver{{Type: "arrive", Instruction: "Arrive at destination", Lat: c.Lat, Lon: c.Lon, Node: path[0], DistanceM: 0, DurationS: 0}}
+		return []Maneuver{{Type: "arrive", Instruction: "Ziel erreicht", Lat: c.Lat, Lon: c.Lon, Node: path[0], DistanceM: 0, DurationS: 0}}
 	}
 
 	// precompute bearings and per-segment distances/durations
@@ -1190,7 +1200,7 @@ func (r *Router) ManeuversForPath(path []int64, opt RouteOptions) []Maneuver {
 
 	// build maneuvers: depart at first node
 	maneuvers := []Maneuver{}
-	depart := Maneuver{Type: "depart", Instruction: "Depart", Lat: coords[0].Lat, Lon: coords[0].Lon, Node: path[0]}
+	depart := Maneuver{Type: "depart", Instruction: "Los geht's", Lat: coords[0].Lat, Lon: coords[0].Lon, Node: path[0]}
 	// accumulate until next maneuver
 	curIdx := 0
 	for i := 1; i < n-1; i++ {
@@ -1215,25 +1225,25 @@ func (r *Router) ManeuversForPath(path []int64, opt RouteOptions) []Maneuver {
 			}
 			// decide type and instruction
 			mtype := "continue"
-			instr := "Continue"
+			instr := "Weiterfahren"
 			if angChange {
 				if math.Abs(d) > 150 {
 					mtype = "uturn"
-					instr = "Make a U-turn"
+					instr = "Wenden"
 				} else if d > 0 {
 					mtype = "turn-right"
-					instr = "Turn right"
+					instr = "Rechts abbiegen"
 				} else {
 					mtype = "turn-left"
-					instr = "Turn left"
+					instr = "Links abbiegen"
 				}
 			} else if nameChange {
 				mtype = "turn"
-				instr = "Turn"
+				instr = "Abbiegen"
 			}
 			// append street name if available
 			if nextName != "" {
-				instr = fmt.Sprintf("%s onto %s", instr, nextName)
+				instr = fmt.Sprintf("%s auf %s", instr, nextName)
 			}
 			m := Maneuver{Type: mtype, Instruction: instr, Lat: coords[i].Lat, Lon: coords[i].Lon, Node: path[i], DistanceM: sumDist, DurationS: sumDur}
 			if len(maneuvers) == 0 {
@@ -1251,7 +1261,7 @@ func (r *Router) ManeuversForPath(path []int64, opt RouteOptions) []Maneuver {
 		sumDist += segDist[k]
 		sumDur += segDur[k]
 	}
-	arrive := Maneuver{Type: "arrive", Instruction: "Arrive at destination", Lat: coords[n-1].Lat, Lon: coords[n-1].Lon, Node: path[n-1], DistanceM: 0, DurationS: 0}
+	arrive := Maneuver{Type: "arrive", Instruction: "Ziel erreicht", Lat: coords[n-1].Lat, Lon: coords[n-1].Lon, Node: path[n-1], DistanceM: 0, DurationS: 0}
 	// set depart fields
 	if depart.DistanceM == 0 && len(maneuvers) > 0 {
 		depart.DistanceM = 0
@@ -1329,7 +1339,7 @@ func (r *Router) chQuery(ctx context.Context, from, to int64, opt RouteOptions) 
 		return []int64{from}, 0, nil
 	}
 	if r.ch == nil {
-		return nil, 0, errors.New("ch: not built")
+		return nil, 0, ErrRouteEngineNotReady
 	}
 
 	// forward
@@ -1400,7 +1410,7 @@ func (r *Router) chQuery(ctx context.Context, from, to int64, opt RouteOptions) 
 		}
 	}
 	if meet == 0 || best == math.MaxFloat64 {
-		return nil, 0, errors.New("ch: no path")
+		return nil, 0, ErrRouteNoPath
 	}
 
 	// reconstruct path: forward from 'from' to meet, backward from 'to' to meet
@@ -1452,10 +1462,10 @@ func (r *Router) dijkstraNode(ctx context.Context, from, to int64, opt RouteOpti
 		return []int64{from}, 0, nil
 	}
 	if _, ok := r.g.coords[from]; !ok {
-		return nil, 0, errors.New("start node missing in graph")
+		return nil, 0, ErrRouteStartUnreachable
 	}
 	if _, ok := r.g.coords[to]; !ok {
-		return nil, 0, errors.New("target node missing in graph")
+		return nil, 0, ErrRouteTargetUnreachable
 	}
 
 	// use a small slice-backed priority queue for nodes
@@ -1513,7 +1523,7 @@ func (r *Router) dijkstraNode(ctx context.Context, from, to int64, opt RouteOpti
 	}
 
 	if dist[to] == math.MaxFloat64 {
-		return nil, 0, errors.New("no path found")
+		return nil, 0, ErrRouteNoPath
 	}
 	// reconstruct path
 	path := make([]int64, 0)
@@ -1524,7 +1534,7 @@ func (r *Router) dijkstraNode(ctx context.Context, from, to int64, opt RouteOpti
 		}
 		p, ok := prev[cur]
 		if !ok {
-			return nil, 0, errors.New("path reconstruction failed")
+			return nil, 0, ErrRouteNoPath
 		}
 		cur = p
 	}
@@ -1631,16 +1641,16 @@ func (r *Router) astar(ctx context.Context, from, to int64, opt RouteOptions, wa
 		return turnState{prev: 0, cur: from}, 0, came, nil
 	}
 	if _, ok := r.g.coords[from]; !ok {
-		return turnState{}, 0, nil, errors.New("start node missing in graph")
+		return turnState{}, 0, nil, ErrRouteStartUnreachable
 	}
 	if _, ok := r.g.coords[to]; !ok {
-		return turnState{}, 0, nil, errors.New("target node missing in graph")
+		return turnState{}, 0, nil, ErrRouteTargetUnreachable
 	}
 	if len(r.g.adj[from]) == 0 {
-		return turnState{}, 0, nil, errors.New("start node has no edges")
+		return turnState{}, 0, nil, ErrRouteStartUnreachable
 	}
 	if len(r.g.adj[to]) == 0 {
-		return turnState{}, 0, nil, errors.New("target node has no edges")
+		return turnState{}, 0, nil, ErrRouteTargetUnreachable
 	}
 
 	if wantPath {
@@ -1699,7 +1709,7 @@ func (r *Router) astar(ctx context.Context, from, to int64, opt RouteOptions, wa
 		}
 	}
 
-	return turnState{}, 0, nil, errors.New("no path found")
+	return turnState{}, 0, nil, ErrRouteNoPath
 }
 
 func reconstructPathTurnState(goal turnState, came map[turnState]turnState) []int64 {

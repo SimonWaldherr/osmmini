@@ -1398,7 +1398,11 @@ function makeSuggest(containerId, inputOrId) {
       ctrl = new AbortController();
       try {
         const res = await fetch('/api/v1/search?limit=6&q=' + encodeURIComponent(q), { signal: ctrl.signal });
-        if (!res.ok) { hide(); return; }
+        if (!res.ok) {
+          hide();
+          showToast('Suche fehlgeschlagen (Fehler ' + res.status + ')', 'error', 2500);
+          return;
+        }
         const data = await res.json();
         if (mySeq !== seq) return;
         container.innerHTML = '';
@@ -1452,6 +1456,7 @@ function makeSuggest(containerId, inputOrId) {
       } catch (err) {
         if (err && err.name === 'AbortError') return;
         hide();
+        showToast('Suche fehlgeschlagen: ' + (err && err.message ? err.message : 'Netzwerkfehler'), 'error', 2500);
       }
     }, 220);
   });
@@ -1573,11 +1578,28 @@ function showSearchResultsOnMap(results) {
             let infoHtml = `<strong>${escapeHtml(data.label || '')}</strong><br/>`;
             if (data.tags) {
               const keys = Object.keys(data.tags).sort();
-              infoHtml += '<div style="margin-top:6px; font-size:13px;">';
+              const knownLabels = { phone: 'Telefon', website: 'Website', opening_hours: 'Öffnungszeiten' };
+              const knownRows = [];
+              const otherRows = [];
               keys.forEach(k => {
                 const v = data.tags[k];
-                infoHtml += `<div><strong>${escapeHtml(k)}:</strong> ${escapeHtml(v)}</div>`;
+                if (k === 'phone') {
+                  const telHref = v.replace(/[^+\d]/g, '');
+                  knownRows.push(`<div><strong>${knownLabels.phone}:</strong> <a href="tel:${escapeHtml(telHref)}">${escapeHtml(v)}</a></div>`);
+                } else if (k === 'website') {
+                  const isSafeUrl = /^https?:\/\//i.test(v);
+                  const link = isSafeUrl
+                    ? `<a href="${escapeHtml(v)}" target="_blank" rel="noopener noreferrer">${escapeHtml(v)}</a>`
+                    : escapeHtml(v);
+                  knownRows.push(`<div><strong>${knownLabels.website}:</strong> ${link}</div>`);
+                } else if (k === 'opening_hours') {
+                  knownRows.push(`<div><strong>${knownLabels.opening_hours}:</strong> ${escapeHtml(v)}</div>`);
+                } else {
+                  otherRows.push(`<div><strong>${escapeHtml(k)}:</strong> ${escapeHtml(v)}</div>`);
+                }
               });
+              infoHtml += '<div style="margin-top:6px; font-size:13px;">';
+              infoHtml += knownRows.join('') + otherRows.join('');
               infoHtml += '</div>';
             }
             if (data.wiki_summary) {
@@ -2933,19 +2955,40 @@ async function loadTerritoryLayers() {
   if (document.getElementById('territoryShowOnMap')?.checked) void setTerritoryOverlayVisible(true);
 }
 
+// Makes an entire card header act as the collapse/expand toggle (click or
+// Enter/Space), while leaving the dedicated chevron button's own click
+// handling untouched. Shared so every sidebar card (AI, Territories,
+// Settings, Shortcuts) behaves the same way instead of only the AI card's
+// header being fully clickable.
+function wireCollapsibleHeader(headerEl, toggleBtnEl, toggleFn) {
+  if (!headerEl) return;
+  headerEl.addEventListener('click', (e) => {
+    if (toggleBtnEl && (e.target === toggleBtnEl || toggleBtnEl.contains(e.target))) return;
+    toggleFn();
+  });
+  headerEl.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    e.preventDefault();
+    toggleFn();
+  });
+}
+
 // Territories card collapse/expand (same pattern as the settings/AI cards)
 const territoryToggleEl = document.getElementById('territoryToggle');
 const territoryBodyEl = document.getElementById('territoryBody');
 const territoryCardEl = document.getElementById('territoryCard');
+const territoryCardHeaderEl = document.getElementById('territoryCardHeader');
 if (territoryToggleEl && territoryBodyEl && territoryCardEl) {
   const setTerritoryOpen = (open) => {
     territoryBodyEl.style.display = open ? 'block' : 'none';
     territoryCardEl.classList.toggle('collapsed', !open);
     territoryToggleEl.setAttribute('aria-expanded', open ? 'true' : 'false');
+    territoryCardHeaderEl?.setAttribute('aria-expanded', open ? 'true' : 'false');
     territoryToggleEl.textContent = open ? '‹' : '›';
     localStorage.setItem('territoryOpen', open ? '1' : '0');
   };
   territoryToggleEl.addEventListener('click', () => setTerritoryOpen(territoryBodyEl.style.display === 'none'));
+  wireCollapsibleHeader(territoryCardHeaderEl, territoryToggleEl, () => setTerritoryOpen(territoryBodyEl.style.display === 'none'));
   setTerritoryOpen(localStorage.getItem('territoryOpen') === '1');
 }
 
@@ -2971,17 +3014,27 @@ loadTerritoryLayers();
 const profileSelEl = document.getElementById('profile');
 if (profileSelEl) {
   profileSelEl.addEventListener('change', async function() {
-    if (!this.value) return; // custom — no auto-apply
-    try {
-      const res = await fetch('/api/v1/profiles');
-      if (!res.ok) return;
-      const profiles = await res.json();
-      const def = profiles.find(p => p.id === this.value);
-      if (def) {
-        const objEl = document.getElementById('objective');
-        if (objEl && def.objective) objEl.value = def.objective;
-      }
-    } catch (e) { /* non-critical */ }
+    if (this.value) {
+      try {
+        const res = await fetch('/api/v1/profiles');
+        if (res.ok) {
+          const profiles = await res.json();
+          const def = profiles.find(p => p.id === this.value);
+          if (def) {
+            const objEl = document.getElementById('objective');
+            if (objEl && def.objective) objEl.value = def.objective;
+          }
+        }
+      } catch (e) { /* non-critical */ }
+    }
+    // A route already on screen reflects the previous profile — recompute it
+    // instead of silently leaving a stale (e.g. car) route displayed after
+    // switching to a different vehicle profile (e.g. cycling).
+    const detailsEl = document.getElementById('routeDetails');
+    if (detailsEl && detailsEl.style.display !== 'none') {
+      showToast('Profil geändert – Route wird neu berechnet…', 'info', 1800);
+      try { await compute(); } catch (e) { /* compute() already surfaces errors */ }
+    }
   });
 }
 
@@ -3066,14 +3119,17 @@ document.getElementById('toggleApiKeyVis')?.addEventListener('click', () => {
 const settingsToggle = document.getElementById('settingsToggle');
 const settingsBody = document.getElementById('settingsBody');
 const settingsCard = document.getElementById('settingsCard');
+const settingsCardHeaderEl = document.getElementById('settingsCardHeader');
 function setSettingsOpen(open){
   settingsBody.style.display = open ? 'block' : 'none';
   settingsCard.classList.toggle('collapsed', !open);
   settingsToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+  settingsCardHeaderEl?.setAttribute('aria-expanded', open ? 'true' : 'false');
   settingsToggle.textContent = open ? '‹' : '›';
   localStorage.setItem('settingsOpen', open ? '1' : '0');
 }
 settingsToggle.addEventListener('click', ()=>{ setSettingsOpen(settingsBody.style.display==='none'); });
+wireCollapsibleHeader(settingsCardHeaderEl, settingsToggle, () => setSettingsOpen(settingsBody.style.display === 'none'));
 // default collapsed
 if(localStorage.getItem('settingsOpen') === null) setSettingsOpen(false); else setSettingsOpen(localStorage.getItem('settingsOpen')==='1');
 
@@ -3081,15 +3137,18 @@ if(localStorage.getItem('settingsOpen') === null) setSettingsOpen(false); else s
 const helpToggle = document.getElementById('helpToggle');
 const helpBody = document.getElementById('helpBody');
 const helpCard = document.getElementById('helpCard');
+const helpCardHeaderEl = document.getElementById('helpCardHeader');
 if (helpToggle) {
   function setHelpOpen(open){
     helpBody.style.display = open ? 'block' : 'none';
     helpCard.classList.toggle('collapsed', !open);
     helpToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    helpCardHeaderEl?.setAttribute('aria-expanded', open ? 'true' : 'false');
     helpToggle.textContent = open ? '‹' : '›';
     localStorage.setItem('helpOpen', open ? '1' : '0');
   }
   helpToggle.addEventListener('click', ()=>{ setHelpOpen(helpBody.style.display==='none'); });
+  wireCollapsibleHeader(helpCardHeaderEl, helpToggle, () => setHelpOpen(helpBody.style.display === 'none'));
   if(localStorage.getItem('helpOpen') === null) setHelpOpen(false); else setHelpOpen(localStorage.getItem('helpOpen')==='1');
 }
 
@@ -3249,19 +3308,7 @@ if (aiToggle) {
   }
   // Clicking the toggle button or anywhere on the header toggles the panel
   aiToggle.addEventListener('click', (e) => { e.stopPropagation(); setAIOpen(aiBody.style.display === 'none'); });
-  if (aiCardHeader) {
-    aiCardHeader.addEventListener('click', (e) => {
-      if (e.target === aiToggle) return; // button handles its own click
-      setAIOpen(aiBody.style.display === 'none');
-    });
-    // Keyboard accessibility for the header
-    aiCardHeader.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.key === ' ') {
-        e.preventDefault();
-        setAIOpen(aiBody.style.display === 'none');
-      }
-    });
-  }
+  wireCollapsibleHeader(aiCardHeader, aiToggle, () => setAIOpen(aiBody.style.display === 'none'));
   if(localStorage.getItem('aiOpen') === null) setAIOpen(false); else setAIOpen(localStorage.getItem('aiOpen')==='1');
 }
 
