@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // RouteEngine selects the pathfinding engine implementation.
@@ -851,8 +852,9 @@ func ParseAddressGuess(raw string) AddressQuery {
 func FindBestAddress(entries []AddressEntry, q AddressQuery) (AddressEntry, bool) {
 	var best AddressEntry
 	bestScore := -1
+	query := normalizeAddressQuery(q)
 	for _, e := range entries {
-		score := matchScore(e, q)
+		score := matchScoreNormalized(e, query)
 		if score > bestScore {
 			bestScore = score
 			best = e
@@ -865,73 +867,108 @@ func FindBestAddress(entries []AddressEntry, q AddressQuery) (AddressEntry, bool
 }
 
 func matchScore(e AddressEntry, q AddressQuery) int {
+	return matchScoreNormalized(e, normalizeAddressQuery(q))
+}
+
+type normalizedAddressQuery struct {
+	street, housenumber, postcode, city, raw string
+}
+
+func normalizeAddressQuery(q AddressQuery) normalizedAddressQuery {
+	return normalizedAddressQuery{
+		street:      normalize(q.Street),
+		housenumber: normalize(q.Housenumber),
+		postcode:    normalize(q.Postcode),
+		city:        normalize(q.City),
+		raw:         normalize(strings.TrimSpace(q.Raw)),
+	}
+}
+
+func matchScoreNormalized(e AddressEntry, q normalizedAddressQuery) int {
+	// Normalize each relevant address field at most once. The former scorer
+	// repeatedly normalized the same query and tag values for every comparison,
+	// which dominated type-ahead latency on regional address datasets.
+	street := normalize(e.Tags["addr:street"])
+	house := normalize(e.Tags["addr:housenumber"])
+	postcode := normalize(e.Tags["addr:postcode"])
+	city := normalize(e.Tags["addr:city"])
+	place := normalize(e.Tags["addr:place"])
+	name := normalize(e.Tags["name"])
+	brand := normalize(e.Tags["brand"])
+	operator := normalize(e.Tags["operator"])
+	shop := normalize(e.Tags["shop"])
+	office := normalize(e.Tags["office"])
+	amenity := normalize(e.Tags["amenity"])
+	tourism := normalize(e.Tags["tourism"])
+	leisure := normalize(e.Tags["leisure"])
+	equal := func(value, query string) bool { return query != "" && value == query }
+	contains := func(value, query string) bool { return value != "" && query != "" && strings.Contains(value, query) }
+
 	score := 0
-	street := e.Tags["addr:street"]
-	raw := strings.TrimSpace(q.Raw)
-	if q.Street != "" && equalNorm(street, q.Street) {
+	if equal(street, q.street) {
 		score += 3
 	}
-	if q.Housenumber != "" && equalNorm(e.Tags["addr:housenumber"], q.Housenumber) {
+	if equal(house, q.housenumber) {
 		score += 4
 	}
-	if q.Postcode != "" && equalNorm(e.Tags["addr:postcode"], q.Postcode) {
+	if equal(postcode, q.postcode) {
 		score += 2
 	}
-	if q.City != "" {
-		if equalNorm(e.Tags["addr:city"], q.City) || equalNorm(e.Tags["addr:place"], q.City) {
+	if q.city != "" {
+		if equal(city, q.city) || equal(place, q.city) {
 			score += 1
 		}
 	}
-	if raw != "" {
+	if q.raw != "" {
 		switch {
-		case equalNorm(e.Tags["name"], raw):
+		case equal(name, q.raw):
 			score += 6
-		case containsNorm(e.Tags["name"], raw):
+		case contains(name, q.raw):
 			score += 3
 		}
 		switch {
-		case equalNorm(e.Tags["brand"], raw), equalNorm(e.Tags["operator"], raw):
+		case equal(brand, q.raw), equal(operator, q.raw):
 			score += 4
-		case containsNorm(e.Tags["brand"], raw), containsNorm(e.Tags["operator"], raw):
+		case contains(brand, q.raw), contains(operator, q.raw):
 			score += 2
 		}
 		switch {
-		case equalNorm(e.Tags["shop"], raw), equalNorm(e.Tags["office"], raw), equalNorm(e.Tags["amenity"], raw), equalNorm(e.Tags["tourism"], raw), equalNorm(e.Tags["leisure"], raw):
+		case equal(shop, q.raw), equal(office, q.raw), equal(amenity, q.raw), equal(tourism, q.raw), equal(leisure, q.raw):
 			score += 3
-		case containsNorm(e.Tags["shop"], raw), containsNorm(e.Tags["office"], raw), containsNorm(e.Tags["amenity"], raw), containsNorm(e.Tags["tourism"], raw), containsNorm(e.Tags["leisure"], raw):
+		case contains(shop, q.raw), contains(office, q.raw), contains(amenity, q.raw), contains(tourism, q.raw), contains(leisure, q.raw):
 			score += 1
 		}
-		if equalNorm(street, raw) {
+		if equal(street, q.raw) {
 			score += 4
-		} else if containsNorm(street, raw) {
+		} else if contains(street, q.raw) {
 			score += 1
 		}
-		if equalNorm(e.Tags["addr:city"], raw) || equalNorm(e.Tags["addr:place"], raw) {
+		if equal(city, q.raw) || equal(place, q.raw) {
 			score += 3
 		}
 	}
 	// If street/address matching didn't produce a high score, also try matching
 	// common POI/company tags so users can search by firm/shop names.
-	if q.Street != "" {
+	if q.street != "" {
 		// exact name match (high relevance)
-		if equalNorm(e.Tags["name"], q.Street) {
+		if equal(name, q.street) {
 			score += 5
-		} else if containsNorm(e.Tags["name"], q.Street) {
+		} else if contains(name, q.street) {
 			score += 2
 		}
 		// other common business tags
-		if equalNorm(e.Tags["brand"], q.Street) || equalNorm(e.Tags["operator"], q.Street) {
+		if equal(brand, q.street) || equal(operator, q.street) {
 			score += 3
-		} else if containsNorm(e.Tags["brand"], q.Street) || containsNorm(e.Tags["operator"], q.Street) {
+		} else if contains(brand, q.street) || contains(operator, q.street) {
 			score += 1
 		}
-		if equalNorm(e.Tags["shop"], q.Street) || equalNorm(e.Tags["office"], q.Street) || equalNorm(e.Tags["amenity"], q.Street) {
+		if equal(shop, q.street) || equal(office, q.street) || equal(amenity, q.street) {
 			score += 2
-		} else if containsNorm(e.Tags["shop"], q.Street) || containsNorm(e.Tags["office"], q.Street) || containsNorm(e.Tags["amenity"], q.Street) {
+		} else if contains(shop, q.street) || contains(office, q.street) || contains(amenity, q.street) {
 			score += 1
 		}
 		// fallback: partial street match as before
-		if score == 0 && containsNorm(street, q.Street) {
+		if score == 0 && contains(street, q.street) {
 			score += 1
 		}
 	}
@@ -951,26 +988,43 @@ func SearchAddresses(entries []AddressEntry, q AddressQuery, limit int) []Addres
 		e AddressEntry
 		s int
 	}
-	sc := make([]scored, 0, len(entries))
+	if limit <= 0 {
+		limit = len(entries)
+	}
+	if limit == 0 {
+		return nil
+	}
+	// Address search runs on every type-ahead request. Keep a bounded ordered
+	// result set instead of allocating and sorting every matching address.
+	// With the UI's small limits this has the same ranking at a fraction of
+	// the work for a large regional address index.
+	sc := make([]scored, 0, limit)
+	query := normalizeAddressQuery(q)
+	better := func(a, b scored) bool {
+		return a.s > b.s || (a.s == b.s && a.e.ID < b.e.ID)
+	}
 	for _, e := range entries {
-		s := matchScore(e, q)
+		s := matchScoreNormalized(e, query)
 		if s <= 0 {
 			continue
 		}
-		sc = append(sc, scored{e: e, s: s})
-	}
-	slices.SortFunc(sc, func(a, b scored) int {
-		if a.s != b.s {
-			return cmp.Compare(b.s, a.s) // descending by score
+		candidate := scored{e: e, s: s}
+		if len(sc) == limit && !better(candidate, sc[len(sc)-1]) {
+			continue
 		}
-		return cmp.Compare(a.e.ID, b.e.ID)
-	})
-	if limit <= 0 || limit > len(sc) {
-		limit = len(sc)
+		insertAt := len(sc)
+		for insertAt > 0 && better(candidate, sc[insertAt-1]) {
+			insertAt--
+		}
+		if len(sc) < limit {
+			sc = append(sc, scored{})
+		}
+		copy(sc[insertAt+1:], sc[insertAt:len(sc)-1])
+		sc[insertAt] = candidate
 	}
-	res := make([]AddressEntry, 0, limit)
-	for i := 0; i < limit; i++ {
-		res = append(res, sc[i].e)
+	res := make([]AddressEntry, len(sc))
+	for i := range sc {
+		res[i] = sc[i].e
 	}
 	return res
 }
@@ -2259,20 +2313,39 @@ func normalize(s string) string {
 	if s == "" {
 		return ""
 	}
-	lower := strings.ToLower(s)
-	replacer := strings.NewReplacer("ß", "ss", "ä", "ae", "ö", "oe", "ü", "ue")
-	cleaned := replacer.Replace(lower)
-
-	out := make([]rune, 0, len(cleaned))
-	for _, r := range cleaned {
+	// Fast path for the overwhelmingly common already-normalized ASCII key.
+	// More importantly, the general path below avoids allocating a lowercase
+	// string, a Replacer result and a rune slice for every indexed field.
+	clean := true
+	for _, r := range s {
+		if r >= 'A' && r <= 'Z' || r == ' ' || r == '-' || r == ',' || r == '.' || r == ';' || r == ':' || r > 127 {
+			clean = false
+			break
+		}
+	}
+	if clean {
+		return s
+	}
+	var out strings.Builder
+	out.Grow(len(s))
+	for _, r := range s {
+		r = unicode.ToLower(r)
 		switch r {
 		case ' ', '-', ',', '.', ';', ':':
 			continue
+		case 'ß':
+			out.WriteString("ss")
+		case 'ä':
+			out.WriteString("ae")
+		case 'ö':
+			out.WriteString("oe")
+		case 'ü':
+			out.WriteString("ue")
 		default:
-			out = append(out, r)
+			out.WriteRune(r)
 		}
 	}
-	return string(out)
+	return out.String()
 }
 
 func allDigits(s string) bool {

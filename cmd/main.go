@@ -2993,24 +2993,23 @@ func (s *server) searchPOIMatches(raw string, limit int) []apiSearchResult {
 		return nil
 	}
 
-	type scored struct {
-		id    int64
-		kind  string
-		tags  osmmini.Tags
-		coord osmmini.Coord
-		score int
-	}
-
 	qNorm := normalizeForCompare(raw)
 	tokens := strings.Fields(qNorm)
-	scoredPOIs := make([]scored, 0, limit*4)
+	scoredPOIs := make([]poiSearchCandidate, 0, limit)
+	consider := func(id int64, kind string, tags osmmini.Tags, coord osmmini.Coord) {
+		score := scorePOIResult(tags, qNorm, tokens)
+		if score <= 0 || (s.window != nil && !s.window.Contains(coord)) {
+			return
+		}
+		candidate := poiSearchCandidate{
+			id: id, kind: kind, tags: tags, coord: coord, score: score,
+			label: formatSearchResultLabel(kind, tags),
+		}
+		scoredPOIs = insertTopPOISearchCandidate(scoredPOIs, candidate, limit)
+	}
 
 	s.poiMu.RLock()
 	for _, poiWay := range s.poiWays {
-		score := scorePOIResult(poiWay.Tags, qNorm, tokens)
-		if score <= 0 {
-			continue
-		}
 		var cx, cy float64
 		var cnt int
 		for _, nid := range poiWay.NodeIDs {
@@ -3024,45 +3023,53 @@ func (s *server) searchPOIMatches(raw string, limit int) []apiSearchResult {
 			continue
 		}
 		coord := osmmini.Coord{Lat: cx / float64(cnt), Lon: cy / float64(cnt)}
-		if s.window != nil && !s.window.Contains(coord) {
-			continue
-		}
-		scoredPOIs = append(scoredPOIs, scored{id: poiWay.ID, kind: "poi", tags: poiWay.Tags, coord: coord, score: score})
+		consider(poiWay.ID, "poi", poiWay.Tags, coord)
 	}
 	for _, poiNode := range s.poiTaggedNodes {
-		score := scorePOIResult(poiNode.Tags, qNorm, tokens)
-		if score <= 0 {
-			continue
-		}
 		coord := osmmini.Coord{Lat: poiNode.Lat, Lon: poiNode.Lon}
-		if s.window != nil && !s.window.Contains(coord) {
-			continue
-		}
-		scoredPOIs = append(scoredPOIs, scored{id: poiNode.ID, kind: "node", tags: poiNode.Tags, coord: coord, score: score})
+		consider(poiNode.ID, "node", poiNode.Tags, coord)
 	}
 	s.poiMu.RUnlock()
-
-	slices.SortFunc(scoredPOIs, func(a, b scored) int {
-		if a.score != b.score {
-			if a.score > b.score {
-				return -1
-			}
-			return 1
-		}
-		al := formatSearchResultLabel(a.kind, a.tags)
-		bl := formatSearchResultLabel(b.kind, b.tags)
-		return strings.Compare(al, bl)
-	})
-
-	if len(scoredPOIs) > limit {
-		scoredPOIs = scoredPOIs[:limit]
-	}
 
 	out := make([]apiSearchResult, 0, len(scoredPOIs))
 	for _, item := range scoredPOIs {
 		out = append(out, buildSearchResult(item.kind, item.id, item.coord, item.tags, raw))
 	}
 	return out
+}
+
+type poiSearchCandidate struct {
+	id    int64
+	kind  string
+	tags  osmmini.Tags
+	coord osmmini.Coord
+	score int
+	label string
+}
+
+func poiSearchCandidateBefore(a, b poiSearchCandidate) bool {
+	if a.score != b.score {
+		return a.score > b.score
+	}
+	return strings.Compare(a.label, b.label) < 0
+}
+
+// insertTopPOISearchCandidate maintains the same score/label ordering as the
+// previous full sort while retaining at most the small result limit.
+func insertTopPOISearchCandidate(items []poiSearchCandidate, candidate poiSearchCandidate, limit int) []poiSearchCandidate {
+	if len(items) == limit && !poiSearchCandidateBefore(candidate, items[len(items)-1]) {
+		return items
+	}
+	insertAt := len(items)
+	for insertAt > 0 && poiSearchCandidateBefore(candidate, items[insertAt-1]) {
+		insertAt--
+	}
+	if len(items) < limit {
+		items = append(items, poiSearchCandidate{})
+	}
+	copy(items[insertAt+1:], items[insertAt:len(items)-1])
+	items[insertAt] = candidate
+	return items
 }
 
 // findNearestPlaceLabel attempts to find a human-friendly label (address or POI)
