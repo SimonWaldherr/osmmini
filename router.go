@@ -68,6 +68,7 @@ const (
 	ProfileTravel       VehicleProfile = "travel"       // long-distance / touring
 	ProfileFirefighting VehicleProfile = "firefighting" // fire engine (ignores some restrictions)
 	ProfileEmergency    VehicleProfile = "emergency"    // ambulance / police
+	ProfileTHW          VehicleProfile = "thw"          // Technisches Hilfswerk (technical relief, ignores some restrictions)
 	ProfileCycling      VehicleProfile = "cycling"      // bicycle
 	ProfileWalking      VehicleProfile = "walking"      // pedestrian
 )
@@ -84,6 +85,13 @@ type VehicleProfileDef struct {
 	SpeedScale float64 `json:"speed_scale,omitempty"`
 	LeftTurn   float64 `json:"left_turn,omitempty"`
 	UTurn      float64 `json:"u_turn,omitempty"`
+
+	// allowedSet is AllowedHwySet as a lookup set, precomputed once in init()
+	// below rather than rebuilt from the slice on every edgeAllowed() call --
+	// that call happens once per edge relaxation during a route search
+	// (potentially millions of times), so reallocating a map there was a
+	// measured hot-path cost. Unexported: never serialized, derived data only.
+	allowedSet map[string]bool
 }
 
 // BuiltinProfiles lists the named travel profiles available out of the box.
@@ -126,6 +134,11 @@ var BuiltinProfiles = []VehicleProfileDef{
 		// emergency vehicles use all roads; no explicit restriction
 	},
 	{
+		ID: ProfileTHW, Label: "THW", Icon: "🛠️",
+		Objective: ObjectiveDuration, MaxSpeedKph: 130,
+		// THW vehicles (technical relief) use all roads; no explicit restriction
+	},
+	{
 		ID: ProfileCycling, Label: "Fahrrad", Icon: "🚲",
 		Objective: ObjectiveDistance, MaxSpeedKph: 25,
 		AllowedHwySet: []string{"primary", "secondary", "tertiary", "unclassified",
@@ -142,6 +155,19 @@ var BuiltinProfiles = []VehicleProfileDef{
 			"secondary_link", "tertiary_link"},
 		SpeedScale: 0.05,
 	},
+}
+
+func init() {
+	for i := range BuiltinProfiles {
+		if len(BuiltinProfiles[i].AllowedHwySet) == 0 {
+			continue
+		}
+		set := make(map[string]bool, len(BuiltinProfiles[i].AllowedHwySet))
+		for _, h := range BuiltinProfiles[i].AllowedHwySet {
+			set[h] = true
+		}
+		BuiltinProfiles[i].allowedSet = set
+	}
 }
 
 // profileDefByID returns the VehicleProfileDef for id, or nil if not found.
@@ -233,14 +259,10 @@ func profileAllowedHwySet(opt RouteOptions) map[string]bool {
 		return nil
 	}
 	def := profileDefByID(opt.Profile)
-	if def == nil || len(def.AllowedHwySet) == 0 {
+	if def == nil {
 		return nil
 	}
-	m := make(map[string]bool, len(def.AllowedHwySet))
-	for _, h := range def.AllowedHwySet {
-		m[h] = true
-	}
-	return m
+	return def.allowedSet
 }
 
 // profileSpeedScale returns the speed scale factor for the given options.
@@ -1481,11 +1503,14 @@ func (r *Router) dijkstraNode(ctx context.Context, from, to int64, opt RouteOpti
 		return it
 	}
 
-	dist := make(map[int64]float64, len(r.g.coords))
-	prev := make(map[int64]int64, len(r.g.coords))
-	for id := range r.g.coords {
-		dist[id] = math.MaxFloat64
-	}
+	// dist/prev are populated lazily (absent == infinity/unvisited) instead
+	// of pre-filling every node in the loaded graph up front -- with a
+	// region-sized graph (millions of nodes) that upfront pass dwarfed the
+	// actual search, since a typical route only ever touches a small
+	// fraction of the graph. Same lazy convention the turn-aware A* already
+	// uses for its gScore map.
+	dist := make(map[int64]float64, 1<<16)
+	prev := make(map[int64]int64, 1<<16)
 	dist[from] = 0
 	push(&dijkstraItem{id: from, dist: 0})
 
@@ -1502,7 +1527,7 @@ func (r *Router) dijkstraNode(ctx context.Context, from, to int64, opt RouteOpti
 			break
 		}
 		u := it.id
-		if it.dist != dist[u] {
+		if d, ok := dist[u]; !ok || it.dist != d {
 			continue // stale
 		}
 		if u == to {
@@ -1514,7 +1539,7 @@ func (r *Router) dijkstraNode(ctx context.Context, from, to int64, opt RouteOpti
 			}
 			v := e.To
 			alt := dist[u] + r.edgeCost(e, opt)
-			if alt < dist[v] {
+			if d, ok := dist[v]; !ok || alt < d {
 				dist[v] = alt
 				prev[v] = u
 				push(&dijkstraItem{id: v, dist: alt})
@@ -1522,7 +1547,7 @@ func (r *Router) dijkstraNode(ctx context.Context, from, to int64, opt RouteOpti
 		}
 	}
 
-	if dist[to] == math.MaxFloat64 {
+	if _, ok := dist[to]; !ok {
 		return nil, 0, ErrRouteNoPath
 	}
 	// reconstruct path
@@ -1658,7 +1683,8 @@ func (r *Router) astar(ctx context.Context, from, to int64, opt RouteOptions, wa
 	}
 
 	start := turnState{prev: 0, cur: from}
-	gScore := map[turnState]float64{start: 0}
+	gScore := make(map[turnState]float64, 1<<16)
+	gScore[start] = 0
 
 	pq := priorityQueue{}
 	heap.Push(&pq, &pqItem{s: start, g: 0, f: r.heuristic(from, to, opt)})
@@ -1791,12 +1817,20 @@ func (r *Router) transitionPenalty(prev, cur, next int64, opt RouteOptions) floa
 		return 0
 	}
 	pen := 0.0
-	if opt.Weights.Crossing > 0 && len(r.g.adj[cur]) > 2 {
-		pen += opt.Weights.Crossing
+	if (opt.Weights.Crossing > 0 || opt.Weights.TrafficLightPenalty > 0) && len(r.g.adj[cur]) > 2 {
+		if opt.Weights.Crossing > 0 {
+			pen += opt.Weights.Crossing
+		}
+		if opt.Weights.TrafficLightPenalty > 0 {
+			pen += opt.Weights.TrafficLightPenalty
+		}
 	}
-	// Traffic light penalty at intersections with more than 2 edges
-	if opt.Weights.TrafficLightPenalty > 0 && len(r.g.adj[cur]) > 2 {
-		pen += opt.Weights.TrafficLightPenalty
+	// turnType() does bearing/trig math per call; skip it entirely when no
+	// turn-direction weight is configured (the default for every profile),
+	// since it would only ever add zero. This is called once per edge
+	// relaxation, so on a long route across a large graph it adds up.
+	if !opt.Weights.NoLeftTurn && opt.Weights.LeftTurn == 0 && opt.Weights.RightTurn == 0 && opt.Weights.UTurn == 0 {
+		return pen
 	}
 	tt := r.turnType(prev, cur, next)
 	switch tt {

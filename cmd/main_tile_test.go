@@ -233,12 +233,8 @@ func TestTinyTilesOfflineStyleIsEmbedded(t *testing.T) {
 
 func TestOfflineMapAssetsAreEmbedded(t *testing.T) {
 	for _, path := range []string{
-		"web/static/leaflet/leaflet.css",
-		"web/static/leaflet/leaflet.js",
-		"web/static/leaflet/leaflet.markercluster.js",
 		"web/static/maplibre/maplibre-gl.js",
 		"web/static/maplibre/maplibre-gl.css",
-		"web/static/maplibre/leaflet-maplibre-gl.js",
 	} {
 		asset, err := embedded.ReadFile(path)
 		if err != nil {

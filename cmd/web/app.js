@@ -22,57 +22,105 @@ function syncInputClearState(inputId) {
   el.closest('.input-clear-wrap')?.classList.toggle('has-value', !!el.value);
 }
 
-const map = L.map('map').setView([48.7, 12.7], 10);
-let currentTileLayer = null;
+const map = new maplibregl.Map({
+  container: 'map',
+  style: { version: 8, sources: {}, layers: [] },
+  center: [12.7, 48.7],
+  zoom: 10,
+  // MapLibre adds a default AttributionControl unless this is disabled; we
+  // add our own explicitly below (so it's easy to find/adjust), which would
+  // otherwise render twice.
+  attributionControl: false,
+});
+map.addControl(new maplibregl.NavigationControl(), 'top-left');
+map.addControl(new maplibregl.AttributionControl());
+// map.once('style.load')/isStyleLoaded() can both be satisfied a tick before
+// addSource/addLayer are actually safe to call on the *very first* style
+// (an inline object, not a fetched URL) — 'load' fires exactly once, only
+// after the map has genuinely finished initializing, and is a more reliable
+// gate for that first call specifically. Later style swaps use
+// waitForStyleReady() below instead, since 'load' never fires again.
+const mapInitialLoad = new Promise((resolve) => map.once('load', resolve));
+let currentTileLayer = null; // { kind: 'raster', sourceId } | { kind: 'vector', styleURL } | null
+let baseLayerKind = null; // 'raster' | 'vector' | null (mirrors currentTileLayer.kind, tracked separately since currentTileLayer is cleared on style resets)
 let tileLayerGeneration = 0;
 let userLocationMarker = null;
 let userLocation = null; // {lat, lon} from browser geolocation (explicit user permission)
-let searchResultMarkers = [];
-let searchResultCluster = null;
-// tinyTiles deliberately has no MapLibre glyph dependency. Text labels for
-// the local map are therefore rendered as small Leaflet DOM overlays from the
-// loaded PBF, which keeps names available without a font CDN.
-const offlineLabelsLayer = L.layerGroup();
+let searchResultMarkers = []; // ad-hoc markers from AI actions (highlight_poi/show_info), not clustered
+let searchClusterRenderedMarkers = []; // currently-rendered cluster-bubble + leaf markers for the last showSearchResultsOnMap() call
+let lastSearchResults = []; // the full result list backing the cluster source, indexed by feature.properties.__idx
+// tinyTiles deliberately has no MapLibre glyph dependency (the offline style
+// has no `glyphs` config, so native symbol/text layers aren't an option).
+// Text labels for the local map are therefore rendered as small MapLibre DOM
+// marker overlays from the loaded PBF, tracked manually since MapLibre has
+// no Leaflet-style layer-group container to add/remove them as a unit.
+let offlineLabelMarkers = [];
 let offlineLabelsEnabled = false;
 let offlineLabelsTimer = null;
 let offlineLabelsRequest = null;
 
-// Dynamic script/css loader helpers (used for MapLibre GL lazy-loading)
-function _loadScript(src) {
-  return new Promise((resolve, reject) => {
-    const existing = document.querySelector(`script[src="${src}"]`);
-    if (existing?.dataset.loadState === 'loaded') { resolve(); return; }
-    if (existing) existing.remove();
-    const s = document.createElement('script');
-    s.src = src;
-    s.onload = () => { s.dataset.loadState = 'loaded'; resolve(); };
-    s.onerror = () => { s.remove(); reject(new Error(`Could not load ${src}`)); };
-    document.head.appendChild(s);
+// Switching the base tile/vector layer goes through map.setStyle(), which
+// replaces the whole style and silently discards any sources/layers added
+// outside of it (route line, markers-as-GeoJSON, territory overlay, ...).
+// Later migration phases register a callback here to re-add their data after
+// every successful base-layer switch instead of each having to special-case
+// setStyle's wipe-and-rebuild behavior themselves.
+const mapLayerRehydrateHooks = [];
+function registerMapLayerRehydrate(fn) { mapLayerRehydrateHooks.push(fn); }
+function rehydrateMapLayers() {
+  mapLayerRehydrateHooks.forEach((fn) => {
+    try { fn(); } catch (e) { console.warn('map layer rehydrate failed', e); }
   });
 }
-function _loadCss(href) {
-  return new Promise((resolve, reject) => {
-    const existing = document.querySelector(`link[href="${href}"]`);
-    if (existing?.dataset.loadState === 'loaded') { resolve(); return; }
-    if (existing) existing.remove();
-    const l = document.createElement('link');
-    l.rel = 'stylesheet'; l.href = href;
-    l.onload = () => { l.dataset.loadState = 'loaded'; resolve(); };
-    l.onerror = () => { l.remove(); reject(new Error(`Could not load ${href}`)); };
-    document.head.appendChild(l);
-  });
+const SEARCH_RESULTS_RENDER_LIMIT = 320;
+const SEARCH_CLUSTER_RENDER_CAP = 2200;
+const SEARCH_COORD_PRECISION = 6;
+
+function normalizeLatLon(lat, lon) {
+  const parsedLat = typeof lat === 'number' ? lat : Number(lat);
+  const parsedLon = typeof lon === 'number' ? lon : Number(lon);
+  if (!Number.isFinite(parsedLat) || !Number.isFinite(parsedLon)) return null;
+  return { lat: parsedLat, lon: parsedLon };
 }
-function _loadMapLibreGL() {
-  if (window.maplibregl && window.L && L.maplibreGL) return Promise.resolve();
-  // Prefer a locally vendored copy (see `make maplibre-assets`, used for the
-  // fully offline tinyTiles profile) and fall back to the CDN otherwise, so
-  // the vector map works out of the box without a vendoring step.
-  const cdnCss = 'https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css';
-  const cdnJs = 'https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js';
-  const cdnAdapter = 'https://unpkg.com/@maplibre/maplibre-gl-leaflet@0.0.20/leaflet-maplibre-gl.js';
-  return _loadCss('/static/maplibre/maplibre-gl.css').catch(() => _loadCss(cdnCss))
-    .then(() => _loadScript('/static/maplibre/maplibre-gl.js').catch(() => _loadScript(cdnJs)))
-    .then(() => _loadScript('/static/maplibre/leaflet-maplibre-gl.js').catch(() => _loadScript(cdnAdapter)));
+
+function removeMarkers(markers) {
+  markers.forEach((marker) => {
+    try { marker.remove(); } catch (_) {}
+  });
+  markers.length = 0;
+}
+
+function removeFromMarkerList(marker, list) {
+  const idx = list.indexOf(marker);
+  if (idx >= 0) list.splice(idx, 1);
+}
+
+function removeSearchResultMarker(marker) {
+  if (!marker) return;
+  try { marker.remove(); } catch (_) {}
+  removeFromMarkerList(marker, searchClusterRenderedMarkers);
+  removeFromMarkerList(marker, searchResultMarkers);
+}
+
+function markerElement(className, text, title) {
+  const el = document.createElement('div');
+  if (className) el.className = className;
+  if (text != null) el.textContent = text;
+  if (title) el.title = title;
+  return el;
+}
+
+function normalizeSearchResult(item) {
+  if (!item) return null;
+  const point = normalizeLatLon(item.lat, item.lon);
+  if (!point) return null;
+  return { ...item, lat: point.lat, lon: point.lon };
+}
+
+function formatLatLon(lat, lon, precision = SEARCH_COORD_PRECISION) {
+  const point = normalizeLatLon(lat, lon);
+  if (!point) return '';
+  return `${point.lat.toFixed(precision)},${point.lon.toFixed(precision)}`;
 }
 
 function supportsWebGL() {
@@ -161,11 +209,24 @@ function queueOfflineLabels() {
   offlineLabelsTimer = window.setTimeout(refreshOfflineLabels, 160);
 }
 
+function clearOfflineLabelMarkers() {
+  removeMarkers(offlineLabelMarkers);
+}
+
+// Builds the DOM element for one offline label (a plain text span in an
+// anchor div — reuses the existing library-agnostic offline-label-* CSS).
+function offlineLabelElement(kind, name) {
+  const el = markerElement(`map-marker offline-label-anchor offline-label-${kind}`);
+  const span = markerElement('offline-map-label', name);
+  el.appendChild(span);
+  return el;
+}
+
 async function refreshOfflineLabels() {
   if (!offlineLabelsEnabled) return;
   const zoom = map.getZoom();
   if (zoom < 7) {
-    offlineLabelsLayer.clearLayers();
+    clearOfflineLabelMarkers();
     return;
   }
   const bounds = map.getBounds();
@@ -183,21 +244,23 @@ async function refreshOfflineLabels() {
     if (!response.ok) throw new Error(`offline labels: ${response.status}`);
     const payload = await response.json();
     if (!offlineLabelsEnabled || offlineLabelsRequest !== controller) return;
-    offlineLabelsLayer.clearLayers();
-    for (const label of Array.isArray(payload.labels) ? payload.labels : []) {
-      const lat = Number(label.lat);
-      const lon = Number(label.lon);
-      const name = String(label.name || '').trim();
-      if (!Number.isFinite(lat) || !Number.isFinite(lon) || !name) continue;
-      const kind = label.kind === 'place' ? 'place' : 'road';
-      const icon = L.divIcon({
-        className: `offline-label-anchor offline-label-${kind}`,
-        html: `<span class="offline-map-label">${escapeHtml(name)}</span>`,
-        iconSize: [0, 0],
-        iconAnchor: [0, 0],
-      });
-      L.marker([lat, lon], { icon, interactive: false, keyboard: false, zIndexOffset: kind === 'place' ? 80 : 40 })
-        .addTo(offlineLabelsLayer);
+    clearOfflineLabelMarkers();
+    const labels = (Array.isArray(payload.labels) ? payload.labels : [])
+      .map((label) => {
+        const coord = normalizeLatLon(label.lat, label.lon);
+        const name = String(label.name || '').trim();
+        if (!coord || !name) return null;
+        return { lat: coord.lat, lon: coord.lon, name, kind: label.kind === 'place' ? 'place' : 'road' };
+      })
+      .filter(Boolean)
+      // MapLibre markers stack in DOM append order (no zIndexOffset like
+      // Leaflet) — add 'road' labels first so 'place' labels render on top.
+      .sort((a, b) => (a.kind === b.kind ? 0 : a.kind === 'place' ? 1 : -1));
+    for (const label of labels) {
+      const marker = new maplibregl.Marker({ element: offlineLabelElement(label.kind, label.name), anchor: 'center' })
+        .setLngLat([label.lon, label.lat])
+        .addTo(map);
+      offlineLabelMarkers.push(marker);
     }
   } catch (error) {
     if (error?.name !== 'AbortError') console.debug('Offline labels are temporarily unavailable', error);
@@ -216,15 +279,414 @@ function setOfflineLabelsVisible(enabled) {
   if (!enabled) {
     map.off('moveend', queueOfflineLabels);
     map.off('zoomend', queueOfflineLabels);
-    offlineLabelsLayer.clearLayers();
-    map.removeLayer(offlineLabelsLayer);
+    clearOfflineLabelMarkers();
     return;
   }
-  offlineLabelsLayer.addTo(map);
   map.on('moveend', queueOfflineLabels);
   map.on('zoomend', queueOfflineLabels);
   queueOfflineLabels();
 }
+
+// ---- Hydrants overlay (BOS/Einsatzmodus) ----
+// Same queue/refresh/clear-on-pan/zoom shape as the offline labels above,
+// but independent of the base map style (works on raster, vector, and
+// offline alike) and gated to a closer zoom since hydrants are dense enough
+// that showing them zoomed out would just be visual noise.
+let hydrantMarkers = [];
+let hydrantsEnabled = false;
+let hydrantsTimer = null;
+let hydrantsRequest = null;
+const HYDRANT_MIN_ZOOM = 14;
+
+function hydrantElement(type) {
+  const label = '🚰';
+  const el = markerElement('map-marker map-hydrant-marker', label);
+  el.title = type === 'underground' ? 'Unterflurhydrant'
+    : type === 'pillar' ? 'Überflurhydrant'
+    : type === 'wall' ? 'Wandhydrant'
+    : 'Hydrant';
+  return el;
+}
+
+function clearHydrantMarkers() {
+  removeMarkers(hydrantMarkers);
+}
+
+function queueHydrants() {
+  if (!hydrantsEnabled) return;
+  window.clearTimeout(hydrantsTimer);
+  hydrantsTimer = window.setTimeout(refreshHydrants, 200);
+}
+
+async function refreshHydrants() {
+  if (!hydrantsEnabled) return;
+  if (map.getZoom() < HYDRANT_MIN_ZOOM) {
+    clearHydrantMarkers();
+    return;
+  }
+  const bounds = map.getBounds();
+  const bbox = [
+    bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth(),
+  ].map((value) => Number(value).toFixed(6)).join(',');
+  hydrantsRequest?.abort();
+  const controller = new AbortController();
+  hydrantsRequest = controller;
+  try {
+    const response = await fetch(`/api/v1/hydrants?bbox=${encodeURIComponent(bbox)}`, {
+      signal: controller.signal,
+      headers: { Accept: 'application/json' },
+    });
+    if (!response.ok) throw new Error(`hydrants: ${response.status}`);
+    const payload = await response.json();
+    if (!hydrantsEnabled || hydrantsRequest !== controller) return;
+    clearHydrantMarkers();
+    for (const h of Array.isArray(payload.hydrants) ? payload.hydrants : []) {
+      const coord = normalizeLatLon(h.lat, h.lon);
+      if (!coord) continue;
+      const marker = new maplibregl.Marker({ element: hydrantElement(h.type), anchor: 'center' })
+        .setLngLat([coord.lon, coord.lat])
+        .addTo(map);
+      if (h.name) marker.setPopup(new maplibregl.Popup().setText(h.name));
+      hydrantMarkers.push(marker);
+    }
+  } catch (error) {
+    if (error?.name !== 'AbortError') console.debug('Hydrants are temporarily unavailable', error);
+  }
+}
+
+function setHydrantsVisible(enabled) {
+  if (hydrantsEnabled === enabled) {
+    if (enabled) queueHydrants();
+    return;
+  }
+  hydrantsEnabled = enabled;
+  window.clearTimeout(hydrantsTimer);
+  hydrantsRequest?.abort();
+  hydrantsRequest = null;
+  if (!enabled) {
+    map.off('moveend', queueHydrants);
+    map.off('zoomend', queueHydrants);
+    clearHydrantMarkers();
+    return;
+  }
+  map.on('moveend', queueHydrants);
+  map.on('zoomend', queueHydrants);
+  queueHydrants();
+  if (map.getZoom() < HYDRANT_MIN_ZOOM) {
+    showToast('Näher heranzoomen, um Hydranten zu sehen', 'info', 2500);
+  }
+}
+
+document.getElementById('showHydrants')?.addEventListener('change', (ev) => {
+  try { ev.target.setAttribute('aria-checked', ev.target.checked ? 'true' : 'false'); } catch (e) {}
+  setHydrantsVisible(!!ev.target.checked);
+});
+
+// ---- Fire stations overlay (Einsatzmodus) ----
+// Stations are auto-detected from the loaded PBF (amenity=fire_station) on
+// the server; vehicles/Funkrufnamen are optional local enrichment added here
+// via manual entry or CSV import (never committed — see cmd/fire_stations.go).
+let fireStationMarkers = [];
+let fireStationsEnabled = false;
+let fireStationsTimer = null;
+let fireStationsRequest = null;
+let fireStationAddMode = false;
+const FIRE_STATION_MIN_ZOOM = 11;
+
+function fireStationElement() {
+  return markerElement('map-marker map-firestation-marker', '🚒');
+}
+
+function clearFireStationMarkers() {
+  removeMarkers(fireStationMarkers);
+}
+
+function queueFireStations() {
+  if (!fireStationsEnabled) return;
+  window.clearTimeout(fireStationsTimer);
+  fireStationsTimer = window.setTimeout(refreshFireStations, 250);
+}
+
+function fireStationPopupHtml(station) {
+  const vehicleRows = (station.vehicles || []).map((v) =>
+    `<div class="territory-popup-row"><span class="territory-popup-key">${escapeHtml(v.callsign || '')}</span><span class="territory-popup-val">${escapeHtml(v.type || '')}</span></div>`
+  ).join('') || '<div style="opacity:0.7;font-size:12px;">Keine Fahrzeuge hinterlegt</div>';
+  return `<div style="min-width:200px;">
+    <strong>${escapeHtml(station.name || 'Feuerwehrhaus (kein Name in OSM)')}</strong>
+    <div style="margin-top:6px;">${vehicleRows}</div>
+    <div style="margin-top:8px;display:flex;gap:4px;flex-wrap:wrap;">
+      <button type="button" class="btn btn-sm btn-outline add-vehicle-btn" style="flex:1;">+ Fahrzeug</button>
+      <button type="button" class="btn btn-sm btn-outline rename-station-btn" style="flex:1;">Umbenennen</button>
+      ${station.source === 'manual' ? '<button type="button" class="btn btn-sm btn-outline delete-station-btn" style="flex:1;">Löschen</button>' : ''}
+    </div>
+  </div>`;
+}
+
+// Same "don't touch the popup's own HTML after it opens" rule as the custom
+// markers above: this only runs once per open (popup.on('open', ...)), so
+// actions here close the popup afterward rather than trying to refresh it.
+function wireFireStationPopup(popup, station) {
+  const el = popup.getElement();
+  if (!el) return;
+  const addBtn = el.querySelector('.add-vehicle-btn');
+  if (addBtn) {
+    addBtn.addEventListener('click', async () => {
+      const callsign = window.prompt('Funkrufname (z.B. FL Musterstadt 40/1):');
+      if (!callsign || !callsign.trim()) return;
+      const type = window.prompt('Fahrzeugtyp (optional, z.B. LF 20):') || '';
+      const vehicles = [...(station.vehicles || []), { callsign: callsign.trim(), type: type.trim() }];
+      try {
+        const res = await fetch(`/api/v1/fire-stations/${encodeURIComponent(station.id)}`, {
+          method: 'PUT',
+          headers: adminAuthHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({ name: station.name, lat: station.lat, lon: station.lon, vehicles }),
+        });
+        if (!res.ok) throw new Error(await res.text());
+        popup.remove();
+        showToast('Fahrzeug hinzugefügt', 'success', 1500);
+        queueFireStations();
+      } catch (e) { showToast('Fehler beim Speichern', 'error', 3000); }
+    });
+  }
+  const renameBtn = el.querySelector('.rename-station-btn');
+  if (renameBtn) {
+    renameBtn.addEventListener('click', async () => {
+      // Some real OSM fire_station ways carry no "name" tag at all, so they
+      // never show up under their real name and can't be matched by CSV
+      // import — this lets an operator attach/correct a display name.
+      const next = window.prompt('Name des Feuerwehrhauses:', station.name || '');
+      if (next === null) return;
+      const name = next.trim();
+      if (!name) return;
+      try {
+        const res = await fetch(`/api/v1/fire-stations/${encodeURIComponent(station.id)}`, {
+          method: 'PUT',
+          headers: adminAuthHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({ name, lat: station.lat, lon: station.lon, vehicles: station.vehicles || [] }),
+        });
+        if (!res.ok) throw new Error(await res.text());
+        popup.remove();
+        showToast('Name gespeichert', 'success', 1500);
+        queueFireStations();
+      } catch (e) { showToast('Fehler beim Speichern', 'error', 3000); }
+    });
+  }
+  const delBtn = el.querySelector('.delete-station-btn');
+  if (delBtn) {
+    delBtn.addEventListener('click', async () => {
+      try {
+        const res = await fetch(`/api/v1/fire-stations/${encodeURIComponent(station.id)}`, { method: 'DELETE', headers: adminAuthHeaders() });
+        if (!res.ok) throw new Error(await res.text());
+        popup.remove();
+        showToast('Feuerwehrhaus gelöscht', 'info', 1500);
+        queueFireStations();
+      } catch (e) { showToast('Fehler beim Löschen', 'error', 3000); }
+    });
+  }
+}
+
+async function refreshFireStations() {
+  if (!fireStationsEnabled) return;
+  if (map.getZoom() < FIRE_STATION_MIN_ZOOM) {
+    clearFireStationMarkers();
+    return;
+  }
+  const bounds = map.getBounds();
+  const bbox = [
+    bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth(),
+  ].map((value) => Number(value).toFixed(6)).join(',');
+  fireStationsRequest?.abort();
+  const controller = new AbortController();
+  fireStationsRequest = controller;
+  try {
+    const response = await fetch(`/api/v1/fire-stations?bbox=${encodeURIComponent(bbox)}`, {
+      signal: controller.signal,
+      headers: { Accept: 'application/json' },
+    });
+    if (!response.ok) throw new Error(`fire-stations: ${response.status}`);
+    const payload = await response.json();
+    if (!fireStationsEnabled || fireStationsRequest !== controller) return;
+    clearFireStationMarkers();
+    for (const st of Array.isArray(payload.stations) ? payload.stations : []) {
+      const coord = normalizeLatLon(st.lat, st.lon);
+      if (!coord) continue;
+      const marker = new maplibregl.Marker({ element: fireStationElement(), anchor: 'bottom' }).setLngLat([coord.lon, coord.lat]).addTo(map);
+      const popup = new maplibregl.Popup().setHTML(fireStationPopupHtml(st));
+      popup.on('open', () => wireFireStationPopup(popup, st));
+      marker.setPopup(popup);
+      fireStationMarkers.push(marker);
+    }
+  } catch (error) {
+    if (error?.name !== 'AbortError') console.debug('Fire stations are temporarily unavailable', error);
+  }
+}
+
+function setFireStationsVisible(enabled) {
+  document.getElementById('fireStationTools')?.classList.toggle('hidden', !enabled);
+  if (fireStationsEnabled === enabled) {
+    if (enabled) queueFireStations();
+    return;
+  }
+  fireStationsEnabled = enabled;
+  window.clearTimeout(fireStationsTimer);
+  fireStationsRequest?.abort();
+  fireStationsRequest = null;
+  if (!enabled) {
+    map.off('moveend', queueFireStations);
+    map.off('zoomend', queueFireStations);
+    clearFireStationMarkers();
+    return;
+  }
+  map.on('moveend', queueFireStations);
+  map.on('zoomend', queueFireStations);
+  queueFireStations();
+  if (map.getZoom() < FIRE_STATION_MIN_ZOOM) {
+    showToast('Näher heranzoomen, um Feuerwehrhäuser zu sehen', 'info', 2500);
+  }
+}
+
+document.getElementById('showFireStations')?.addEventListener('change', (ev) => {
+  try { ev.target.setAttribute('aria-checked', ev.target.checked ? 'true' : 'false'); } catch (e) {}
+  setFireStationsVisible(!!ev.target.checked);
+});
+
+document.getElementById('addFireStationBtn')?.addEventListener('click', () => {
+  fireStationAddMode = !fireStationAddMode;
+  const btn = document.getElementById('addFireStationBtn');
+  if (btn) btn.textContent = fireStationAddMode ? '📍 Jetzt auf die Karte klicken …' : '📍 Feuerwehrhaus manuell hinzufügen (auf Karte klicken)';
+  if (fireStationAddMode) showToast('Klicke auf die Karte, um ein Feuerwehrhaus zu platzieren', 'info', 2500);
+});
+
+map.on('click', async (ev) => {
+  if (!fireStationAddMode) return;
+  fireStationAddMode = false;
+  const btn = document.getElementById('addFireStationBtn');
+  if (btn) btn.textContent = '📍 Feuerwehrhaus manuell hinzufügen (auf Karte klicken)';
+  const name = window.prompt('Name des Feuerwehrhauses:');
+  if (!name || !name.trim()) return;
+  try {
+    const res = await fetch('/api/v1/fire-stations', {
+      method: 'POST',
+      headers: adminAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ name: name.trim(), lat: ev.lngLat.lat, lon: ev.lngLat.lng }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    showToast('Feuerwehrhaus hinzugefügt', 'success', 1500);
+    queueFireStations();
+  } catch (e) { showToast('Fehler beim Speichern', 'error', 3000); }
+});
+
+document.getElementById('importFireStationCsvBtn')?.addEventListener('click', async () => {
+  const csvEl = document.getElementById('fireStationCsv');
+  const csvText = csvEl?.value.trim();
+  if (!csvText) { showToast('Bitte CSV-Text einfügen', 'info', 2000); return; }
+  const btn = document.getElementById('importFireStationCsvBtn');
+  const originalLabel = btn ? btn.textContent : '';
+  // Rows with no direct name match trigger a geocode lookup server-side —
+  // each one is a real address/POI search, so this can take a while for a
+  // roster with several unmatched stations. Make that visible instead of
+  // leaving the button looking stuck.
+  if (btn) { btn.disabled = true; btn.textContent = 'Importiere …'; }
+  try {
+    const res = await fetch('/api/v1/fire-stations/import', {
+      method: 'POST',
+      headers: adminAuthHeaders({ 'Content-Type': 'text/csv' }),
+      body: csvText,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || res.statusText);
+    }
+    const result = await res.json();
+    const matched = result.matched?.length || 0;
+    const guessed = result.guessed?.length || 0;
+    const unmatched = result.unmatched?.length || 0;
+    const parts = [`${matched} zugeordnet`];
+    if (guessed > 0) parts.push(`${guessed} über Ortsnamen gefunden`);
+    if (unmatched > 0) parts.push(`${unmatched} ohne Treffer`);
+    showToast(`Import: ${parts.join(', ')}`, unmatched > 0 ? 'info' : 'success', 5000);
+    renderFireStationImportResult(result);
+    queueFireStations();
+  } catch (e) {
+    showToast('Import fehlgeschlagen: ' + (e.message || ''), 'error', 4000);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
+  }
+});
+
+// "guessed" = auto-matched to a nearby *unnamed* OSM fire_station by
+// geocoding the place name (see backend geocodeStationHint) — worth a
+// glance, but already merged in. Genuinely unmatched rows with a geocode
+// hint get a one-click "Hier anlegen" button instead of requiring the
+// operator to hunt for the right spot on the map by hand.
+function renderFireStationImportResult(result) {
+  const el = document.getElementById('fireStationImportResult');
+  if (!el) return;
+  const guessed = result.guessed || [];
+  const unmatched = result.unmatched || [];
+  if (guessed.length === 0 && unmatched.length === 0) { el.innerHTML = ''; return; }
+  const guessedHtml = guessed.length ? `<div style="font-size:11px;opacity:0.85;margin-bottom:4px;">Über Ortsnamen gefunden (bitte kurz prüfen): ${guessed.map(escapeHtml).join(', ')}</div>` : '';
+  const unmatchedHtml = unmatched.map((u, i) => {
+    const hasHint = typeof u.hintLat === 'number' && typeof u.hintLon === 'number' && (u.hintLat !== 0 || u.hintLon !== 0);
+    return `<div class="territory-popup-row" style="align-items:center;">
+      <span class="territory-popup-key" style="font-size:11px;">${escapeHtml(u.name)}${hasHint ? ` <span style="opacity:0.7;">(nahe ${escapeHtml(u.hintLabel || '')})</span>` : ''}</span>
+      ${hasHint ? `<button type="button" class="btn btn-sm btn-outline place-unmatched-btn" data-idx="${i}" style="font-size:11px;padding:2px 6px;">Hier anlegen</button>` : '<span style="font-size:11px;opacity:0.6;">kein Vorschlag</span>'}
+    </div>`;
+  }).join('');
+  el.innerHTML = `${guessedHtml}${unmatchedHtml ? `<div style="font-size:11px;opacity:0.85;margin:4px 0;">Ohne Treffer:</div>${unmatchedHtml}` : ''}`;
+  el.querySelectorAll('.place-unmatched-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const u = unmatched[Number(btn.dataset.idx)];
+      if (!u) return;
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/v1/fire-stations', {
+          method: 'POST',
+          headers: adminAuthHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({ name: u.name, lat: u.hintLat, lon: u.hintLon }),
+        });
+        if (!res.ok) throw new Error(await res.text());
+        showToast(`${u.name} angelegt`, 'success', 1500);
+        btn.closest('.territory-popup-row')?.remove();
+        queueFireStations();
+      } catch (e) {
+        showToast('Fehler beim Anlegen', 'error', 3000);
+        btn.disabled = false;
+      }
+    });
+  });
+}
+
+document.getElementById('fireStationCsvFile')?.addEventListener('change', async (ev) => {
+  const file = ev.target.files?.[0];
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const csvEl = document.getElementById('fireStationCsv');
+    if (csvEl) csvEl.value = text;
+    showToast(`Datei geladen: ${file.name}`, 'success', 1500);
+  } catch (e) {
+    showToast('Datei konnte nicht gelesen werden', 'error', 3000);
+  } finally {
+    ev.target.value = '';
+  }
+});
+
+document.getElementById('downloadFireStationCsvExampleBtn')?.addEventListener('click', () => {
+  const example = 'Dienststelle,Funkrufname,Fahrzeugtyp\n'
+    + 'FF Musterstadt,FL Musterstadt 40/1,LF 20\n'
+    + 'FF Musterstadt,FL Musterstadt 41/1,LF 10\n'
+    + 'FF Musterhausen,FL Musterhausen 30/1,DLK 23/12\n';
+  const blob = new Blob([example], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'fahrzeuge-beispiel.csv';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+});
 
 // Use a compact, non-secret fingerprint for browser-cache namespacing. Passing
 // a raw upstream URL here could expose custom service tokens in browser/server
@@ -249,75 +711,99 @@ function waitForMapLayerPaint() {
   });
 }
 
-function waitForMapLibreLayer(layer, timeoutMs = 5000) {
+// Resolves once the map's current style (initial load or a prior
+// map.setStyle() call) has fully finished loading, or false on error/timeout.
+function waitForStyleReady(timeoutMs = 5000) {
   return new Promise((resolve) => {
-    const glMap = layer?.getMaplibreMap?.();
-    if (!glMap) { resolve(false); return; }
     let done = false;
     const finish = (ready) => {
       if (done) return;
       done = true;
       window.clearTimeout(timeout);
+      map.off('error', onError);
       resolve(ready);
     };
-    const timeout = window.setTimeout(() => finish(false), timeoutMs);
-    if (glMap.loaded?.()) {
-      finish(true);
-      return;
-    }
-    glMap.once?.('idle', () => finish(true));
-    glMap.once?.('error', () => finish(false));
+    const onError = () => finish(false);
+    const timeout = window.setTimeout(() => finish(true), timeoutMs);
+    map.once('error', onError);
+    if (map.isStyleLoaded()) { finish(true); return; }
+    map.once('style.load', () => finish(true));
   });
 }
 
-function waitForRasterLayer(layer, timeoutMs = 5000) {
+// Resolves once a given source has finished loading its visible tiles (or on
+// timeout/error), the MapLibre-native equivalent of the old tileload/tileerror
+// counting used for Leaflet raster layers.
+function waitForSourceReady(sourceId, timeoutMs = 5000) {
   return new Promise((resolve) => {
     let done = false;
-    let loadedTiles = 0;
-    let failedTiles = 0;
+    let sawError = false;
     const finish = (ready) => {
       if (done) return;
       done = true;
       window.clearTimeout(timeout);
-      layer.off?.('tileload', onTileLoad);
-      layer.off?.('tileerror', onTileError);
-      layer.off?.('load', onLoad);
+      map.off('sourcedata', onSourceData);
+      map.off('error', onError);
       resolve(ready);
     };
-    const onTileLoad = () => { loadedTiles += 1; };
-    const onTileError = () => {
-      failedTiles += 1;
-      // A single retry/error should not discard a source that has working
-      // neighbours. Several failed tiles without one success is conclusive.
-      if (loadedTiles === 0 && failedTiles >= 3) finish(false);
+    const onSourceData = (e) => {
+      if (e.sourceId === sourceId && e.isSourceLoaded && map.isSourceLoaded(sourceId)) finish(true);
     };
-    const onLoad = () => finish(loadedTiles > 0);
-    const timeout = window.setTimeout(() => finish(loadedTiles > 0), timeoutMs);
-    layer.on?.('tileload', onTileLoad);
-    layer.on?.('tileerror', onTileError);
-    layer.on?.('load', onLoad);
+    const onError = (e) => {
+      if (e.sourceId === sourceId) sawError = true;
+    };
+    const timeout = window.setTimeout(() => finish(!sawError), timeoutMs);
+    map.on('sourcedata', onSourceData);
+    map.on('error', onError);
+    if (map.isSourceLoaded(sourceId)) { finish(true); return; }
   });
 }
 
-async function activateRasterLayer(layer, generation) {
-  const previous = currentTileLayer;
-  layer.addTo(map);
-  const ready = await waitForRasterLayer(layer);
+// Raster/WMS base layers are added as plain sources+layers directly onto the
+// current style (cheap, no flicker: the old source stays visible until the
+// new one is confirmed ready). Vector base layers instead replace the whole
+// style via map.setStyle() below, so switching *back* to raster first needs
+// to land on a raster-capable (i.e. non-vector) style.
+async function ensureRasterCapableStyle(generation) {
+  if (baseLayerKind === 'raster') return true;
+  if (baseLayerKind !== null) {
+    // Coming from a vector style: reset to an empty style before adding a
+    // raster source, since the vector style owns its own background/water/
+    // road layers that a raster source can't simply be layered underneath.
+    map.setStyle({ version: 8, sources: {}, layers: [] });
+    currentTileLayer = null;
+  }
+  const ready = await waitForStyleReady();
+  return ready && generation === tileLayerGeneration;
+}
+
+async function activateRasterSource(sourceId, sourceSpec, generation) {
+  map.addSource(sourceId, sourceSpec);
+  map.addLayer({ id: sourceId, type: 'raster', source: sourceId });
+  const ready = await waitForSourceReady(sourceId);
   if (!ready || generation !== tileLayerGeneration) {
-    map.removeLayer(layer);
+    if (map.getLayer(sourceId)) map.removeLayer(sourceId);
+    if (map.getSource(sourceId)) map.removeSource(sourceId);
     return false;
   }
-  if (previous && previous !== layer) map.removeLayer(previous);
-  currentTileLayer = layer;
+  const previous = currentTileLayer;
+  if (previous && previous.kind === 'raster' && previous.sourceId !== sourceId) {
+    if (map.getLayer(previous.sourceId)) map.removeLayer(previous.sourceId);
+    if (map.getSource(previous.sourceId)) map.removeSource(previous.sourceId);
+  }
+  currentTileLayer = { kind: 'raster', sourceId };
+  baseLayerKind = 'raster';
   await waitForMapLayerPaint();
   return true;
 }
 
-// Apply a tile/map layer from settings.  MapLibre/assets are prepared before
-// replacing the old layer, so a failed switch leaves the visible map intact.
-// A temporary source preview goes directly to the selected provider: the
-// server-side cache deliberately only knows the persisted source configuration.
+// Apply a tile/map layer from settings. The new source/style is prepared and
+// confirmed ready before the old one is torn down, so a failed switch leaves
+// the visible map intact. A temporary source preview goes directly to the
+// selected provider: the server-side cache deliberately only knows the
+// persisted source configuration.
 async function applyTileLayer(settings, { directPreview = false } = {}) {
+  await mapInitialLoad;
   const generation = ++tileLayerGeneration;
   const tiles = (settings && settings.tiles) || {};
   const mapType = (tiles.map_type || 'raster').toLowerCase();
@@ -332,23 +818,18 @@ async function applyTileLayer(settings, { directPreview = false } = {}) {
 
   if (mapType === 'vector' && tiles.style_url && supportsWebGL()) {
     try {
-      await _loadMapLibreGL();
-      if (generation !== tileLayerGeneration) return false;
-      const previous = currentTileLayer;
-      const layer = L.maplibreGL({ style: tiles.style_url, attribution }).addTo(map);
-      const ready = await waitForMapLibreLayer(layer);
-      if (!ready || generation !== tileLayerGeneration) {
-        map.removeLayer(layer);
-        return false;
-      }
-      if (previous && previous !== layer) map.removeLayer(previous);
-      currentTileLayer = layer;
+      map.setStyle(tiles.style_url);
+      const ready = await waitForStyleReady();
+      if (!ready || generation !== tileLayerGeneration) return false;
+      currentTileLayer = { kind: 'vector', styleURL: tiles.style_url };
+      baseLayerKind = 'vector';
       await waitForMapLayerPaint();
       updateMapModeUI(tiles);
       setOfflineLabelsVisible(isTinyTilesSettings(tiles));
+      rehydrateMapLayers();
       return true;
     } catch (e) {
-      console.warn('MapLibre GL load failed, falling back to raster tiles', e);
+      console.warn('MapLibre GL style load failed, falling back to raster tiles', e);
     }
   } else if (mapType === 'vector' && tiles.style_url) {
     console.warn('WebGL is unavailable, falling back to raster tiles');
@@ -356,22 +837,21 @@ async function applyTileLayer(settings, { directPreview = false } = {}) {
 
   if (generation !== tileLayerGeneration) return false;
   if (mapType === 'wms' && tiles.upstream && directPreview) {
-    const layer = L.tileLayer.wms(tiles.upstream, {
-      layers: tiles.wms_layers || '',
-      format: 'image/png',
-      transparent: false,
-      attribution,
-      maxZoom,
-      updateWhenIdle: true,
-      updateWhenZooming: false,
-      keepBuffer: 2,
-    }).on('tileerror', () => {
-      console.warn('Map WMS tile could not be loaded');
-    });
-    const applied = await activateRasterLayer(layer, generation);
+    const ok = await ensureRasterCapableStyle(generation);
+    if (!ok) return false;
+    // MapLibre raster sources understand the {bbox-epsg-3857} WMS template
+    // token natively; non-preview WMS instead goes through the server-side
+    // /tiles proxy below, which already normalizes WMS to plain XYZ tiles.
+    const sep = tiles.upstream.includes('?') ? '&' : '?';
+    const wmsURL = `${tiles.upstream}${sep}SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&FORMAT=image%2Fpng&TRANSPARENT=false&LAYERS=${encodeURIComponent(tiles.wms_layers || '')}&SRS=EPSG%3A3857&WIDTH=256&HEIGHT=256&BBOX={bbox-epsg-3857}`;
+    const sourceId = `base-raster-${generation}`;
+    const applied = await activateRasterSource(sourceId, {
+      type: 'raster', tiles: [wmsURL], tileSize: 256, attribution, maxzoom: maxZoom,
+    }, generation);
     if (applied) {
       updateMapModeUI(tiles);
       setOfflineLabelsVisible(isTinyTilesSettings(tiles));
+      rehydrateMapLayers();
     }
     return applied;
   }
@@ -389,19 +869,20 @@ async function applyTileLayer(settings, { directPreview = false } = {}) {
   // Proxied raster, WMTS, and WMS sources use the same-origin tile endpoint.
   // For WMS the server converts the slippy coordinate to GetMap parameters;
   // direct raster sources are loaded from their own URL instead.
-  const layer = L.tileLayer(rasterFallback.url, {
-    maxZoom,
+  const ok = await ensureRasterCapableStyle(generation);
+  if (!ok) return false;
+  const sourceId = `base-raster-${generation}`;
+  const applied = await activateRasterSource(sourceId, {
+    type: 'raster',
+    tiles: [rasterFallback.url],
+    tileSize: 256,
     attribution: rasterFallback.attribution,
-    updateWhenIdle: true,
-    updateWhenZooming: false,
-    keepBuffer: 2,
-  }).on('tileerror', () => {
-    console.warn('Map tile could not be loaded');
-  });
-  const applied = await activateRasterLayer(layer, generation);
+    maxzoom: maxZoom,
+  }, generation);
   if (applied) {
     updateMapModeUI(tiles);
     setOfflineLabelsVisible(isTinyTilesSettings(tiles));
+    rehydrateMapLayers();
   }
   return applied;
 }
@@ -480,8 +961,12 @@ document.getElementById('useLocationBtn')?.addEventListener('click', async () =>
     }
     // set user marker
     if (userLocationMarker) userLocationMarker.remove();
-    userLocationMarker = L.circleMarker([lat, lon], { radius:6, color:'#2ee6a7', fillColor:'#2ee6a7', fillOpacity:0.9 }).addTo(map).bindPopup('Ihr Standort').openPopup();
-    map.setView([lat, lon], 14);
+    userLocationMarker = new maplibregl.Marker({ element: dotElement('#2ee6a7'), anchor: 'center' })
+      .setLngLat([lon, lat])
+      .setPopup(new maplibregl.Popup().setText('Ihr Standort'))
+      .addTo(map);
+    userLocationMarker.togglePopup();
+    map.jumpTo({ center: [lon, lat], zoom: 14 });
     showToast('Standort gesetzt', 'success', 1500);
   }, (err) => {
     showToast('Standort konnte nicht ermittelt werden: ' + (err.message||''), 'error', 4000);
@@ -511,6 +996,55 @@ function debounce(func, wait) {
 
 // debounced wrapper used by inputs (compute is hoisted)
 const debouncedCompute = debounce(function(){ try{ compute(); } catch(e){} }, 300);
+
+// The route line lives on a single persistent GeoJSON source+layer rather
+// than being removed/recreated per Leaflet's L.polyline. `polyline` stays an
+// object shaped like { coords, remove(), getBounds(), getLatLngs() } so the
+// many call sites below (zoom-to-route, clear, export) don't need to change.
+const ROUTE_SOURCE_ID = 'route';
+function emptyFeatureCollection() { return { type: 'FeatureCollection', features: [] }; }
+function ensureRouteLayer() {
+  if (map.getSource(ROUTE_SOURCE_ID)) return;
+  map.addSource(ROUTE_SOURCE_ID, { type: 'geojson', data: emptyFeatureCollection() });
+  map.addLayer({
+    id: ROUTE_SOURCE_ID,
+    type: 'line',
+    source: ROUTE_SOURCE_ID,
+    layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: { 'line-color': '#3a8eef', 'line-width': 5, 'line-opacity': 0.8 },
+  });
+}
+function makeRouteLine(lngLatCoords) {
+  ensureRouteLayer();
+  map.getSource(ROUTE_SOURCE_ID).setData({
+    type: 'FeatureCollection',
+    features: [{ type: 'Feature', geometry: { type: 'LineString', coordinates: lngLatCoords }, properties: {} }],
+  });
+  return {
+    coords: lngLatCoords,
+    remove() {
+      if (map.getSource(ROUTE_SOURCE_ID)) map.getSource(ROUTE_SOURCE_ID).setData(emptyFeatureCollection());
+    },
+    getBounds() {
+      return lngLatCoords.reduce((acc, c) => acc.extend(c), new maplibregl.LngLatBounds(lngLatCoords[0], lngLatCoords[0]));
+    },
+    getLatLngs() {
+      return lngLatCoords.map(c => ({ lng: c[0], lat: c[1] }));
+    },
+  };
+}
+// A base-layer switch (map.setStyle()) wipes sources added outside the
+// style, including the route source — re-add it, and redraw the last route
+// if one was on screen, after every switch.
+registerMapLayerRehydrate(() => {
+  ensureRouteLayer();
+  if (polyline) {
+    map.getSource(ROUTE_SOURCE_ID).setData({
+      type: 'FeatureCollection',
+      features: [{ type: 'Feature', geometry: { type: 'LineString', coordinates: polyline.coords }, properties: {} }],
+    });
+  }
+});
 
 let polyline = null;
 let startMarker = null, endMarker = null;
@@ -636,19 +1170,187 @@ function toggleTheme() {
 document.getElementById('themeToggle').addEventListener('click', toggleTheme);
 initTheme();
 
-function pinIcon(label){
-  return L.divIcon({className:'', html:`<div style="font-size:14px; text-shadow: 0 1px 2px black;">📍 ${label}</div>`, iconSize:[30,18]});
+// Builds the "📍 <label>" DOM element used for draggable waypoint stop
+// markers (replaces the old pinIcon() L.divIcon helper — a MapLibre Marker
+// takes a DOM element directly instead of an icon spec).
+function pinElement(label, icon){
+  return markerElement('map-marker map-pin-marker', `${icon || '📍'} ${label}`);
+}
+
+// ---- Custom markers (draggable stop pins): delete, move, rename, icon,
+// persisted locally so they survive a page reload. ----
+const CUSTOM_MARKER_ICONS = ['📍','🏠','🏢','⛽','🅿️','🚧','⭐','📦'];
+const CUSTOM_MARKERS_STORAGE_KEY = 'osmmini-custom-markers';
+
+function saveCustomMarkers() {
+  try {
+    const data = stops.map(s => ({ id: s.id, lat: s.lat, lon: s.lon, label: s.label, icon: s.icon }));
+    localStorage.setItem(CUSTOM_MARKERS_STORAGE_KEY, JSON.stringify(data));
+  } catch (e) { /* storage unavailable/full — non-fatal, markers just won't persist */ }
+}
+
+function stopPopupHtml(s) {
+  const iconButtons = CUSTOM_MARKER_ICONS.map((ic) =>
+    `<button type="button" class="btn btn-sm btn-outline icon-pick-btn" data-icon="${ic}" style="padding:4px 8px;font-size:14px;">${ic}</button>`
+  ).join('');
+  return `<div style="min-width:170px;">
+    <strong>${escapeHtml(s.icon || '📍')} ${escapeHtml(s.label)}</strong>
+    <div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px;">${iconButtons}</div>
+    <div style="margin-top:6px;display:flex;gap:4px;">
+      <button type="button" class="btn btn-sm btn-outline rename-stop-btn" style="flex:1;">Umbenennen</button>
+      <button type="button" class="btn btn-sm btn-outline delete-stop-btn" style="flex:1;">Löschen</button>
+    </div>
+  </div>`;
+}
+
+function deleteStopMarker(id) {
+  const i = stops.findIndex(x => x.id === id);
+  if (i < 0) return;
+  const s = stops[i];
+  s.marker.remove();
+  stops.splice(i, 1);
+  renderStopList();
+  saveCustomMarkers();
+  showToast(`Marker ${s.label} gelöscht`, 'info', 1500);
+}
+
+function deleteAllStopMarkers() {
+  if (stops.length === 0) return;
+  const count = stops.length;
+  if (!window.confirm(`Wirklich alle ${count} Marker löschen?`)) return;
+
+  while (stops.length) {
+    const s = stops.pop();
+    s.marker.remove();
+  }
+  stopSeq = 1;
+  saveCustomMarkers();
+  renderStopList();
+  showToast(`${count} Marker gelöscht`, 'info', 1800);
+}
+
+function setStopAsDestination(s) {
+  const value = formatLatLon(s?.lat, s?.lon);
+  const toEl = document.getElementById('to');
+  if (!value || !toEl) return;
+
+  toEl.value = value;
+  syncInputClearState('to');
+  showToast(`Ziel gesetzt: ${s.label || s.id}`, 'success', 1800);
+  compute();
+}
+
+// Wires the popup's buttons each time it opens (MapLibre Popups only emit
+// 'open' once per open-transition, so this must run there — not after later
+// content changes, which is why icon/rename actions below avoid touching the
+// popup's own HTML and instead just update the marker + close it).
+function wireStopPopup(popup, s) {
+  const el = popup.getElement();
+  if (!el) return;
+  el.querySelectorAll('.icon-pick-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      s.icon = btn.dataset.icon;
+      const markerEl = s.marker.getElement();
+      if (markerEl) markerEl.textContent = `${s.icon} ${s.label}`;
+      saveCustomMarkers();
+      popup.remove();
+    });
+  });
+  const renameBtn = el.querySelector('.rename-stop-btn');
+  if (renameBtn) {
+    renameBtn.addEventListener('click', () => {
+      const next = window.prompt('Neuer Name für diesen Marker:', s.label);
+      if (next === null) return;
+      const trimmed = next.trim();
+      if (!trimmed) return;
+      s.label = trimmed;
+      const markerEl = s.marker.getElement();
+      if (markerEl) markerEl.textContent = `${s.icon || '📍'} ${s.label}`;
+      renderStopList();
+      saveCustomMarkers();
+      popup.remove();
+    });
+  }
+  const deleteBtn = el.querySelector('.delete-stop-btn');
+  if (deleteBtn) {
+    deleteBtn.addEventListener('click', () => {
+      popup.remove();
+      deleteStopMarker(s.id);
+    });
+  }
+}
+
+function createStopMarker(id, lat, lon, label, icon) {
+  label = label || id;
+  icon = icon || '📍';
+  const marker = new maplibregl.Marker({ element: pinElement(label, icon), draggable: true })
+    .setLngLat([lon, lat])
+    .addTo(map);
+  const s = { id, marker, lat, lon, label, icon };
+  const popup = new maplibregl.Popup().setHTML(stopPopupHtml(s));
+  popup.on('open', () => wireStopPopup(popup, s));
+  marker.setPopup(popup);
+  marker.on('dragend', () => {
+    const ll = marker.getLngLat();
+    s.lat = ll.lat;
+    s.lon = ll.lng;
+    renderStopList();
+    saveCustomMarkers();
+    showToast(`Marker ${s.label} verschoben`, 'info', 1500);
+  });
+  // MapLibre markers have no built-in contextmenu event (unlike Leaflet's
+  // marker.on('contextmenu', ...)); listen on the underlying DOM element.
+  // Kept as a power-user shortcut alongside the popup's "Löschen" button.
+  marker.getElement().addEventListener('contextmenu', (domEv) => {
+    domEv.preventDefault();
+    deleteStopMarker(id);
+  });
+  return s;
+}
+
+function restoreCustomMarkers() {
+  let saved;
+  try {
+    saved = JSON.parse(localStorage.getItem(CUSTOM_MARKERS_STORAGE_KEY) || '[]');
+  } catch (e) {
+    saved = [];
+  }
+  if (!Array.isArray(saved) || saved.length === 0) return;
+  let maxSeq = 0;
+  saved.forEach((entry) => {
+    const coord = normalizeLatLon(entry.lat, entry.lon);
+    if (!entry || !entry.id || !coord) return;
+    stops.push(createStopMarker(entry.id, coord.lat, coord.lon, entry.label, entry.icon));
+    const m = /^M(\d+)$/.exec(entry.id);
+    if (m) maxSeq = Math.max(maxSeq, parseInt(m[1], 10));
+  });
+  stopSeq = Math.max(stopSeq, maxSeq + 1);
+  renderStopList();
+}
+
+// Small colored dot DOM element — the closest MapLibre-native equivalent to
+// Leaflet's L.circleMarker (a vector-drawn map-plane circle), used for the
+// user-location dot and the route start/end markers.
+function dotElement(color) {
+  const el = markerElement('map-marker map-dot-marker');
+  el.style.setProperty('--dot-color', color || '#3a8eef');
+  return el;
+}
+
+function searchResultMarkerElement() {
+  return markerElement('map-marker map-search-result-marker', '📍');
 }
 
 function syncStopIcons(orderIds) {
   const idToRank = new Map();
   orderIds.forEach((id, i) => idToRank.set(id, i+1));
-  
+
   // Batch icon updates using requestAnimationFrame for better performance
   requestAnimationFrame(() => {
     stops.forEach((s, idx) => {
       const n = idToRank.get(s.id) || (idx+1);
-      s.marker.setIcon(pinIcon(n));
+      const el = s.marker.getElement();
+      if (el) el.textContent = `${n}. ${s.icon || '📍'} ${s.label || s.id}`;
     });
   });
 }
@@ -656,25 +1358,73 @@ function syncStopIcons(orderIds) {
 function renderStopList(orderIds) {
   const el = document.getElementById('stopList');
   const order = (orderIds && orderIds.length) ? orderIds : stops.map(s => s.id);
-  
+
   // Use requestAnimationFrame for smooth rendering
   requestAnimationFrame(() => {
     el.innerHTML = '';
-    
+
     if (order.length === 0) {
-      el.innerHTML = '<div style="padding:10px; color:#8aaedc; font-style:italic; font-size:12px;">Keine Stops auf der Karte</div>';
+      el.innerHTML = '<div style="padding:10px; color:#8aaedc; font-style:italic; font-size:12px;">Keine Marker auf der Karte</div>';
       return;
     }
+
+    const toolbar = document.createElement('div');
+    toolbar.className = 'stop-list-toolbar';
+    const title = document.createElement('span');
+    title.className = 'stop-list-title';
+    title.textContent = `Marker (${stops.length})`;
+    toolbar.appendChild(title);
+
+    const clearAllBtn = document.createElement('button');
+    clearAllBtn.type = 'button';
+    clearAllBtn.className = 'stop-list-clear-all';
+    clearAllBtn.title = 'Alle Marker löschen';
+    clearAllBtn.textContent = 'Alle löschen';
+    clearAllBtn.addEventListener('click', deleteAllStopMarkers);
+    toolbar.appendChild(clearAllBtn);
+    el.appendChild(toolbar);
 
     order.forEach(id => {
     const s = stops.find(x => x.id === id);
     if (!s) return;
     const item = document.createElement('div');
     item.className = 'stop-item';
-    item.innerHTML = `<span>📍 ${id}</span> <span style="color:#8aaedc; font-size:11px; margin-left:auto;">${s.lat.toFixed(4)}, ${s.lon.toFixed(4)}</span>`;
+    const main = document.createElement('div');
+    main.className = 'stop-item-main';
+    const name = document.createElement('span');
+    name.className = 'stop-item-name';
+    name.textContent = `${s.icon || '📍'} ${s.label || id}`;
+    const coords = document.createElement('span');
+    coords.className = 'stop-item-coords';
+    coords.textContent = `${s.lat.toFixed(4)}, ${s.lon.toFixed(4)}`;
+    main.append(name, coords);
+
+    const actions = document.createElement('div');
+    actions.className = 'stop-item-actions';
+    const destinationBtn = document.createElement('button');
+    destinationBtn.type = 'button';
+    destinationBtn.className = 'stop-list-action stop-list-destination';
+    destinationBtn.title = 'Marker als Ziel übernehmen';
+    destinationBtn.textContent = 'Als Ziel';
+    destinationBtn.addEventListener('click', (event) => {
+      event.stopPropagation();
+      setStopAsDestination(s);
+    });
+    const deleteBtn = document.createElement('button');
+    deleteBtn.type = 'button';
+    deleteBtn.className = 'stop-list-action stop-list-delete';
+    deleteBtn.title = 'Marker löschen';
+    deleteBtn.setAttribute('aria-label', `${s.label || id} löschen`);
+    deleteBtn.textContent = '×';
+    deleteBtn.addEventListener('click', (event) => {
+      event.stopPropagation();
+      deleteStopMarker(s.id);
+    });
+    actions.append(destinationBtn, deleteBtn);
+    item.append(main, actions);
     item.title = 'Klicken zum Zentrieren';
     item.style.cursor = 'pointer';
-    item.onclick = () => map.panTo([s.lat, s.lon]);
+    item.onclick = () => map.panTo([s.lon, s.lat]);
     el.appendChild(item);
     });
   });
@@ -769,9 +1519,15 @@ async function apiRoute(from,to,options){
 async function apiTripSolve(from,to,options){
   const optimize = document.getElementById('optimize').checked;
   const allStops = [];
-  waypoints.forEach(wp=>{ const v=wp.input.value.trim(); if(v) allStops.push({id:wp.id, location:{query:v}}); });
+  waypoints.forEach(wp=>{
+    const v=wp.input.value.trim();
+    if(!v) return;
+    const demand = parseFloat(wp.demandInput?.value) || 0;
+    allStops.push({id:wp.id, location:{query:v}, demand: demand || undefined});
+  });
   stops.forEach(s=> allStops.push({id:s.id, location:{lat:s.lat, lon:s.lon}}));
-  const plan = { start:{query:from}, end:{query:to}, stops: allStops, dependencies:[], optimize };
+  const vehicleCapacity = parseFloat(document.getElementById('vehicleCapacity')?.value) || 0;
+  const plan = { start:{query:from}, end:{query:to}, stops: allStops, dependencies:[], optimize, vehicle_capacity: vehicleCapacity || undefined };
   const res = await fetch('/api/v1/trip/solve', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({plan, options})});
   if(!res.ok){
     const err = await res.json().catch(()=>({}));
@@ -816,14 +1572,15 @@ function renderDisambiguationButtons(details) {
     btn.className = 'btn';
     btn.style.padding = '6px 10px';
     btn.style.fontSize = '12px';
-    btn.textContent = getResultInputValue(sug) || `${(sug.lat || 0).toFixed(5)}, ${(sug.lon || 0).toFixed(5)}`;
+    const sugCoord = normalizeSearchResult(sug);
+    btn.textContent = getResultInputValue(sug) || (sugCoord ? `${sugCoord.lat.toFixed(5)}, ${sugCoord.lon.toFixed(5)}` : '');
     btn.title = [sug.kind || 'Treffer', getResultSecondary(sug)].filter(Boolean).join(' • ');
     btn.addEventListener('click', async () => {
-      const val = getResultInputValue(sug) || `${sug.lat},${sug.lon}`;
+          const val = getResultInputValue(sug) || (sugCoord ? `${sugCoord.lat},${sugCoord.lon}` : '');
       const el = document.getElementById(target);
       if (el) el.value = val;
       try {
-        if (typeof sug.lat === 'number' && typeof sug.lon === 'number') map.panTo([sug.lat, sug.lon]);
+        if (sugCoord) map.panTo([sugCoord.lon, sugCoord.lat]);
       } catch (e) {}
       showToast(`${target === 'from' ? 'Start' : 'Ziel'} gesetzt: ${val}`, 'success', 1800);
       try { await compute(); } catch (e) { console.warn('compute after disambiguation failed', e); }
@@ -849,10 +1606,10 @@ function renderPath(path, meta){
     maxLat: Math.max(bb.maxLat, c[0]),
     maxLon: Math.max(bb.maxLon, c[1]),
   }), {minLat: coords[0][0], minLon: coords[0][1], maxLat: coords[0][0], maxLon: coords[0][1]});
-  polyline = L.polyline(coords,{color:'#3a8eef', weight:5, opacity: 0.8}).addTo(map);
-  startMarker = L.circleMarker(coords[0],{radius:7, color:'#6ef2a0', fillColor:'#6ef2a0', fillOpacity:0.8}).addTo(map);
-  endMarker = L.circleMarker(coords[coords.length-1],{radius:7, color:'#ffcc66', fillColor:'#ffcc66', fillOpacity:0.8}).addTo(map);
-  map.fitBounds(polyline.getBounds(),{padding:[40,40]});
+  polyline = makeRouteLine(coords.map(c => [c[1], c[0]]));
+  startMarker = new maplibregl.Marker({ element: dotElement('#6ef2a0'), anchor: 'center' }).setLngLat([coords[0][1], coords[0][0]]).addTo(map);
+  endMarker = new maplibregl.Marker({ element: dotElement('#ffcc66'), anchor: 'center' }).setLngLat([coords[coords.length-1][1], coords[coords.length-1][0]]).addTo(map);
+  map.fitBounds(polyline.getBounds(),{padding:40});
   
   const distKm = (meta.distance_m / 1000).toFixed(2);
   const durMin = Math.round(meta.duration_s / 60);
@@ -871,6 +1628,18 @@ function renderPath(path, meta){
     const eta = new Date(Date.now() + meta.duration_s * 1000);
     document.getElementById('detailETA').textContent = eta.toLocaleTimeString('de-DE', {hour: '2-digit', minute: '2-digit'});
     document.getElementById('detailEngine').textContent = meta.engine || 'astar';
+    const computeEl = document.getElementById('detailComputeMs');
+    const computePill = document.getElementById('detailComputePill');
+    if (computeEl && computePill) {
+      if (meta.cached) {
+        computeEl.textContent = 'aus Cache';
+      } else if (typeof meta.compute_ms === 'number') {
+        computeEl.textContent = meta.compute_ms < 1 ? '<1 ms' : `${Math.round(meta.compute_ms)} ms`;
+      } else {
+        computeEl.textContent = '—';
+      }
+      computePill.style.display = (meta.cached || typeof meta.compute_ms === 'number') ? '' : 'none';
+    }
   }
   
   // Show route actions
@@ -910,6 +1679,20 @@ async function compute() {
       }
       const data = await apiRoute(from, to, options);
       renderPath(data.path, data);
+      // A bare "lat,lon" query (used instead of a free-text label to avoid
+      // ambiguous server-side resolution, see resultCoordValue()) is
+      // upgraded to the resolved place name once the route confirms it.
+      const coordPattern = /^-?\d+\.?\d*,-?\d+\.?\d*$/;
+      const fromEl = document.getElementById('from');
+      const toEl = document.getElementById('to');
+      if (fromEl && coordPattern.test(from) && data.from?.label) {
+        fromEl.value = data.from.label;
+        syncInputClearState('from');
+      }
+      if (toEl && coordPattern.test(to) && data.to?.label) {
+        toEl.value = data.to.label;
+        syncInputClearState('to');
+      }
       // ensure maneuvers shown from response (top-level steps)
       (function(){
         let steps = data.steps || null;
@@ -941,6 +1724,11 @@ async function compute() {
       renderStopList(data.order || []);
       setMapsLinks(data.google_maps_url, data.apple_maps_url);
       showToast(`Trip berechnet mit ${stops.length + waypoints.filter(w=>w.input.value.trim()).length} Stops`, 'success', 2000);
+      if (data.capacity_warning) {
+        showToast('⚠️ ' + data.capacity_warning, 'error', 6000);
+      } else if (data.vehicle_capacity) {
+        showToast(`Ladung: ${data.total_demand} / ${data.vehicle_capacity}`, 'info', 3000);
+      }
     }
   } catch (e) {
     document.getElementById('status').textContent = '❌ Fehler';
@@ -1019,7 +1807,7 @@ function renderManeuvers(steps) {
     row.append(left, right);
     row.addEventListener('click', () => {
       const lat = s.lat || s.Lat; const lon = s.lon || s.Lon;
-      if (lat && lon) map.panTo([lat, lon]);
+      if (lat && lon) map.panTo([lon, lat]);
     });
     list.appendChild(row);
   });
@@ -1065,7 +1853,7 @@ document.getElementById('clear').addEventListener('click', () => {
 // Route control buttons
 document.getElementById('zoomToRoute')?.addEventListener('click', () => {
   if (polyline) {
-    map.fitBounds(polyline.getBounds(), {padding: [40, 40]});
+    map.fitBounds(polyline.getBounds(), {padding: 40});
     showToast('Route zentriert', 'info', 1500);
   }
 });
@@ -1124,6 +1912,55 @@ async function postAgentExecute(actions, session, confirm=false, dry_run=false) 
   return res.json();
 }
 
+async function fetchPoiPayload(id) {
+  const qlat = userLocation ? userLocation.lat : null;
+  const qlon = userLocation ? userLocation.lon : null;
+  const qs = (qlat !== null && qlon !== null) ? `?lat=${qlat}&lon=${qlon}` : '';
+  const res = await fetch(`/api/v1/poi/${id}${qs}`);
+  if (!res.ok) return null;
+  return res.json();
+}
+
+function describeSearchResultDistance(item) {
+  return item && item.distance_m ? `${Math.round(item.distance_m)} m` : '';
+}
+
+function summarizePoiAction(type, item) {
+  const label = item.label || (item.id == null ? 'POI' : `#${item.id}`);
+  const distance = describeSearchResultDistance(item);
+  return `${type}: ${label} ${distance}`.trim();
+}
+
+async function resolveRouteEndpointValue(value) {
+  if (!value) return '';
+  if (value.query) return String(value.query);
+
+  const coord = formatLatLon(value.lat, value.lon);
+  if (coord) return coord;
+
+  const id = value.id;
+  if (id == null) return '';
+  try {
+    const data = await fetchPoiPayload(id);
+    if (!data) return '';
+    if (data.label) return data.label;
+    return formatLatLon(data.lat, data.lon);
+  } catch (_) {
+    return '';
+  }
+}
+
+async function addMarkerForPoiAction(id) {
+  if (id == null) return null;
+  const data = await fetchPoiPayload(id);
+  if (!data) return null;
+  const markerData = normalizeSearchResult(data);
+  if (!markerData) return null;
+  const marker = createSearchResultMarker(markerData);
+  if (!marker) return null;
+  return { marker, markerData };
+}
+
 // Execute a list of actions returned by the agent. If actions include
 // compute_route we ask for confirmation and call server execute to compute.
 async function executeAgentActions(actions, session_id) {
@@ -1136,35 +1973,24 @@ async function executeAgentActions(actions, session_id) {
     if (t === 'highlight_poi') {
       try {
         const id = params.id;
-        const qlat = userLocation ? userLocation.lat : null;
-        const qlon = userLocation ? userLocation.lon : null;
-        const qs = (qlat!==null && qlon!==null) ? `?lat=${qlat}&lon=${qlon}` : '';
-        const res = await fetch(`/api/v1/poi/${id}${qs}`);
-        if (res.ok) {
-          const data = await res.json();
-          const m = L.marker([data.lat, data.lon]).addTo(map);
-          m.bindPopup(`<strong>${escapeHtml(data.label||'')}</strong>`).openPopup();
-          searchResultMarkers.push(m);
-          const distText = data.distance_m ? `${Math.round(data.distance_m)} m` : '';
-          summaries.push(`Hervorgehoben: ${data.label || ('#' + id)} ${distText}`);
+        const result = await addMarkerForPoiAction(id);
+        if (result?.markerData && result.marker) {
+          result.marker.addTo(map);
+          result.marker.togglePopup();
+          searchResultMarkers.push(result.marker);
+          summaries.push(summarizePoiAction('Hervorgehoben', result.markerData));
         }
       } catch (e) { console.warn('highlight failed', e); summaries.push('Hervorhebung fehlgeschlagen'); }
     } else if (t === 'show_info') {
       try {
         const id = params.id;
-        const qlat = userLocation ? userLocation.lat : null;
-        const qlon = userLocation ? userLocation.lon : null;
-        const qs = (qlat!==null && qlon!==null) ? `?lat=${qlat}&lon=${qlon}` : '';
-        const res = await fetch(`/api/v1/poi/${id}${qs}`);
-        if (res.ok) {
-          const data = await res.json();
-          const html = `<div style="min-width:200px;"><strong>${escapeHtml(data.label||'')}</strong><div style="font-size:12px;opacity:0.8;">${escapeHtml(Object.keys(data.tags||{}).slice(0,6).map(k=>k+': '+data.tags[k]).join('<br/>'))}</div></div>`;
-          const m = L.marker([data.lat, data.lon]).addTo(map);
-          m.bindPopup(html).openPopup();
-          searchResultMarkers.push(m);
-          map.panTo([data.lat, data.lon]);
-          const distText = data.distance_m ? `${Math.round(data.distance_m)} m` : '';
-          summaries.push(`Info angezeigt: ${data.label || ('#' + id)} ${distText}`);
+        const result = await addMarkerForPoiAction(id);
+        if (result?.markerData && result.marker) {
+          result.marker.addTo(map);
+          result.marker.togglePopup();
+          searchResultMarkers.push(result.marker);
+          map.panTo([result.markerData.lon, result.markerData.lat]);
+          summaries.push(summarizePoiAction('Info angezeigt', result.markerData));
         }
       } catch (e) { console.warn('show_info failed', e); summaries.push('Details konnten nicht geladen werden'); }
     }
@@ -1191,33 +2017,9 @@ async function executeAgentActions(actions, session_id) {
     const c = computeActions[0];
     const params = c.params || {};
     // determine from value
-    let fromVal = '';
-    if (params.from) {
-      const f = params.from;
-      if (f.query) fromVal = f.query;
-      else if (typeof f.lat === 'number' && typeof f.lon === 'number') fromVal = `${f.lat.toFixed(6)},${f.lon.toFixed(6)}`;
-    }
+    const fromVal = await resolveRouteEndpointValue(params.from);
     // determine to value; if id present, try to fetch POI label
-    let toVal = '';
-    if (params.to) {
-      const t = params.to;
-      if (t.query) toVal = t.query;
-      else if (typeof t.lat === 'number' && typeof t.lon === 'number') toVal = `${t.lat.toFixed(6)},${t.lon.toFixed(6)}`;
-      else if (t.id) {
-        const id = t.id;
-        try {
-          const qlat = userLocation ? userLocation.lat : null;
-          const qlon = userLocation ? userLocation.lon : null;
-          const qs = (qlat!==null && qlon!==null) ? `?lat=${qlat}&lon=${qlon}` : '';
-          const res = await fetch(`/api/v1/poi/${id}${qs}`);
-          if (res.ok) {
-            const data = await res.json();
-            if (data.label) toVal = data.label;
-            else if (typeof data.lat === 'number' && typeof data.lon === 'number') toVal = `${data.lat.toFixed(6)},${data.lon.toFixed(6)}`;
-          }
-        } catch (e) { /* ignore */ }
-      }
-    }
+    const toVal = await resolveRouteEndpointValue(params.to);
 
     // Populate the form fields
     try {
@@ -1259,26 +2061,21 @@ async function executeAgentActions(actions, session_id) {
 window.executeAgentActions = executeAgentActions;
 
 map.on('click', ev=>{
+  // Marker/popup DOM elements don't stop click propagation to the map by
+  // default, so without this guard every click on an existing marker (a
+  // fire station, hydrant, search result, or another stop) or its popup
+  // buttons would also drop a brand-new stop marker at that spot.
+  const target = ev.originalEvent && ev.originalEvent.target;
+  if (target && target.closest && target.closest('.maplibregl-marker, .maplibregl-popup')) return;
   const id = 'M'+(stopSeq++);
-  const marker = L.marker(ev.latlng,{draggable:true, icon: pinIcon(id)}).addTo(map);
-  const s = {id, marker, lat:ev.latlng.lat, lon:ev.latlng.lng};
-  stops.push(s); renderStopList();
-  marker.on('dragend', ()=>{ 
-    const ll=marker.getLatLng(); 
-    s.lat=ll.lat; 
-    s.lon=ll.lng; 
-    renderStopList(); 
-    showToast(`Marker ${id} verschoben`, 'info', 1500);
-  });
-  marker.on('contextmenu', ()=>{ 
-    marker.remove(); 
-    const i=stops.findIndex(x=>x.id===id); 
-    if(i>=0) stops.splice(i,1); 
-    renderStopList(); 
-    showToast(`Marker ${id} gelöscht`, 'info', 1500);
-  });
+  const s = createStopMarker(id, ev.lngLat.lat, ev.lngLat.lng);
+  stops.push(s);
+  renderStopList();
+  saveCustomMarkers();
   showToast(`Marker ${id} hinzugefügt`, 'success', 1500);
 });
+
+restoreCustomMarkers();
 
 makeSuggest('from-suggest','from'); 
 makeSuggest('to-suggest','to');
@@ -1313,20 +2110,32 @@ function addWaypoint() {
   
   inputGroup.appendChild(suggestDiv);
   inputGroup.appendChild(input);
-  
+
+  // Optional per-stop load, compared against Einstellungen > Trip-Optionen >
+  // Fahrzeugkapazität on the server (Lieferdienst/Spedition use case).
+  const demandInput = document.createElement('input');
+  demandInput.type = 'number';
+  demandInput.step = '1';
+  demandInput.min = '0';
+  demandInput.placeholder = 'Ladung';
+  demandInput.title = 'Ladung an diesem Stopp (optional, vergleiche Fahrzeugkapazität)';
+  demandInput.className = 'waypoint-demand-input';
+  demandInput.setAttribute('aria-label', 'Ladung an Zwischenstopp ' + id);
+
   const removeBtn = document.createElement('button');
   removeBtn.textContent = '✕';
   removeBtn.className = 'btn-remove';
   removeBtn.title = 'Entfernen';
   removeBtn.setAttribute('aria-label', 'Zwischenstopp entfernen');
   removeBtn.onclick = () => removeWaypoint(id);
-  
+
   wrapper.appendChild(inputGroup);
+  wrapper.appendChild(demandInput);
   wrapper.appendChild(removeBtn);
   container.appendChild(wrapper);
-  
+
   const suggestHandle = makeSuggest(id + '-suggest', input);
-  waypoints.push({id, input, wrapper, suggestHandle});
+  waypoints.push({id, input, wrapper, suggestHandle, demandInput});
   
   input.addEventListener('change', debouncedCompute);
   
@@ -1438,7 +2247,7 @@ function makeSuggest(containerId, inputOrId) {
           el.setAttribute('aria-selected', 'false');
           el.addEventListener('mouseover', () => { selectedIndex = i; updateActive(); });
           el.onclick = () => {
-            const val = getResultInputValue(item) || primary || '';
+            const val = resultCoordValue(item) || primary || '';
             input.value = val;
             // update clear-button visibility
             const wrap = input.closest('.input-clear-wrap');
@@ -1507,61 +2316,235 @@ function makeSuggest(containerId, inputOrId) {
   };
 }
 
+const SEARCH_SOURCE_ID = 'search-results';
+const SEARCH_CLUSTER_MAX_ZOOM = 16;
+const SEARCH_CLUSTER_RADIUS = 40;
+
 function clearSearchResults() {
-  if (searchResultCluster && typeof searchResultCluster.clearLayers === 'function') {
-    try { searchResultCluster.clearLayers(); } catch(e) {}
-    searchResultCluster = null;
+  removeMarkers(searchClusterRenderedMarkers);
+  removeMarkers(searchResultMarkers);
+  lastSearchResults = [];
+  if (map.getSource(SEARCH_SOURCE_ID)) map.getSource(SEARCH_SOURCE_ID).setData(emptyFeatureCollection());
+}
+
+// Small colored bubble DOM element for a cluster of search results — the
+// MapLibre-native replacement for Leaflet.markercluster's icon, kept as a
+// DOM marker (like the offline labels) rather than a map circle/symbol layer
+// so it renders identically under styles with no text glyphs configured
+// (e.g. the offline tinyTiles style).
+function clusterBubbleElement(count) {
+  const safeCount = Number(count) || 0;
+  const sizeClass = safeCount < 10 ? 'small' : safeCount < 50 ? 'medium' : 'large';
+  const el = markerElement(`map-marker map-cluster-marker map-cluster-marker-${sizeClass}`);
+  el.textContent = String(safeCount);
+  el.setAttribute('aria-label', `${safeCount} Treffer im Cluster`);
+  return el;
+}
+
+// Shows a lightweight list of overlapping results, used as the equivalent of
+// Leaflet.markercluster's spiderfy when a cluster is already at max zoom and
+// clicking it can't split it apart any further.
+function showClusterLeavesPopup(lngLat, leaves) {
+  const wrap = document.createElement('div');
+  wrap.className = 'search-result-cluster-popup';
+  const title = document.createElement('strong');
+  title.className = 'search-result-cluster-title';
+  title.textContent = `${leaves.length} Treffer an dieser Stelle`;
+  wrap.appendChild(title);
+  leaves.forEach((leaf) => {
+    const item = lastSearchResults[leaf.properties.__idx];
+    if (!item) return;
+    const label = item.label || getResultInputValue(item) || resultCoordValue(item) || 'Treffer';
+    const row = document.createElement('div');
+    row.className = 'search-result-cluster-row';
+    const btn = document.createElement('button');
+    btn.className = 'btn btn-sm btn-outline search-result-cluster-btn';
+    btn.textContent = label;
+    btn.addEventListener('click', () => {
+      popup.remove();
+      const m = createSearchResultMarker(item);
+      if (!m) return;
+      m.addTo(map);
+      searchClusterRenderedMarkers.push(m);
+      map.easeTo({ center: [item.lon, item.lat], zoom: SEARCH_CLUSTER_MAX_ZOOM + 1 });
+      window.setTimeout(() => m.togglePopup(), 300);
+    });
+    row.appendChild(btn);
+    wrap.appendChild(row);
+  });
+  const popup = new maplibregl.Popup().setLngLat(lngLat).setDOMContent(wrap).addTo(map);
+}
+
+function ensureSearchClusterSource() {
+  if (map.getSource(SEARCH_SOURCE_ID)) return;
+  map.addSource(SEARCH_SOURCE_ID, {
+    type: 'geojson',
+    data: emptyFeatureCollection(),
+    cluster: true,
+    clusterRadius: SEARCH_CLUSTER_RADIUS,
+    clusterMaxZoom: SEARCH_CLUSTER_MAX_ZOOM,
+  });
+  // Clusters/leaves render as DOM markers (see clusterBubbleElement() and
+  // createSearchResultMarker()), not a map paint layer — but MapLibre only
+  // loads/tiles a GeoJSON source's features for tiles a *layer* actually
+  // requests, so querySourceFeatures() below stays empty without one. This
+  // layer is fully transparent and exists solely to make the source's tiles
+  // (and therefore its clustering) load.
+  map.addLayer({
+    id: SEARCH_SOURCE_ID,
+    type: 'circle',
+    source: SEARCH_SOURCE_ID,
+    paint: { 'circle-radius': 0, 'circle-opacity': 0 },
+  });
+  map.on('moveend', syncSearchClusterMarkers);
+  map.on('zoomend', syncSearchClusterMarkers);
+}
+// A base-layer switch (map.setStyle()) wipes the cluster source too — the
+// route/territory sources restore their own data on rehydrate, but the
+// search-results source is ephemeral (cleared whenever a new search starts
+// anyway), so it only needs to exist again, not repopulate stale results.
+registerMapLayerRehydrate(() => {
+  if (map.getSource(SEARCH_SOURCE_ID)) return; // still present, style diff kept it
+  ensureSearchClusterSource();
+});
+
+async function syncSearchClusterMarkers() {
+  if (!map.getSource(SEARCH_SOURCE_ID) || lastSearchResults.length === 0) return;
+  removeMarkers(searchClusterRenderedMarkers);
+  const features = map.querySourceFeatures(SEARCH_SOURCE_ID);
+  const seenClusters = new Set();
+  let renderedCount = 0;
+  for (const f of features) {
+    if (renderedCount >= SEARCH_CLUSTER_RENDER_CAP) break;
+    const coords = f.geometry?.coordinates;
+    if (!Array.isArray(coords) || coords.length !== 2) continue;
+    if (f.properties.cluster) {
+      const clusterId = f.properties.cluster_id;
+      if (seenClusters.has(clusterId)) continue; // Point features never span tiles, but guard anyway
+      seenClusters.add(clusterId);
+      const el = clusterBubbleElement(f.properties.point_count);
+      const marker = new maplibregl.Marker({ element: el, anchor: 'center' }).setLngLat(coords).addTo(map);
+      el.addEventListener('click', async () => {
+        const source = map.getSource(SEARCH_SOURCE_ID);
+        const expansionZoom = await source.getClusterExpansionZoom(clusterId);
+        if (expansionZoom > SEARCH_CLUSTER_MAX_ZOOM - 0.5) {
+          const leaves = await source.getClusterLeaves(clusterId, 200, 0);
+          showClusterLeavesPopup(coords, leaves);
+        } else {
+          map.easeTo({ center: coords, zoom: expansionZoom });
+        }
+      });
+      searchClusterRenderedMarkers.push(marker);
+      renderedCount += 1;
+    } else {
+      const item = lastSearchResults[f.properties.__idx];
+      if (!item) continue;
+      const marker = createSearchResultMarker(item);
+      if (!marker) continue;
+      marker.addTo(map);
+      searchClusterRenderedMarkers.push(marker);
+      renderedCount += 1;
+    }
   }
-  searchResultMarkers.forEach(m => m.remove());
-  searchResultMarkers = [];
 }
 
 function showSearchResultsOnMap(results) {
   clearSearchResults();
   if (!Array.isArray(results) || results.length === 0) return;
-  const bounds = [];
-  // Use marker clustering when available for large result sets, with custom icon
-  const useCluster = !!(window.L && typeof L.markerClusterGroup === 'function');
-  if (useCluster) {
-    searchResultCluster = L.markerClusterGroup({
-      spiderfyOnMaxZoom: true,
-      showCoverageOnHover: false,
-      maxClusterRadius: 40,
-      iconCreateFunction: function(cluster) {
-        const count = cluster.getChildCount();
-        const size = count < 10 ? 'small' : (count < 50 ? 'medium' : 'large');
-        const html = `<div class="cluster-icon ${size}"><span>${count}</span></div>`;
-        return L.divIcon({ html, className: 'custom-cluster', iconSize: L.point(40, 40) });
-      }
-    });
+  ensureSearchClusterSource();
+  const valid = [];
+  for (const item of results) {
+    if (valid.length >= SEARCH_RESULTS_RENDER_LIMIT) break;
+    const normalized = normalizeSearchResult(item);
+    if (normalized) valid.push(normalized);
   }
-  results.forEach((item, idx) => {
-    if (!item || !item.lat || !item.lon) return;
-    const m = L.marker([item.lat, item.lon], { title: item.label || '' });
-    const secondary = getResultSecondary(item);
-    let popupHtml = `<strong>${escapeHtml(item.label || '')}</strong><br/>`;
-    if (secondary) popupHtml += `<small style="opacity:0.8">${escapeHtml(secondary)}</small>`;
-    // add an action button to popup to quickly add this result as waypoint
-    const popupWithButton = popupHtml + `<div style="margin-top:6px;text-align:right;">
-      <button class="btn btn-sm btn-outline info-btn">Mehr Info</button>
-      <button class="btn btn-sm btn-outline add-waypoint-btn">Als Zwischenstopp</button>
+  if (results.length > SEARCH_RESULTS_RENDER_LIMIT) {
+    showToast(`Suchergebnisanzeige auf ${SEARCH_RESULTS_RENDER_LIMIT} Treffer begrenzt`, 'info', 1800);
+  }
+  lastSearchResults = valid;
+  const bounds = valid.map((item) => [item.lon, item.lat]);
+  if (bounds.length === 0) return;
+  map.getSource(SEARCH_SOURCE_ID).setData({
+    type: 'FeatureCollection',
+    features: valid.map((item, idx) => ({
+      type: 'Feature',
+      geometry: { type: 'Point', coordinates: [item.lon, item.lat] },
+      properties: { __idx: idx },
+    })),
+  });
+  // map.once('idle', ...) right after setData() is a known race (the map
+  // can briefly report idle before the new tiles/clusters have finished
+  // loading) — waitForSourceReady polls the source's own load state instead.
+  waitForSourceReady(SEARCH_SOURCE_ID).then(syncSearchClusterMarkers);
+  if (bounds.length === 1) {
+    map.panTo(bounds[0]);
+  } else if (bounds.length > 1) {
+    try {
+      const b = bounds.reduce((acc, c) => acc.extend(c), new maplibregl.LngLatBounds(bounds[0], bounds[0]));
+      map.fitBounds(b, { padding: 40 });
+    } catch(e) {}
+  }
+}
+
+// Builds one search-result marker with its full "Mehr Info"/"Als
+// Zwischenstopp" popup — used for both un-clustered leaves and results
+// picked from the cluster-leaves fallback list.
+function createSearchResultMarker(item) {
+    const normalized = normalizeSearchResult(item);
+    if (!normalized) return null;
+    const m = new maplibregl.Marker({ element: searchResultMarkerElement(), anchor: 'bottom' }).setLngLat([normalized.lon, normalized.lat]);
+    const markerEl = m.getElement();
+    if (markerEl) markerEl.title = normalized.label || '';
+    const secondary = getResultSecondary(normalized);
+    const popupWithButton = `<div class="search-result-popup">
+      <strong class="search-result-popup-title">${escapeHtml(normalized.label || '')}</strong>
+      ${secondary ? `<div class="search-result-popup-subtitle">${escapeHtml(secondary)}</div>` : ''}
+      <div class="search-result-popup-actions">
+        <button class="btn btn-sm btn-outline info-btn">Mehr Info</button>
+        <button class="btn btn-sm btn-outline set-destination-btn">Als Ziel</button>
+        <button class="btn btn-sm btn-outline add-waypoint-btn">Als Zwischenstopp</button>
+        <button class="btn btn-sm btn-outline delete-marker-btn">Löschen</button>
+      </div>
     </div>`;
-    m.bindPopup(popupWithButton);
-    m.on('popupopen', (ev) => {
-      const btn = ev.popup.getElement().querySelector('.add-waypoint-btn');
-      const infoBtn = ev.popup.getElement().querySelector('.info-btn');
+    const popup = new maplibregl.Popup().setHTML(popupWithButton);
+    popup.on('open', () => {
+      const btn = popup.getElement().querySelector('.add-waypoint-btn');
+      const infoBtn = popup.getElement().querySelector('.info-btn');
+      const destBtn = popup.getElement().querySelector('.set-destination-btn');
+      const deleteBtn = popup.getElement().querySelector('.delete-marker-btn');
+      if (destBtn) {
+        destBtn.addEventListener('click', () => {
+          const val = resultCoordValue(normalized);
+          const toEl = document.getElementById('to');
+          if (val && toEl) {
+            toEl.value = val;
+            syncInputClearState('to');
+          }
+          popup.remove();
+          if (val) compute();
+        });
+      }
+      if (deleteBtn) {
+        deleteBtn.addEventListener('click', () => {
+          popup.remove();
+          removeSearchResultMarker(m);
+        });
+      }
       if (btn) {
         btn.addEventListener('click', () => {
-          const lbl = getResultInputValue(item) || '';
-          if (lbl) addWaypointWithValue(lbl);
-          ev.popup._close();
+          const val = resultCoordValue(normalized);
+          if (val) addWaypointWithValue(val);
+          popup.remove();
         });
       }
       if (infoBtn) {
         infoBtn.addEventListener('click', async () => {
-          const orig = ev.popup.getContent();
+          // MapLibre's Popup has no getContent() getter (unlike Leaflet's),
+          // so the "original" content to restore on "Zurück" is the HTML we
+          // built above rather than something read back from the popup.
+          const orig = popupWithButton;
           // show loading
-          ev.popup.setContent('<div>Informationen werden geladen…</div>');
+          popup.setHTML('<div class="search-result-popup-loading">Informationen werden geladen…</div>');
           try {
             const qlat = userLocation ? userLocation.lat : null;
             const qlon = userLocation ? userLocation.lon : null;
@@ -1569,13 +2552,20 @@ function showSearchResultsOnMap(results) {
             // Search uses "poi" for way-based POIs and also displays address
             // and street results. Only entity kinds accepted by the typed API
             // are encoded; legacy lookup remains useful for the other kinds.
-            const entityKind = item.kind === 'poi' ? 'way' : (['node', 'way', 'relation'].includes(item.kind) ? item.kind : '');
-            const poiPath = entityKind ? `${entityKind}/${item.id}` : String(item.id);
+            const entityKind = normalized.kind === 'poi' ? 'way' : (['node', 'way', 'relation'].includes(normalized.kind) ? normalized.kind : '');
+            const poiPath = entityKind ? `${entityKind}/${normalized.id}` : String(normalized.id);
             const res = await fetch(`/api/v1/poi/${poiPath}${qs}`);
             if (!res.ok) throw new Error('fetch failed');
             const data = await res.json();
             // build info html
-            let infoHtml = `<strong>${escapeHtml(data.label || '')}</strong><br/>`;
+            let infoHtml = `<div class="search-result-popup">
+              <strong class="search-result-popup-title">${escapeHtml(data.label || '')}</strong>
+              <div class="search-result-popup-actions">
+                <button class="btn btn-sm btn-primary route-btn">Als Ziel</button>
+                <button class="btn btn-sm btn-outline waypoint-btn">Als Zwischenstopp</button>
+                <button class="btn btn-sm btn-outline delete-btn">Löschen</button>
+                <button class="btn btn-sm btn-outline back-btn">Zurück</button>
+              </div>`;
             if (data.tags) {
               const keys = Object.keys(data.tags).sort();
               const knownLabels = { phone: 'Telefon', website: 'Website', opening_hours: 'Öffnungszeiten' };
@@ -1598,58 +2588,57 @@ function showSearchResultsOnMap(results) {
                   otherRows.push(`<div><strong>${escapeHtml(k)}:</strong> ${escapeHtml(v)}</div>`);
                 }
               });
-              infoHtml += '<div style="margin-top:6px; font-size:13px;">';
+              infoHtml += '<div class="search-result-popup-details">';
               infoHtml += knownRows.join('') + otherRows.join('');
               infoHtml += '</div>';
             }
             if (data.wiki_summary) {
-              infoHtml += `<div style="margin-top:8px; font-size:13px; color:#333;">${escapeHtml(data.wiki_summary)}</div>`;
+              infoHtml += `<div class="search-result-popup-details search-result-popup-muted">${escapeHtml(data.wiki_summary)}</div>`;
             }
             if (data.distance_m) {
-              infoHtml += `<div style="margin-top:6px; font-size:12px; color:#666;">Entfernung: ${Math.round(data.distance_m)} m</div>`;
+              infoHtml += `<div class="search-result-popup-note">Entfernung: ${Math.round(data.distance_m)} m</div>`;
             }
-            infoHtml += `<div style="margin-top:8px;text-align:right;"><button class=\"btn btn-sm btn-primary route-btn\">Route berechnen</button> <button class=\"btn btn-sm btn-outline back-btn\">Zurück</button></div>`;
-            ev.popup.setContent(infoHtml);
+            infoHtml += '</div>';
+            popup.setHTML(infoHtml);
             // wire buttons
             setTimeout(() => {
-              const el = ev.popup.getElement();
+              const el = popup.getElement();
               if (!el) return;
               const rbtn = el.querySelector('.route-btn');
+              const wbtn = el.querySelector('.waypoint-btn');
+              const dbtn = el.querySelector('.delete-btn');
               const bbtn = el.querySelector('.back-btn');
               if (rbtn) rbtn.addEventListener('click', () => {
-                const to = data.label || item.label || `${data.lat},${data.lon}`;
+                const to = resultCoordValue(data) || resultCoordValue(normalized);
                 document.getElementById('to').value = to;
-                ev.popup._close();
+                syncInputClearState('to');
+                popup.remove();
                 compute();
               });
+              if (wbtn) wbtn.addEventListener('click', () => {
+                const val = resultCoordValue(data) || resultCoordValue(normalized);
+                if (val) addWaypointWithValue(val);
+                popup.remove();
+              });
+              if (dbtn) dbtn.addEventListener('click', () => {
+                popup.remove();
+                removeSearchResultMarker(m);
+              });
               if (bbtn) bbtn.addEventListener('click', () => {
-                ev.popup.setContent(orig);
+                popup.setHTML(orig);
               });
             }, 50);
           } catch (e) {
-            ev.popup.setContent('<div>Informationen konnten nicht geladen werden.</div>');
-            setTimeout(() => ev.popup.setContent(orig), 2000);
+            popup.setHTML('<div class="search-result-popup-error">Informationen konnten nicht geladen werden.</div>');
+            setTimeout(() => popup.setHTML(orig), 2000);
           }
         });
       }
     });
-    m.on('click', () => { m.openPopup(); });
-    if (searchResultCluster) {
-      searchResultCluster.addLayer(m);
-    } else {
-      m.addTo(map);
-    }
-    searchResultMarkers.push(m);
-    bounds.push([item.lat, item.lon]);
-  });
-  if (searchResultCluster) {
-    map.addLayer(searchResultCluster);
-  }
-  if (bounds.length === 1) {
-    map.panTo(bounds[0]);
-  } else if (bounds.length > 1) {
-    try { map.fitBounds(bounds, { padding: [40, 40] }); } catch(e) {}
-  }
+    // marker.setPopup() wires the marker's own click handler to toggle it,
+    // matching Leaflet's implicit "click marker to open its bound popup".
+    m.setPopup(popup);
+    return m;
 }
 
 function getResultPrimary(item) {
@@ -1676,6 +2665,15 @@ function getResultSecondary(item) {
 function getResultInputValue(item) {
   if (!item) return '';
   return item.label || getResultPrimary(item) || '';
+}
+
+// Prefer exact "lat,lon" coordinates over the free-text label when routing
+// to/through a result whose coordinates we already know. Round-tripping a
+// label (especially one missing a city, e.g. an unaddressed POI) back
+// through the server's free-text search can resolve to a same-housenumber
+// address somewhere else entirely — coordinates sidestep that ambiguity.
+function resultCoordValue(item) {
+  return formatLatLon(item?.lat, item?.lon);
 }
 
 // simple HTML escaper for suggestion labels
@@ -1706,6 +2704,26 @@ pro.addEventListener('change', () => {
 
 document.getElementById('engine').addEventListener('change', compute);
 document.getElementById('objective').addEventListener('change', compute);
+
+// Route objective quick-toggle in the main route card — a more discoverable
+// shortcut for the same "Ziel" select in Einstellungen > Routing, kept in
+// sync with it in both directions rather than duplicating routing logic.
+function syncRouteObjectiveToggle() {
+  const current = document.getElementById('objective')?.value || 'distance';
+  document.querySelectorAll('.route-objective-btn').forEach((btn) => {
+    btn.classList.toggle('is-active', btn.dataset.objective === current);
+  });
+}
+document.getElementById('routeObjectiveToggle')?.addEventListener('click', (ev) => {
+  const btn = ev.target.closest('.route-objective-btn');
+  if (!btn) return;
+  const objectiveEl = document.getElementById('objective');
+  if (!objectiveEl || objectiveEl.value === btn.dataset.objective) return;
+  objectiveEl.value = btn.dataset.objective;
+  objectiveEl.dispatchEvent(new Event('change', { bubbles: true }));
+});
+document.getElementById('objective')?.addEventListener('change', syncRouteObjectiveToggle);
+syncRouteObjectiveToggle();
 const optimizeEl = document.getElementById('optimize');
 optimizeEl.addEventListener('change', (ev) => {
   try { optimizeEl.setAttribute('aria-checked', optimizeEl.checked ? 'true' : 'false'); } catch (e) {}
@@ -1718,6 +2736,7 @@ function initializeSettingsUI(s) {
     if(s.routing) {
         document.getElementById('engine').value = (s.routing.engine || 'astar');
         document.getElementById('objective').value = s.routing.objective || 'duration';
+        syncRouteObjectiveToggle();
         const profileEl = document.getElementById('profile');
         if (profileEl) profileEl.value = s.routing.profile || '';
         document.getElementById('pro').checked = !!s.routing.pro;
@@ -2225,7 +3244,7 @@ function openMapSourcePicker() {
 }
 
 document.getElementById('mapWelcomeLater')?.addEventListener('click', () => hideMapWelcome({ defer: true }));
-document.getElementById('openMapSources')?.addEventListener('click', showMapSourcePicker);
+document.getElementById('openMapSources')?.addEventListener('click', () => showMapSourcePicker());
 document.getElementById('mapWelcomeOffline')?.addEventListener('click', () => { void selectTinyTilesSource({ fromWelcome: true }); });
 document.getElementById('mapWelcomeOnline')?.addEventListener('click', () => {
   const main = document.getElementById('mapWelcomeMain');
@@ -2759,8 +3778,41 @@ loadVehicleProfiles();
 // keeps the whole feature frontend-only, with no extra round-trips and no
 // changes to the shared route handler/cache on the server.
 const territoryGeoJSONCache = {}; // layer name -> parsed FeatureCollection
-let territoryOverlayLayer = null;
+const TERRITORY_SOURCE_ID = 'territories';
+const TERRITORY_FILL_LAYER_ID = 'territories-fill';
+let territoryOverlayVisible = false;
+let lastTerritoryGeoJSON = null; // last-shown, __color-annotated FeatureCollection, for style-swap rehydration
 let territoryBuildAnnouncedLayer = '';
+
+function ensureTerritoryLayer() {
+  if (map.getSource(TERRITORY_SOURCE_ID)) return;
+  map.addSource(TERRITORY_SOURCE_ID, { type: 'geojson', data: emptyFeatureCollection() });
+  map.addLayer({
+    id: TERRITORY_FILL_LAYER_ID,
+    type: 'fill',
+    source: TERRITORY_SOURCE_ID,
+    // A PLZ3 feature is a MultiPolygon made from genuine PLZ5 boundaries. Do
+    // not stroke every retained component: those internal edges made one
+    // correctly grouped PLZ3 region look like many incorrectly recognised
+    // regions. Different prefix groups remain clearly visible by fill.
+    paint: { 'fill-color': ['get', '__color'], 'fill-opacity': 0.18, 'fill-outline-color': 'rgba(0,0,0,0)' },
+  });
+  // MapLibre fill layers don't auto-bind a popup per feature the way
+  // Leaflet's L.geoJSON onEachFeature did — wire one click handler instead.
+  map.on('click', TERRITORY_FILL_LAYER_ID, (e) => {
+    const feature = e.features && e.features[0];
+    if (!feature) return;
+    new maplibregl.Popup().setLngLat(e.lngLat).setHTML(territoryPopupHtml(feature.properties)).addTo(map);
+  });
+  map.on('mouseenter', TERRITORY_FILL_LAYER_ID, () => { map.getCanvas().style.cursor = 'pointer'; });
+  map.on('mouseleave', TERRITORY_FILL_LAYER_ID, () => { map.getCanvas().style.cursor = ''; });
+}
+// A base-layer switch (map.setStyle()) wipes the territory source too.
+registerMapLayerRehydrate(() => {
+  if (!territoryOverlayVisible) return;
+  ensureTerritoryLayer();
+  if (lastTerritoryGeoJSON) map.getSource(TERRITORY_SOURCE_ID).setData(lastTerritoryGeoJSON);
+});
 
 function territoryColor(id) {
   const s = String(id ?? '');
@@ -2779,7 +3831,7 @@ function territoryColor(id) {
 function territoryPopupHtml(props) {
   props = props || {};
   const id = props.territory_id ?? '';
-  const rows = Object.keys(props).filter(k => k !== 'territory_id').sort().map(k => {
+  const rows = Object.keys(props).filter(k => k !== 'territory_id' && k !== '__color').sort().map(k => {
     const v = Array.isArray(props[k]) ? props[k].join(', ') : props[k];
     return `<div class="territory-popup-row"><span class="territory-popup-key">${escapeHtml(k)}</span><span class="territory-popup-val">${escapeHtml(String(v))}</span></div>`;
   }).join('');
@@ -2895,29 +3947,40 @@ async function updateTerritoryRouteTransitions(path) {
 }
 
 async function setTerritoryOverlayVisible(visible) {
-  if (territoryOverlayLayer) { map.removeLayer(territoryOverlayLayer); territoryOverlayLayer = null; }
-  if (!visible) return;
+  territoryOverlayVisible = visible;
+  if (!visible) {
+    lastTerritoryGeoJSON = null;
+    if (map.getSource(TERRITORY_SOURCE_ID)) map.getSource(TERRITORY_SOURCE_ID).setData(emptyFeatureCollection());
+    return;
+  }
   const layerName = document.getElementById('territoryLayer')?.value;
   const checkbox = document.getElementById('territoryShowOnMap');
   if (!layerName) {
     showToast('Bitte zuerst eine Gebietsebene wählen', 'info', 2200);
     if (checkbox) checkbox.checked = false;
+    territoryOverlayVisible = false;
     return;
   }
   try {
     const geojson = await fetchTerritoryGeoJSON(layerName);
-    territoryOverlayLayer = L.geoJSON(geojson, {
-      // A PLZ3 feature is a MultiPolygon made from genuine PLZ5 boundaries.
-      // Do not stroke every retained component: those internal edges made one
-      // correctly grouped PLZ3 region look like many incorrectly recognised
-      // regions. Different prefix groups remain clearly visible by fill.
-      style: feature => ({ color: territoryColor(feature.properties?.territory_id), stroke: false, fillOpacity: 0.18 }),
-      onEachFeature: (feature, lyr) => lyr.bindPopup(territoryPopupHtml(feature.properties)),
-    }).addTo(map);
+    // Precompute each feature's fill color: MapLibre paint expressions can't
+    // call an arbitrary JS hash function like territoryColor() at render
+    // time, so it's injected as a property instead and read back via ['get'].
+    const colored = {
+      ...geojson,
+      features: (geojson.features || []).map((f) => ({
+        ...f,
+        properties: { ...f.properties, __color: territoryColor(f.properties?.territory_id) },
+      })),
+    };
+    lastTerritoryGeoJSON = colored;
+    ensureTerritoryLayer();
+    map.getSource(TERRITORY_SOURCE_ID).setData(colored);
   } catch (e) {
     console.error('Territory overlay failed:', e);
     showToast('Gebiete konnten nicht geladen werden', 'error', 3000);
     if (checkbox) checkbox.checked = false;
+    territoryOverlayVisible = false;
   }
 }
 
@@ -3578,7 +4641,7 @@ async function sendAIQuery() {
       const toEl = document.getElementById('to');
       if (showRouteIntent) {
         if (polyline) {
-          map.fitBounds(polyline.getBounds(), { padding: [40, 40] });
+          map.fitBounds(polyline.getBounds(), { padding: 40 });
           const dist = document.getElementById('detailDistance')?.textContent || '';
           const dur = document.getElementById('detailDuration')?.textContent || '';
           loadingMsg.innerHTML = `<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">lokal</div>Route auf der Karte angezeigt${dist || dur ? `: <strong>${escapeHtml(dist)}</strong>${dur ? ` • ${escapeHtml(dur)}` : ''}` : ''}`;

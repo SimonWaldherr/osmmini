@@ -12,7 +12,7 @@ Features
 
 - Build a routing graph from an OSM PBF and serve offline routes via HTTP API
 - Multiple routing engines: `astar`, `dijkstra`, `dijkstra-node` (node-only Dijkstra)
-- Web UI (Leaflet) in `cmd/web` with search, trip solver, settings and turn-by-turn maneuvers
+- Web UI (MapLibre GL) in `cmd/web` with search, trip solver, settings and turn-by-turn maneuvers
 - Global raster map profile plus official BayernAtlas vector and WMTS presets
 - Local tinyTiles vector profile for an optional fully offline basemap
 - Tile proxy with a source-namespaced local cache for proxied sources
@@ -61,14 +61,17 @@ integrated tinyTiles endpoint. The built-in tinyTiles generator creates local
 vector tiles for roads, buildings, water, forest and agricultural land;
 osmmini serves both the tiles and matching local MapLibre style.
 
-For a truly offline browser renderer, vendor MapLibre locally once while
-online (see "Frontend / assets" below), then use the **Offline-Karte
-erzeugen** action in the web UI to build the `.ttiles` artifact from the PBF
-loaded by osmmini. After preparation, the map UI needs no network connection:
+For a truly offline browser renderer, prepare a PBF extract and vendor
+MapLibre locally once while online (see "Frontend / assets" below, or just
+run `make offline-prep`), then use the **Offline-Karte erzeugen** action in
+the web UI to build the `.ttiles` artifact from the PBF loaded by osmmini.
+After preparation, the map UI needs no network connection at all — no CDN,
+no font/glyph service:
 
 ```bash
-# Vendor MapLibre locally once, while online, for a fully offline UI:
-# make maplibre-assets
+# One-shot: download a Geofabrik PBF extract and vendor MapLibre locally,
+# both while online, so the running server needs no further network access:
+make offline-prep GEOFABRIK_URL='https://download.geofabrik.de/europe/germany/bayern-latest.osm.pbf'
 
 OSMMINI_ADMIN_TOKEN='choose-a-secret' go run ./cmd \
   -pbf region.osm.pbf \
@@ -92,6 +95,8 @@ make run PBF=region.osm.pbf
 make bayern BAYERN_PBF=bayern.osm.pbf ADMIN_TOKEN='choose-a-secret'
 make offline PBF=region.osm.pbf ADMIN_TOKEN='choose-a-secret'
 make maplibre-assets
+make pbf-download GEOFABRIK_URL='https://download.geofabrik.de/europe/germany/bayern-latest.osm.pbf'
+make offline-prep
 make check
 ```
 
@@ -124,8 +129,14 @@ self-hosted global provider and follow its terms. See the
 
 Frontend / assets
 
-- The UI lives in `cmd/web`; own JS/CSS is committed, third-party libraries (Leaflet, MapLibre GL) are not.
-- Leaflet and MapLibre load from a CDN by default. For the fully offline
-  tinyTiles profile, run `make maplibre-assets` once (while online) to vendor
-  a local, checksum-verified copy under `cmd/web/static`; osmmini prefers
-  that local copy over the CDN whenever it is present.
+- The UI lives in `cmd/web`; own JS/CSS is committed, the third-party MapLibre
+  GL library is not.
+- MapLibre GL is the only map engine (Leaflet was removed). It is **not**
+  loaded from a CDN — the browser always loads it from
+  `cmd/web/static/maplibre`, which is not committed to the repository. Run
+  `make maplibre-assets` once (while online) to vendor a local,
+  checksum-verified copy before the first run; without it the map fails to
+  load rather than silently falling back to a CDN.
+- `make offline-prep` runs `make pbf-download` and `make maplibre-assets`
+  together as a one-shot "get everything needed for a fully offline
+  deployment" step.

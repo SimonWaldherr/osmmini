@@ -1055,11 +1055,19 @@ type RouteResponse struct {
 	AppleMapsURL  string             `json:"apple_maps_url"`
 	Steps         []osmmini.Maneuver `json:"steps,omitempty"`
 	Cached        bool               `json:"cached,omitempty"`
+	// ComputeMs is server-side wall-clock time for the pathfinding call
+	// itself (RouteWithOptions), in milliseconds. Omitted for cache hits --
+	// no computation happened, see Cached instead.
+	ComputeMs float64 `json:"compute_ms,omitempty"`
 }
 
 type TripStop struct {
 	ID       string   `json:"id"`
 	Location Location `json:"location"`
+	// Demand is the load this stop adds or removes (e.g. kg or a generic
+	// unit), compared against TripPlan.VehicleCapacity. Optional; zero means
+	// the stop carries no load requirement.
+	Demand float64 `json:"demand,omitempty"`
 }
 
 type Dependency struct {
@@ -1074,6 +1082,10 @@ type TripPlan struct {
 	Dependencies []Dependency `json:"dependencies,omitempty"`
 	Optimize     bool         `json:"optimize"`
 	Loop         bool         `json:"loop,omitempty"`
+	// VehicleCapacity is the maximum total Demand the vehicle can carry.
+	// Optional; zero (the default) skips the capacity check entirely, since
+	// most trips have no load to track.
+	VehicleCapacity float64 `json:"vehicle_capacity,omitempty"`
 }
 
 type TripSolveRequest struct {
@@ -1082,12 +1094,13 @@ type TripSolveRequest struct {
 }
 
 type TripStopResolved struct {
-	ID    string  `json:"id"`
-	Label string  `json:"label"`
-	Lat   float64 `json:"lat"`
-	Lon   float64 `json:"lon"`
-	Node  int64   `json:"node"`
-	SnapM float64 `json:"snap_m"`
+	ID     string  `json:"id"`
+	Label  string  `json:"label"`
+	Lat    float64 `json:"lat"`
+	Lon    float64 `json:"lon"`
+	Node   int64   `json:"node"`
+	SnapM  float64 `json:"snap_m"`
+	Demand float64 `json:"demand,omitempty"`
 }
 
 type TripSolveResponse struct {
@@ -1102,6 +1115,15 @@ type TripSolveResponse struct {
 	Legs          []RouteResponse    `json:"legs"`
 	GoogleMapsURL string             `json:"google_maps_url"`
 	AppleMapsURL  string             `json:"apple_maps_url"`
+	// TotalDemand is the sum of all stops' Demand; VehicleCapacity echoes the
+	// plan's limit (0 if none was set). CapacityWarning is non-empty only
+	// when a positive VehicleCapacity was set and TotalDemand exceeds it —
+	// the trip is still solved and returned, since which stops to drop or
+	// whether to split into a second run is a dispatcher decision, not
+	// something the solver should decide unilaterally.
+	TotalDemand     float64 `json:"total_demand,omitempty"`
+	VehicleCapacity float64 `json:"vehicle_capacity,omitempty"`
+	CapacityWarning string  `json:"capacity_warning,omitempty"`
 }
 
 // ---- Route result cache ----
@@ -1348,6 +1370,11 @@ type server struct {
 	territories    *osmmini.TerritoryStore
 	territoryRaw   map[string][]byte
 	territoriesDir string
+
+	// fireStations persists manually-added/CSV-imported vehicle rosters for
+	// the Einsatzmodus "Feuerwehrhäuser" overlay. Never committed — see
+	// fire_stations.go and the gitignored fire-stations.json default path.
+	fireStations *FireStationStore
 }
 
 type aiMessage struct {
@@ -1473,6 +1500,10 @@ func main() {
 		pbfPath:        *pbf,
 		tinyTilesDir:   *tinyTilesDir,
 		territoriesDir: *territoriesDir,
+		fireStations:   NewFireStationStore("fire-stations.json"),
+	}
+	if err := srv.fireStations.Load(); err != nil {
+		log.Printf("fire stations: failed to load fire-stations.json: %v", err)
 	}
 	if *tinyTilesMaxMemoryMB > 0 {
 		srv.tinyTilesMaxMemory = *tinyTilesMaxMemoryMB << 20
@@ -1610,6 +1641,10 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/api/v1/tile-sources", s.handleTileSources)
 	mux.HandleFunc("/api/v1/tinytiles/build", s.handleTinyTilesBuild)
 	mux.HandleFunc("/api/v1/offline-labels", s.handleOfflineLabels)
+	mux.HandleFunc("/api/v1/hydrants", s.handleHydrants)
+	mux.HandleFunc("/api/v1/fire-stations", s.handleFireStations)
+	mux.HandleFunc("/api/v1/fire-stations/import", s.handleFireStationsImport)
+	mux.HandleFunc("/api/v1/fire-stations/", s.handleFireStationByID)
 	mux.HandleFunc("/api/v1/profiles", s.handleProfiles)
 	mux.HandleFunc("/api/v1/search", s.handleSearch)
 	mux.HandleFunc("/api/v1/route", s.handleRoute)
@@ -3483,7 +3518,9 @@ func (s *server) handleRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	computeStart := time.Now()
 	res, err := s.router.RouteWithOptions(r.Context(), startID, endID, opt)
+	computeMs := float64(time.Since(computeStart).Microseconds()) / 1000
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, routeErrorMessage(err))
 		return
@@ -3526,6 +3563,7 @@ func (s *server) handleRoute(w http.ResponseWriter, r *http.Request) {
 		GoogleMapsURL: gURL,
 		AppleMapsURL:  aURL,
 		Steps:         steps,
+		ComputeMs:     computeMs,
 	}
 	s.routeCache.set(cacheKey, resp)
 	writeJSON(w, http.StatusOK, resp)
@@ -3559,11 +3597,12 @@ func (s *server) handleTripSolve(w http.ResponseWriter, r *http.Request) {
 // ---- Trip / TSP ----
 
 type stopR struct {
-	id    string
-	label string
-	coord osmmini.Coord
-	node  int64
-	snap  float64
+	id     string
+	label  string
+	coord  osmmini.Coord
+	node   int64
+	snap   float64
+	demand float64
 }
 
 func (s *server) solveTrip(ctx context.Context, plan TripPlan, opt osmmini.RouteOptions) (TripSolveResponse, error) {
@@ -3616,7 +3655,7 @@ func (s *server) solveTrip(ctx context.Context, plan TripPlan, opt osmmini.Route
 			return TripSolveResponse{}, fmt.Errorf("stop %s: no graph node found", id)
 		}
 		_ = in
-		stops = append(stops, stopR{id: id, label: lab, coord: c, node: n, snap: snap})
+		stops = append(stops, stopR{id: id, label: lab, coord: c, node: n, snap: snap, demand: st.Demand})
 	}
 
 	n := len(stops)
@@ -3717,16 +3756,23 @@ func (s *server) solveTrip(ctx context.Context, plan TripPlan, opt osmmini.Route
 
 	orderIDs := make([]string, 0, len(orderIdx))
 	resStops := make([]TripStopResolved, 0, len(orderIdx))
+	totalDemand := 0.0
 	for _, i := range orderIdx {
 		orderIDs = append(orderIDs, stops[i].id)
+		totalDemand += stops[i].demand
 		resStops = append(resStops, TripStopResolved{
-			ID:    stops[i].id,
-			Label: stops[i].label,
-			Lat:   stops[i].coord.Lat,
-			Lon:   stops[i].coord.Lon,
-			Node:  stops[i].node,
-			SnapM: stops[i].snap,
+			ID:     stops[i].id,
+			Label:  stops[i].label,
+			Lat:    stops[i].coord.Lat,
+			Lon:    stops[i].coord.Lon,
+			Node:   stops[i].node,
+			SnapM:  stops[i].snap,
+			Demand: stops[i].demand,
 		})
+	}
+	capacityWarning := ""
+	if plan.VehicleCapacity > 0 && totalDemand > plan.VehicleCapacity {
+		capacityWarning = fmt.Sprintf("Ladung (%.1f) überschreitet die Fahrzeugkapazität (%.1f)", totalDemand, plan.VehicleCapacity)
 	}
 
 	tripCoords := make([]osmmini.Coord, 0, len(points))
@@ -3735,17 +3781,20 @@ func (s *server) solveTrip(ctx context.Context, plan TripPlan, opt osmmini.Route
 	}
 
 	return TripSolveResponse{
-		Engine:        string(opt.Engine),
-		Objective:     string(opt.Objective),
-		Order:         orderIDs,
-		Stops:         resStops,
-		DistanceM:     totalDist,
-		DurationS:     totalDur,
-		Cost:          totalCost,
-		Path:          combined,
-		Legs:          legs,
-		GoogleMapsURL: buildGoogleMapsURL(tripCoords, 9),
-		AppleMapsURL:  buildAppleMapsURL(tripCoords),
+		Engine:          string(opt.Engine),
+		Objective:       string(opt.Objective),
+		Order:           orderIDs,
+		Stops:           resStops,
+		DistanceM:       totalDist,
+		DurationS:       totalDur,
+		Cost:            totalCost,
+		Path:            combined,
+		Legs:            legs,
+		GoogleMapsURL:   buildGoogleMapsURL(tripCoords, 9),
+		AppleMapsURL:    buildAppleMapsURL(tripCoords),
+		TotalDemand:     totalDemand,
+		VehicleCapacity: plan.VehicleCapacity,
+		CapacityWarning: capacityWarning,
 	}, nil
 }
 
