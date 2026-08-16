@@ -487,3 +487,8 @@ components:
         postal_prefix_length: { type: integer, minimum: 1, maximum: 5 }
         territory_layer: { type: string, example: plz3 }
         territories: { type: integer, minimum: 0 }
+        source_bytes: { type: integer, format: int64, minimum: 0, description: Size of the source PBF in bytes. }
+        estimated_disk_bytes: { type: integer, format: int64, minimum: 0, description: Preflight estimate for the published artifact. }
+        estimated_tile_count: { type: integer, format: int64, minimum: 0, description: Tile count estimated during tinySQL preflight. }
+        generated_tiles: { type: integer, minimum: 0, description: Number of tiles generated from the PBF. }
+        road_features: { type: integer, minimum: 0, description: Number of road features used by the generated map. }

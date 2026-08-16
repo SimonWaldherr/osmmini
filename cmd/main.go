@@ -1403,6 +1403,9 @@ func main() {
 		case "route":
 			runRouteCLI(os.Args[2:])
 			return
+		case "pbf-index":
+			runPBFIndexCLI(os.Args[2:])
+			return
 		}
 	}
 

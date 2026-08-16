@@ -4,7 +4,7 @@ go 1.26.5
 
 require (
 	github.com/Karte-Bayern/tinyTiles/v2 v2.3.0
-	github.com/SimonWaldherr/tinySQL v0.33.0
+	github.com/SimonWaldherr/tinySQL v0.34.0
 )
 
 require (

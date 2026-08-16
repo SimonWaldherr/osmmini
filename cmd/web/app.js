@@ -3370,6 +3370,7 @@ function tinyTilesElements() {
     message: document.getElementById('tinyTilesStatusMessage'),
     progress: document.getElementById('tinyTilesProgress'),
     progressBar: document.querySelector('#tinyTilesProgress .tinytiles-progress-bar span'),
+    facts: document.getElementById('tinyTilesFacts'),
   };
 }
 
@@ -3394,6 +3395,72 @@ function tinyTilesZoomsFromUI() {
     throw new Error('Bitte gültige Zoomstufen zwischen 5 und 14 wählen (Minimum ≤ Maximum).');
   }
   return { min_zoom: min, max_zoom: max };
+}
+
+function updateTinyTilesPresetSelection() {
+  const min = Number.parseInt(document.getElementById('tinyTilesMinZoom')?.value, 10);
+  const max = Number.parseInt(document.getElementById('tinyTilesMaxZoom')?.value, 10);
+  document.querySelectorAll('.tinytiles-preset').forEach((preset) => {
+    const selected = Number.parseInt(preset.dataset.tinytilesMin, 10) === min
+      && Number.parseInt(preset.dataset.tinytilesMax, 10) === max;
+    preset.classList.toggle('is-selected', selected);
+    preset.setAttribute('aria-pressed', String(selected));
+  });
+}
+
+function formatTinyTilesBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes <= 0) return '';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let scaled = bytes;
+  let unit = 0;
+  while (scaled >= 1024 && unit < units.length - 1) {
+    scaled /= 1024;
+    unit += 1;
+  }
+  const digits = scaled >= 10 || unit === 0 ? 0 : 1;
+  return `${new Intl.NumberFormat('de-DE', { maximumFractionDigits: digits }).format(scaled)} ${units[unit]}`;
+}
+
+function formatTinyTilesDuration(status, state) {
+  const started = Date.parse(status.started_at || '');
+  const finished = Date.parse(status.finished_at || '');
+  if (!Number.isFinite(started)) return '';
+  const until = Number.isFinite(finished) ? finished : state === 'building' ? Date.now() : NaN;
+  if (!Number.isFinite(until) || until <= started) return '';
+  const seconds = Math.round((until - started) / 1000);
+  if (seconds < 60) return `${seconds} Sek.`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return rest ? `${minutes} Min. ${rest} Sek.` : `${minutes} Min.`;
+}
+
+function updateTinyTilesFacts(status, state, facts) {
+  if (!facts) return;
+  const number = new Intl.NumberFormat('de-DE');
+  const entries = [];
+  const sourceBytes = formatTinyTilesBytes(status.source_bytes);
+  const estimatedDisk = formatTinyTilesBytes(status.estimated_disk_bytes);
+  const estimatedTiles = Number(status.estimated_tile_count);
+  const generatedTiles = Number(status.generated_tiles);
+  const roads = Number(status.road_features);
+  const duration = formatTinyTilesDuration(status, state);
+  if (sourceBytes) entries.push(['PBF-Quelle', sourceBytes]);
+  if (estimatedTiles > 0) entries.push(['Geschätzte Kacheln', number.format(estimatedTiles)]);
+  if (estimatedDisk) entries.push(['Geschätzter Speicher', estimatedDisk]);
+  if (generatedTiles > 0) entries.push(['Erzeugte Kacheln', number.format(generatedTiles)]);
+  if (roads > 0) entries.push(['Straßenobjekte', number.format(roads)]);
+  if (duration) entries.push([state === 'building' ? 'Läuft seit' : 'Build-Dauer', duration]);
+  facts.replaceChildren(...entries.map(([label, value]) => {
+    const item = document.createElement('div');
+    const term = document.createElement('dt');
+    const detail = document.createElement('dd');
+    term.textContent = label;
+    detail.textContent = value;
+    item.append(term, detail);
+    return item;
+  }));
+  facts.hidden = entries.length === 0;
 }
 
 function tinyTilesStatusText(status, state) {
@@ -3436,6 +3503,7 @@ function updateTinyTilesUI(rawStatus = {}) {
   if (el.icon) el.icon.textContent = text.icon;
   if (el.title) el.title.textContent = text.title;
   if (el.message) el.message.textContent = text.message;
+  updateTinyTilesFacts(rawStatus, state, el.facts);
   if (el.progress) {
     el.progress.hidden = state !== 'building';
     const rawProgress = Number(rawStatus.progress);
@@ -3545,6 +3613,13 @@ function handleTinyTilesStatus(status) {
   tinyTilesLatestStatus = safeStatus;
   window.tinyTilesLatestStatus = tinyTilesLatestStatus;
   const state = updateTinyTilesUI(safeStatus);
+  if (state === 'ready' && Number.isInteger(safeStatus.min_zoom) && Number.isInteger(safeStatus.max_zoom)) {
+    const min = document.getElementById('tinyTilesMinZoom');
+    const max = document.getElementById('tinyTilesMaxZoom');
+    if (min) min.value = String(safeStatus.min_zoom);
+    if (max) max.value = String(safeStatus.max_zoom);
+  }
+  updateTinyTilesPresetSelection();
   const text = tinyTilesStatusText(safeStatus, state);
   if (tinyTilesLoadRequested && state === 'building') {
     showTileLoadOverlay({
@@ -3727,6 +3802,22 @@ async function startTinyTilesBuild({ postalCodes = false, postalPrefixLength = 3
 }
 
 document.getElementById('tinyTilesBuild')?.addEventListener('click', () => { void startTinyTilesBuild(); });
+
+document.querySelectorAll('.tinytiles-preset').forEach((preset) => {
+  preset.addEventListener('click', () => {
+    const min = Number.parseInt(preset.dataset.tinytilesMin, 10);
+    const max = Number.parseInt(preset.dataset.tinytilesMax, 10);
+    if (!Number.isInteger(min) || !Number.isInteger(max)) return;
+    const minInput = document.getElementById('tinyTilesMinZoom');
+    const maxInput = document.getElementById('tinyTilesMaxZoom');
+    if (minInput) minInput.value = String(min);
+    if (maxInput) maxInput.value = String(max);
+    updateTinyTilesPresetSelection();
+  });
+});
+document.getElementById('tinyTilesMinZoom')?.addEventListener('change', updateTinyTilesPresetSelection);
+document.getElementById('tinyTilesMaxZoom')?.addEventListener('change', updateTinyTilesPresetSelection);
+updateTinyTilesPresetSelection();
 
 document.getElementById('tinyTilesActivate')?.addEventListener('click', async () => {
   try {

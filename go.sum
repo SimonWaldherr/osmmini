@@ -1,7 +1,7 @@
 github.com/Karte-Bayern/tinyTiles/v2 v2.3.0 h1:XtSmX0fCe09ccHKUrrIDszFjzZz6CIxIYurdZ2Mavdo=
 github.com/Karte-Bayern/tinyTiles/v2 v2.3.0/go.mod h1:H2HcoUmrnuuY7mJGZB0+sagDNZ3Gf/XjgHHCedwRDck=
-github.com/SimonWaldherr/tinySQL v0.33.0 h1:9wjzCmhi7nP1zge0Jlfy4wSKL0lVTHsxHkXWW16U4U8=
-github.com/SimonWaldherr/tinySQL v0.33.0/go.mod h1:bsH4bz7giYKBWJBFemtqHQcu1TagAUdokC/RafBC3sM=
+github.com/SimonWaldherr/tinySQL v0.34.0 h1:5nIs5UfrEkfX6sHueVUZzr7XsDvtg5PPtstPEH+5Axo=
+github.com/SimonWaldherr/tinySQL v0.34.0/go.mod h1:u0G4nIU74UD4lUXH12GLYWUWr4E7eDRxsU+45bcWn74=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=
 github.com/dustin/go-humanize v1.0.1/go.mod h1:Mu1zIs6XwVuF/gI1OepvI0qD18qycQx+mFykh5fBlto=
 github.com/google/pprof v0.0.0-20260802141513-ef3492d7dac3 h1:LMLX+LgTNWpfvCBdFebv6EsYotImrt/Ppc5cXIriCSo=

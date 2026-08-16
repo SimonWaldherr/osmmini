@@ -14,6 +14,7 @@ import (
 
 	tinytiles "github.com/Karte-Bayern/tinyTiles/v2"
 	tinytilesserver "github.com/Karte-Bayern/tinyTiles/v2/server"
+	tiles "github.com/SimonWaldherr/tinySQL/tiles"
 )
 
 const (
@@ -38,6 +39,11 @@ type tinyTilesBuildStatus struct {
 	PostalPrefixLength int       `json:"postal_prefix_length,omitempty"`
 	TerritoryLayer     string    `json:"territory_layer,omitempty"`
 	Territories        int       `json:"territories,omitempty"`
+	SourceBytes        int64     `json:"source_bytes,omitempty"`
+	EstimatedDiskBytes int64     `json:"estimated_disk_bytes,omitempty"`
+	EstimatedTileCount int64     `json:"estimated_tile_count,omitempty"`
+	GeneratedTiles     int       `json:"generated_tiles,omitempty"`
+	RoadFeatures       int       `json:"road_features,omitempty"`
 }
 
 type tinyTilesBuildRequest struct {
@@ -88,7 +94,8 @@ func (s *server) handleTinyTilesBuild(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusBadRequest, "ungültiger Zoom-Bereich; unterstützt werden 5 bis 14")
 			return
 		}
-		if info, err := os.Stat(s.pbfPath); err != nil || info.IsDir() {
+		pbfInfo, err := os.Stat(s.pbfPath)
+		if err != nil || pbfInfo.IsDir() {
 			writeJSONError(w, http.StatusBadRequest, "geladene PBF-Datei ist nicht verfügbar")
 			return
 		}
@@ -120,6 +127,7 @@ func (s *server) handleTinyTilesBuild(w http.ResponseWriter, r *http.Request) {
 			MaxZoom:            request.MaxZoom,
 			PostalCodes:        request.PostalCodes,
 			PostalPrefixLength: request.PostalPrefixLength,
+			SourceBytes:        pbfInfo.Size(),
 		}
 		s.tinyTilesBuild = status
 		s.tinyTilesMu.Unlock()
@@ -152,6 +160,9 @@ func (s *server) buildTinyTiles(status tinyTilesBuildStatus) {
 		PostalCodes:     status.PostalCodes,
 		ReplaceExisting: true,
 		Progress: func(progress tinytiles.PBFBuildProgress) {
+			if progress.Import != nil && progress.Import.Estimate != nil {
+				s.updateTinyTilesBuildEstimate(progress.Import.Estimate)
+			}
 			phase, percent, message := tinyTilesPublicBuildProgress(progress)
 			s.updateTinyTilesBuildProgress(phase, percent, message)
 		},
@@ -167,7 +178,7 @@ func (s *server) buildTinyTiles(status tinyTilesBuildStatus) {
 		territoryLayer, territoryCount, err = s.publishPostalTerritories(result.PostalCodesPath, status.PostalPrefixLength)
 	}
 
-	s.finishTinyTilesBuild(filepath.Base(artifact), territoryLayer, territoryCount, err)
+	s.finishTinyTilesBuild(filepath.Base(artifact), territoryLayer, territoryCount, result.GeneratedTiles, result.RoadFeatures, err)
 }
 
 // buildPostalTerritory creates an additional PLZ1–PLZ5 layer from the
@@ -176,10 +187,10 @@ func (s *server) buildTinyTiles(status tinyTilesBuildStatus) {
 func (s *server) buildPostalTerritory(status tinyTilesBuildStatus, postalSidecar string) {
 	s.updateTinyTilesBuildProgress("territories", 20, "OSM-PLZ-Grenzen werden geladen…")
 	territoryLayer, territoryCount, err := s.publishPostalTerritories(postalSidecar, status.PostalPrefixLength)
-	s.finishTinyTilesBuild("", territoryLayer, territoryCount, err)
+	s.finishTinyTilesBuild("", territoryLayer, territoryCount, 0, 0, err)
 }
 
-func (s *server) finishTinyTilesBuild(artifact, territoryLayer string, territoryCount int, err error) {
+func (s *server) finishTinyTilesBuild(artifact, territoryLayer string, territoryCount, generatedTiles, roadFeatures int, err error) {
 	s.tinyTilesMu.Lock()
 	defer s.tinyTilesMu.Unlock()
 	s.tinyTilesBuild.FinishedAt = time.Now().UTC()
@@ -196,6 +207,12 @@ func (s *server) finishTinyTilesBuild(artifact, territoryLayer string, territory
 	s.tinyTilesBuild.Progress = 100
 	s.tinyTilesBuild.TerritoryLayer = territoryLayer
 	s.tinyTilesBuild.Territories = territoryCount
+	if generatedTiles > 0 {
+		s.tinyTilesBuild.GeneratedTiles = generatedTiles
+	}
+	if roadFeatures > 0 {
+		s.tinyTilesBuild.RoadFeatures = roadFeatures
+	}
 	if territoryLayer != "" {
 		s.tinyTilesBuild.Message = fmt.Sprintf("%d %s-Gebiete sind bereit.", territoryCount, territoryLayer)
 	} else {
@@ -204,6 +221,22 @@ func (s *server) finishTinyTilesBuild(artifact, territoryLayer string, territory
 	if artifact != "" {
 		s.tinyTilesBuild.Artifact = artifact
 	}
+}
+
+// updateTinyTilesBuildEstimate records tinySQL's bounded preflight plan. It
+// is safe to expose: the estimate describes aggregate resource use only, not
+// local paths or the PBF's contents.
+func (s *server) updateTinyTilesBuildEstimate(estimate *tiles.ResourceEstimate) {
+	if estimate == nil {
+		return
+	}
+	s.tinyTilesMu.Lock()
+	defer s.tinyTilesMu.Unlock()
+	if s.tinyTilesBuild.State != "building" {
+		return
+	}
+	s.tinyTilesBuild.EstimatedDiskBytes = estimate.EstimatedDisk
+	s.tinyTilesBuild.EstimatedTileCount = estimate.TileCount
 }
 
 // updateTinyTilesBuildProgress records only a small, path-free public status.
@@ -301,6 +334,13 @@ func (s *server) loadTinyTilesIfPresent() {
 		MinZoom:    minZoom,
 		MaxZoom:    maxZoom,
 		FinishedAt: time.Now().UTC(),
+		SourceBytes: func() int64 {
+			info, err := os.Stat(s.pbfPath)
+			if err != nil || info.IsDir() {
+				return 0
+			}
+			return info.Size()
+		}(),
 	}
 	s.tinyTilesMu.Unlock()
 }

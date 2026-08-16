@@ -1447,6 +1447,30 @@ input:-webkit-autofill:focus {
 .tile-source-advanced[hidden] { display: none; }
 
 /* ─── tinyTiles offline build ─── */
+.tinytiles-presets {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin: 12px 0;
+}
+.tinytiles-preset {
+  min-width: 0;
+  padding: 8px;
+  color: var(--text-2);
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--input-bg);
+  transition: border-color .16s var(--ease), background .16s var(--ease), color .16s var(--ease), transform .16s var(--ease);
+}
+.tinytiles-preset:hover { color: var(--text); border-color: rgba(77,163,255,.45); transform: translateY(-1px); }
+.tinytiles-preset:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.tinytiles-preset.is-selected { color: var(--text); border-color: var(--primary); background: var(--primary-dim); }
+.tinytiles-preset strong, .tinytiles-preset span { display: block; min-width: 0; }
+.tinytiles-preset strong { font-size: 11.5px; line-height: 1.3; }
+.tinytiles-preset span { margin-top: 2px; color: var(--text-2); font-size: 10px; line-height: 1.3; }
 .tinytiles-actions {
   display: flex;
   gap: 8px;
@@ -1517,6 +1541,19 @@ input:-webkit-autofill:focus {
   transform: none;
   transition: width .28s var(--ease);
 }
+.tinytiles-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px 12px;
+  margin: 10px 0 0;
+  padding: 9px 10px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--input-bg) 72%, transparent);
+}
+.tinytiles-facts[hidden] { display: none; }
+.tinytiles-facts div { min-width: 0; }
+.tinytiles-facts dt { color: var(--text-2); font-size: 10.5px; line-height: 1.25; }
+.tinytiles-facts dd { margin: 1px 0 0; overflow: hidden; color: var(--text); font-size: 11.5px; font-variant-numeric: tabular-nums; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
 @keyframes tinytilesIndeterminate {
   from { transform: translateX(-110%); }
   to { transform: translateX(260%); }
@@ -1971,6 +2008,8 @@ body.map-welcome-open { overflow: hidden; }
   .tile-source-preview { min-height: 58px; }
   .tinytiles-actions { flex-wrap: wrap; }
   .tinytiles-actions .btn { flex: 1 1 150px; }
+  .tinytiles-presets { grid-template-columns: 1fr; }
+  .tinytiles-facts { grid-template-columns: 1fr; }
   .allowed-highways { grid-template-columns: 1fr 1fr; }
   .speed-defaults { grid-template-columns: 1fr; }
   .toast { bottom: 8px; right: 8px; left: 8px; max-width: none; }

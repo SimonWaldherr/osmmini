@@ -463,6 +463,11 @@
               </div>
               <div id="tinyTilesSettings" style="display:none">
                 <p class="settings-hint">Erzeugt aus der beim Server geladenen OSM-PBF eine lokale Straßen-, Gebäude-, Gewässer- und Landbedeckungskarte. Während des Builds bleibt Routing verfügbar; der Build benötigt freien lokalen Speicher.</p>
+                <div class="tinytiles-presets" role="group" aria-label="Zoom-Voreinstellung für die Offline-Karte">
+                  <button type="button" class="tinytiles-preset" data-tinytiles-min="5" data-tinytiles-max="10"><strong>Übersicht</strong><span>5–10 · klein &amp; schnell</span></button>
+                  <button type="button" class="tinytiles-preset is-selected" data-tinytiles-min="8" data-tinytiles-max="14"><strong>Ausgewogen</strong><span>8–14 · empfohlen</span></button>
+                  <button type="button" class="tinytiles-preset" data-tinytiles-min="10" data-tinytiles-max="14"><strong>Details</strong><span>10–14 · für ein Gebiet</span></button>
+                </div>
                 <div class="settings-grid">
                   <div class="setting-item">
                     <label class="setting-label" for="tinyTilesMinZoom">Minimaler Zoom</label>
@@ -487,6 +492,7 @@
                 <div id="tinyTilesProgress" class="tinytiles-progress" role="progressbar" aria-label="Erzeugung der Offline-Karte" aria-valuemin="0" aria-valuemax="100" aria-valuetext="Nicht gestartet" hidden>
                   <div class="tinytiles-progress-bar"><span></span></div>
                 </div>
+                <dl id="tinyTilesFacts" class="tinytiles-facts" aria-live="polite" hidden></dl>
               </div>
             </div>
 

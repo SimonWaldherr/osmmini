@@ -65,6 +65,28 @@ For a truly offline browser renderer, prepare a PBF extract and vendor
 MapLibre locally once while online (see "Frontend / assets" below, or just
 run `make offline-prep`), then use the **Offline-Karte erzeugen** action in
 the web UI to build the `.ttiles` artifact from the PBF loaded by osmmini.
+
+### Spatial PBF sidecar index
+
+For large source files, create a disk-backed spatial block index once:
+
+```bash
+go run ./cmd pbf-index -pbf europe.osm.pbf
+```
+
+This streams the PBF one block at a time and atomically writes
+`europe.idx`. It records the byte range and node
+extent of each OSMData block, plus the source file's size, timestamp and
+SHA-256. Tools can use it to select the node-bearing blocks for a geographic
+window without another whole-file scan. The index is invalidated when the PBF
+changes and is intentionally disk-backed: it never loads the source PBF into
+RAM. Use `-output /path/to/index.json` to store the sidecar elsewhere.
+
+OSM PBF is not normally a fully spatially indexed container: ways refer to
+nodes that may live in other blocks. The sidecar is therefore the first stage
+of a regional streaming builder; it is safe for node-window discovery, while
+correctly extracting all intersecting ways still needs the follow-up
+disk-backed way/reference stage.
 After preparation, the map UI needs no network connection at all — no CDN,
 no font/glyph service:
 
@@ -114,6 +136,7 @@ Flags
 - `-tile-upstream`: Upstream tile URL template
 - `-tinytiles-dir`: Directory for the generated local `.ttiles` artifact
 - `-tinytiles-max-memory-mb`: Maximum memory (MB) tinyTiles may use while building a `.ttiles` artifact (default `768`); raise this for larger PBF regions
+- `pbf-index -pbf FILE`: Stream `FILE` into a reusable spatial block sidecar; use `-output PATH` to override the sidecar path
 - `-build-ch`: Build experimental Contraction Hierarchies after graph load (default false)
 - `-admin-token`: Optional bearer token (or `OSMMINI_ADMIN_TOKEN`); when set, it is required for settings updates. When unset, settings updates are unauthenticated.
 
