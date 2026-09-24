@@ -589,3 +589,34 @@ test('clearing discovery cancels pending work and removes old markers and result
   assert.equal(h.markers.length, 0);
   assert.equal(h.elements.placeResults.children.length, 0);
 });
+
+test('GPX export escapes labels and contains waypoints, maneuvers and track', () => {
+  const context = vm.createContext({});
+  vm.runInContext(section('function xmlEscape(', "\ndocument.getElementById('exportRoute')"), context);
+  const gpx = context.buildRouteGPX(
+    [{ lat: 48, lng: 12 }, { lat: 48.001, lng: 12.0005 }],
+    {
+      from: { label: 'Café <A&B>', lat: 48, lon: 12 },
+      to: { label: 'Ziel "Nord"', lat: 48.001, lon: 12.0005 },
+      steps: [{ type: 'depart', instruction: 'Losfahren', lat: 48, lon: 12 }],
+    },
+  );
+  assert.match(gpx, /^<\?xml version="1\.0" encoding="UTF-8"\?>\n<gpx version="1\.1"/);
+  assert.match(gpx, /<name>Café &lt;A&amp;B&gt; → Ziel &quot;Nord&quot;<\/name>/);
+  assert.equal((gpx.match(/<wpt /g) || []).length, 2);
+  assert.equal((gpx.match(/<rtept /g) || []).length, 1);
+  assert.equal((gpx.match(/<trkpt /g) || []).length, 2);
+  assert.match(gpx, /<trkpt lat="48\.0010000" lon="12\.0005000">/);
+});
+
+test('GPX export of a trip lists numbered stops and leg maneuvers', () => {
+  const context = vm.createContext({});
+  vm.runInContext(section('function xmlEscape(', "\ndocument.getElementById('exportRoute')"), context);
+  const gpx = context.buildRouteGPX([{ lat: 1, lng: 2 }], {
+    stops: [{ id: 'S1', label: 'Kunde', lat: 1, lon: 2 }],
+    legs: [{ steps: [{ type: 'arrive', instruction: 'Ankunft', lat: 1, lon: 2 }] }],
+  });
+  assert.match(gpx, /<name>1\. Kunde<\/name><type>stop<\/type>/);
+  assert.match(gpx, /<name>Ankunft<\/name>/);
+  assert.match(gpx, /<metadata><name>OSMmini Route<\/name>/);
+});

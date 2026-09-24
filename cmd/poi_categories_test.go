@@ -2,9 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
-	osmmini "simonwaldherr.de/go/osmmini"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+
+	osmmini "simonwaldherr.de/go/osmmini"
 )
 
 func TestPOICategoryPromptBoundariesAndAliases(t *testing.T) {
@@ -117,5 +122,21 @@ func TestPOICategoryCatalogAliasesAndFilters(t *testing.T) {
 				t.Fatalf("AI does not match %s %v", category.ID, filter)
 			}
 		}
+	}
+}
+
+// docs/osm-categories.md lists every category; keep it in sync when adding one.
+func TestPOICategoryDocumentationIsComplete(t *testing.T) {
+	doc, err := os.ReadFile(filepath.Join("..", "docs", "osm-categories.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range poiCategories {
+		if !strings.Contains(string(doc), "| `"+c.ID+"` |") {
+			t.Errorf("docs/osm-categories.md is missing category %q", c.ID)
+		}
+	}
+	if want := fmt.Sprintf("%d Kategorien", len(poiCategories)); !strings.Contains(string(doc), want) {
+		t.Errorf("docs/osm-categories.md must mention %q", want)
 	}
 }

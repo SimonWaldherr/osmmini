@@ -2184,6 +2184,44 @@ document.getElementById('clearRoute')?.addEventListener('click', () => {
   showToast('Route gelöscht', 'info', 1500);
 });
 
+function downloadTextFile(text, filename, type) {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function xmlEscape(value) {
+  return String(value ?? '').replace(/[<>&"']/g, ch => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' })[ch]);
+}
+
+// buildRouteGPX returns GPX 1.1 for the current route: start/stop/end
+// waypoints, the turn-by-turn maneuvers as <rte> and the road geometry as
+// <trk>. Garmin, OsmAnd, Komoot and most GPS apps import this directly.
+function buildRouteGPX(latLngs, meta = {}) {
+  const fromLabel = meta.from?.label || meta.from?.input || '';
+  const toLabel = meta.to?.label || meta.to?.input || '';
+  const name = fromLabel && toLabel ? `${fromLabel} → ${toLabel}` : 'OSMmini Route';
+  const pt = (tag, lat, lon, inner = '') => `<${tag} lat="${Number(lat).toFixed(7)}" lon="${Number(lon).toFixed(7)}">${inner}</${tag}>`;
+  const wpts = [];
+  if (meta.from) wpts.push(pt('wpt', meta.from.lat, meta.from.lon, `<name>${xmlEscape(fromLabel || 'Start')}</name><type>start</type>`));
+  (meta.stops || []).forEach((st, i) => wpts.push(pt('wpt', st.lat, st.lon, `<name>${xmlEscape(`${i + 1}. ${st.label || st.id || ''}`)}</name><type>stop</type>`)));
+  if (meta.to) wpts.push(pt('wpt', meta.to.lat, meta.to.lon, `<name>${xmlEscape(toLabel || 'Ziel')}</name><type>end</type>`));
+  const steps = Array.isArray(meta.steps) ? meta.steps : (meta.legs || []).flatMap(leg => leg.steps || []);
+  const rte = steps.length
+    ? `  <rte><name>${xmlEscape(name)}</name>\n${steps.map(st => '    ' + pt('rtept', st.lat, st.lon, `<name>${xmlEscape(st.instruction)}</name><type>${xmlEscape(st.type)}</type>`)).join('\n')}\n  </rte>\n`
+    : '';
+  const trkpts = latLngs.map(c => '      ' + pt('trkpt', c.lat, c.lng)).join('\n');
+  return '<?xml version="1.0" encoding="UTF-8"?>\n'
+    + '<gpx version="1.1" creator="osmmini" xmlns="http://www.topografix.com/GPX/1/1">\n'
+    + `  <metadata><name>${xmlEscape(name)}</name><time>${new Date().toISOString()}</time></metadata>\n`
+    + wpts.map(w => '  ' + w + '\n').join('')
+    + rte
+    + `  <trk><name>${xmlEscape(name)}</name>\n    <trkseg>\n${trkpts}\n    </trkseg>\n  </trk>\n</gpx>\n`;
+}
+
 document.getElementById('exportRoute')?.addEventListener('click', () => {
   if (!polyline) {
     showToast('Keine Route zum Exportieren', 'error', 2000);
@@ -2198,20 +2236,23 @@ document.getElementById('exportRoute')?.addEventListener('click', () => {
     },
     properties: {
       name: 'OSMmini Route',
-      distance_m: document.getElementById('detailDistance')?.textContent || '',
-      duration: document.getElementById('detailDuration')?.textContent || '',
-      engine: document.getElementById('detailEngine')?.textContent || '',
+      distance_m: currentRouteMeta?.distance_m ?? '',
+      duration_s: currentRouteMeta?.duration_s ?? '',
+      engine: currentRouteMeta?.engine || document.getElementById('detailEngine')?.textContent || '',
       timestamp: new Date().toISOString()
     }
   };
-  const blob = new Blob([JSON.stringify(geojson, null, 2)], {type: 'application/json'});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `osmmini-route-${Date.now()}.geojson`;
-  a.click();
-  URL.revokeObjectURL(url);
+  downloadTextFile(JSON.stringify(geojson, null, 2), `osmmini-route-${Date.now()}.geojson`, 'application/geo+json');
   showToast('Route als GeoJSON exportiert', 'success', 2000);
+});
+
+document.getElementById('exportRouteGPX')?.addEventListener('click', () => {
+  if (!polyline) {
+    showToast('Keine Route zum Exportieren', 'error', 2000);
+    return;
+  }
+  downloadTextFile(buildRouteGPX(polyline.getLatLngs(), currentRouteMeta || {}), `osmmini-route-${Date.now()}.gpx`, 'application/gpx+xml');
+  showToast('Route als GPX exportiert (für Navi & GPS-Apps)', 'success', 2200);
 });
 
 // --- Agent action executor ---

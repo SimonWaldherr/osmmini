@@ -2,114 +2,117 @@
 
 [![DOI](https://zenodo.org/badge/1116409323.svg)](https://doi.org/10.5281/zenodo.18929953)
 
-Lightweight, open source offline routing server and web UI using OSM PBF
-extracts, designed for regional and offline use.
+OSMmini is an open-source routing server and map web UI that can run fully
+offline. It builds its routing graph, address search and POI index from one
+OpenStreetMap PBF extract, so it works for a single region without any external
+service.
 
-![](https://simonwaldherr.de/gh-pages/osmmini.png)
+![OSMmini web UI](https://simonwaldherr.de/gh-pages/osmmini.png)
 
-Features
+**Contents:**
+[Features](#features) ·
+[Quick start](#quick-start) ·
+[Map profiles](#map-profiles) ·
+[Large PBF files](#large-pbf-files) ·
+[Web UI guide](#web-ui-guide) ·
+[HTTP API](#http-api) ·
+[Command-line tools](#command-line-tools) ·
+[Configuration](#configuration) ·
+[Production](#running-in-production) ·
+[Development](#development)
 
-- Build a routing graph from an OSM PBF and serve offline routes via HTTP API
-- Multiple routing engines: `astar`, `dijkstra`, `dijkstra-node` (node-only Dijkstra)
-- Map-first web UI (MapLibre GL) in `cmd/web` with floating place search, nearby categories, and separate discovery, routing and tools views
-- Search results can be opened on the map or used directly as an exact route destination; responsive bottom panel on mobile
-- Fixed search header, compact map view and expandable mobile panels; Ctrl/Cmd+K focuses search
-- Multiline assistant input: Enter sends, Shift+Enter inserts a newline
-- Trip solver, settings and turn-by-turn maneuvers
-- Global raster map profile plus official BayernAtlas vector and WMTS presets
-- Local tinyTiles vector profile for an optional fully offline basemap
-- Tile proxy with a source-namespaced local cache for proxied sources
+## Features
 
-Requirements
+**Routing and trips**
+- Routing engines `astar`, `dijkstra` and `dijkstra-node`, optimising for
+  distance or duration, with turn-by-turn directions
+- Trip solver for up to 60 stops with dependencies ("A before B") and vehicle
+  capacity; up to 16 stops are solved exactly
+- **Route export as GPX** (for sat navs and GPS apps) **or GeoJSON** (for GIS
+  tools), available in the UI, through the API and on the command line
 
-- Go 1.26.5+
-- An OSM PBF extract (e.g. `region.osm.pbf`)
+**Search and maps**
+- Address, street and POI search with German and English category aliases
+  ([category catalog](docs/osm-categories.md))
+- Map-first MapLibre GL UI with a mobile layout and a keyboard shortcut
+  (<kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>K</kbd>) to focus search
+- Offline vector basemap generated from your PBF (tinyTiles) with adjustable
+  styles; alternatively, OSM raster, BayernAtlas vector/WMTS or your own
+  MBTiles/GeoTIFF
 
-Quick start
+**GIS and field work**
+- POI export (viewport or radius) as GeoJSON and distance measurement
+- Import of GeoJSON, KML/KMZ and Shapefile layers; territory layers with lookup
+  and CSV assignment
+- OSM-Edit: a draft editor for nodes, ways and relations that exports `.osc`
+  change files and never uploads anything itself
+- Delivery-proof, maintenance and status log with barcode scanning and CSV
+  export
+- Emergency mode: fire hydrants, fire stations with vehicle rosters, and
+  confidential objects that never leave the server
 
-1. Build or run the server (example):
+## Quick start
 
-```bash
-go run ./cmd -pbf region.osm.pbf
-```
-
-2. Open the web UI: http://localhost:8080/
-
-The included [`settings.json`](settings.json) is the global profile. It loads
-the standard OpenStreetMap raster map directly in the browser, so it works
-inside and outside Bavaria without routing public OSM tiles through this
-server. The map is global; routing, address search and local POIs are limited
-to the PBF extract you loaded.
-
-Category filters and local AI search share a [documented OSM category catalog](cmd/docs/osm-categories.md), including German/English aliases and alternative healthcare, forest and swimming tags.
-
-## Bavaria profile
-
-For a Bavaria-focused deployment, use the included
-[`settings.bayern.json`](settings.bayern.json). It uses the official Bayern
-vector map and automatically falls back to official Bayern WMTS when WebGL or
-MapLibre is unavailable:
-
-```bash
-OSMMINI_ADMIN_TOKEN='choose-a-secret' go run ./cmd \
-  -pbf bayern.osm.pbf \
-  -settings settings.bayern.json
-```
-
-This visual basemap is regional. Keep the global profile or select another
-global preset when users should browse outside Bavaria.
-
-The default map uses the local tinyTiles style; generate its tiles with
-**Offline-Karte erzeugen** after loading a PBF. Online sources remain available
-in settings. The offline style distinguishes road classes and paths, while
-local labels are spread across the viewport and hidden when they overlap.
-
-Under **Einstellungen → Offline-Karte → Kartenstil anpassen**, choose Natur,
-Atlas, Nacht, or Hoher Kontrast, or customize colors, road width, label size,
-and the visibility of buildings, paths, and labels. Changes preview immediately
-on the local map; **Stil speichern** keeps them in this browser's local storage.
-Online sources are unaffected and no tile rebuild is needed.
-
-## Fully offline tinyTiles profile
-
-[`settings.tinytiles.json`](settings.tinytiles.json) activates osmmini's
-integrated tinyTiles endpoint. The built-in tinyTiles generator creates local
-vector tiles for roads, buildings, water, forest and agricultural land;
-osmmini serves both the tiles and matching local MapLibre style.
-
-For a truly offline browser renderer, prepare a PBF extract and vendor
-MapLibre locally once while online (see "Frontend / assets" below, or just
-run `make offline-prep`), then use the **Offline-Karte erzeugen** action in
-the web UI to build the `.ttiles` artifact from the PBF loaded by osmmini.
-
-### Spatial PBF sidecar index
-
-For large source files, create a disk-backed spatial block index once:
+**Requirements:** Go 1.26.5+, Node.js (only for the JS tests), `curl`, and an OSM
+PBF extract, for example from [Geofabrik](https://download.geofabrik.de/).
 
 ```bash
-go run ./cmd pbf-index -pbf europe.osm.pbf
+# 1. Download a PBF and the pinned MapLibre assets (one-off, needs network):
+make offline-prep GEOFABRIK_URL='https://download.geofabrik.de/europe/germany/bayern/niederbayern-latest.osm.pbf'
+
+# 2. Start the server:
+make run                     # same as: go run -tags=sqliteimport ./cmd -pbf region.osm.pbf
+
+# 3. Open http://localhost:8080/
 ```
 
-This streams the PBF one block at a time and atomically writes
-`europe.idx`. It records the byte range and node
-extent of each OSMData block, plus the source file's size, timestamp and
-SHA-256. Tools can use it to select the node-bearing blocks for a geographic
-window without another whole-file scan. The index is invalidated when the PBF
-changes and is intentionally disk-backed: it never loads the source PBF into
-RAM. Use `-output /path/to/index.json` to store the sidecar elsewhere.
+The default profile ([`settings.json`](settings.json)) uses the local offline
+map. Build it once with **Einstellungen → Offline-Karte erzeugen**. After that,
+the map is available without a network connection. Routing, search and POIs
+work as soon as the graph is loaded (see the log line `Graph ready: …`).
 
-OSM PBF is not normally a fully spatially indexed container: ways refer to
-nodes that may live in other blocks. The sidecar is therefore the first stage
-of a regional streaming builder; it is safe for node-window discovery, while
-correctly extracting all intersecting ways still needs the follow-up
-disk-backed way/reference stage.
+`osmmini help` lists all commands and flags, and `osmmini version` prints the
+build version.
 
-### Large PBF: regional import for routing, search, and offline maps
+## Map profiles
 
-Use a large source PBF as the archive and create a complete regional PBF for
-the area currently needed. This keeps the server's routing graph, address
-search, POI index and tinyTiles input bounded to that region, while the large
-source remains available for further on-demand regions:
+| Profile | Start | Basemap |
+| --- | --- | --- |
+| Default | `make run` | Local tinyTiles vector map (offline). OSM raster and other presets can be selected in the settings |
+| Bavaria | `make bayern ADMIN_TOKEN=… BAYERN_PBF=bayern.osm.pbf` | Official BayernAtlas vector map. It falls back automatically to BayernAtlas WMTS when WebGL is unavailable. This map only covers Bavaria |
+| Fully offline | `make offline ADMIN_TOKEN=… PBF=region.osm.pbf` | tinyTiles only, no online source |
+
+The map can be global, but routing, address search and POIs always cover only
+the PBF you loaded.
+
+### Offline map (tinyTiles)
+
+**Offline-Karte erzeugen** builds the `.ttiles` artifact from the loaded PBF.
+It includes roads by class, paths, buildings, water, forest and farmland. The
+artifact is stored in `offline-tiles/basemap.ttiles` and is loaded again
+automatically after a restart. If the same value was passed as `-admin-token`,
+first enter it under **Einstellungen → Administrationsschutz**.
+
+- **Style:** **Einstellungen → Offline-Karte → Kartenstil anpassen** has the
+  presets Natur, Atlas, Nacht and Hoher Kontrast. You can also change colours,
+  road width, label size and which layers are shown. Changes are previewed
+  immediately and saved in the browser, and the tiles do not need to be
+  rebuilt.
+- **Waterways:** a separate local sidecar adds rivers and canals from zoom 7,
+  streams from zoom 11 and drainage details from zoom 13. Existing artifacts are
+  upgraded in the background at startup if the PBF has not changed.
+- **Postcodes:** if the build includes postcode boundaries, you can query them
+  with `GET /tinytiles/postcode/search?q=940`, `/tinytiles/postcode/94032` and
+  `/tinytiles/postcode/at?lon=13.46&lat=48.57`.
+- Complex multipolygon areas need a more detailed tile generator.
+
+For a truly offline browser, the MapLibre assets must be present locally
+(`make maplibre-assets`). OSMmini never loads them from a CDN.
+
+## Large PBF files
+
+Load a regional extract rather than a whole country or continent. The routing
+graph, POI index and offline map then stay small:
 
 ```bash
 go run ./cmd region-extract \
@@ -117,300 +120,350 @@ go run ./cmd region-extract \
   -bbox 11.7,47.8,14.3,49.3 \
   -output regions/niederbayern.osm.pbf
 
-go run ./cmd -pbf regions/niederbayern.osm.pbf -settings settings.tinytiles.json
+go run ./cmd -pbf regions/niederbayern.osm.pbf
 ```
 
-`region-extract` builds or reuses `germany-latest.idx` by default, then calls
-the separately installed [`osmium`](https://osmcode.org/osmium-tool/) streaming
-extractor with its `complete_ways` strategy. That preserves ways crossing PBF
-block boundaries, so every existing osmmini feature works against the regional
-PBF. Use `-index=false` to skip sidecar creation, or create another regional
-PBF later for a different area. A matching existing regional PBF is reused
-instantly; use `-reuse=false` to force replacement. `osmium` is an external
-command-line tool and must be installed on the machine that performs
-extraction.
-After preparation, the map UI needs no network connection at all — no CDN,
-no font/glyph service:
+`region-extract` requires the external tool
+[`osmium`](https://osmcode.org/osmium-tool/). It uses the `complete_ways`
+strategy, so ways that cross PBF block boundaries are kept in full. By default
+it creates or reuses the spatial sidecar index `germany-latest.idx`
+(`-index=false` skips this). A matching regional PBF that already exists is
+reused (`-reuse=false` forces a rebuild).
+
+The sidecar index can also be created on its own:
 
 ```bash
-# One-shot: download a Geofabrik PBF extract and vendor MapLibre locally,
-# both while online, so the running server needs no further network access:
-make offline-prep GEOFABRIK_URL='https://download.geofabrik.de/europe/germany/bayern-latest.osm.pbf'
-
-OSMMINI_ADMIN_TOKEN='choose-a-secret' go run ./cmd \
-  -pbf region.osm.pbf \
-  -settings settings.tinytiles.json \
-  -listen :8080
+go run ./cmd pbf-index -pbf europe.osm.pbf   # writes europe.idx
 ```
 
-Enter the same value once in **Einstellungen → Administrationsschutz**, then
-start **Offline-Karte erzeugen**. The resulting artifact is kept in
-`offline-tiles/basemap.ttiles` and is restored automatically after a restart.
+The indexer streams the PBF one block at a time without loading it into memory.
+For each block it records the byte range and node extent, together with the
+file's size, timestamp and SHA-256. The index becomes invalid when the PBF
+changes. Because ways reference nodes in other blocks, the index only selects
+node blocks. Extracting complete ways still happens in `region-extract`.
 
-The source is also available as **tinyTiles lokal (offline)** in the
-map-source selector. Alongside the compact tile artifact, osmmini generates a
-local, viewport-bounded vector sidecar for open OSM waterways: rivers and
-canals appear from zoom level 7, streams from 11, and drainage details from
-13. This avoids a full regional GeoJSON download in the browser while filling
-the main gap of the minimal renderer. Complex multipolygon areas still require
-a richer tileset generator.
+## Web UI guide
 
-Existing offline artifacts are upgraded in the background on the next server
-start when their source PBF is unchanged; otherwise, start **Offline-Karte
-erzeugen** once to create a matching pair. The companion layer is specific to
-the osmmini map UI and deliberately remains separate from the upstream
-tinyTiles/TileJSON artifact.
+### Routes and trips
 
-When the offline build includes PLZ boundaries, tinyTiles also exposes a
-local, cacheable postcode API: `GET /tinytiles/postcode/search?q=940`, `GET
-/tinytiles/postcode/94032`, and `GET /tinytiles/postcode/at?lon=13.46&lat=48.57`.
-It reads the generated sidecar only and never loads the PBF again.
+Enter a start and destination (an address, a POI, `lat,lon`, or a click on the
+map) and add stops as needed. With **Reihenfolge optimieren** switched on,
+OSMmini calculates the best order of the stops. Once a
+route has been calculated, these actions are available:
 
-## Make targets
+- **Einpassen / Löschen**: fit the route to the map or remove it
+- **GeoJSON**: a LineString with distance and duration, for QGIS, uMap and
+  similar tools
+- **GPX**: start, stops and destination as waypoints, the turn-by-turn
+  directions as `<rte>` and the exact road geometry as `<trk>`. It can be
+  imported into Garmin devices, OsmAnd, Komoot, Locus and most GPS apps
+- links for handing the route over to Google Maps or Apple Maps
+
+### GIS & Geo-Werkzeuge
+
+- Search POIs in the viewport or within 1–50 km of the map centre, filter them
+  by name or category, and download them as GeoJSON. The UI shows at most 320
+  points; the API returns up to 1,000.
+- **Strecke messen**: draw a polyline independently of the route. The result is
+  the sum of great-circle distances, not a driving distance or survey
+  measurement.
+- **Importieren**: GeoJSON, KML/KMZ and Shapefile ZIPs become map layers.
+  Polygon layers are also available as territory layers. Admins can use one
+  MBTiles or GeoTIFF file as an extra map source.
+
+### OSM-Edit (draft editor)
+
+OSM-Edit never uploads anything. Drafts stay in the browser (`localStorage`)
+and can only be exported as an `.osc` change file or a `.json` backup for manual
+upload in a full OSM editor.
+
+1. **Finden**: select a place on the map, search for one, add a point, or draw
+   a way or area. New vertices snap to existing ones.
+2. **Bearbeiten**: typed fields for each place type, hints for common mistakes,
+   a change summary and the full tag table. For ways, the editor can move
+   vertices (**Punkte bearbeiten**), split a way (**Weg teilen**) and join two
+   ways (**Mit Weg-ID verbinden**). <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>S</kbd>
+   saves.
+3. **Entwürfe**: undo/redo, compare with the current OSM state, export. If an
+   object has changed on OSM in the meantime, the export is blocked.
+4. **Relationen**: create a relation or load one by ID, reorder members and
+   edit their roles.
+
+Objects marked **vertraulich speichern** (for example fire-brigade internals or
+access information) are stored only on the server, in
+`confidential-objects.json`. They never appear in an OSM export, and they
+require `-admin-token`.
+
+Place types are defined in `cmd/web/osm-presets.js`; validation, topology and
+export logic is in `cmd/web/osm-editor.js`.
+
+### Zustellung & Wartung (log)
+
+This local audit log is designed for mobile use:
+
+- **Zustellnachweis**: barcode/QR code or object ID, recipient, reference, time
+  and optional GPS position
+- **Wartung**: work type, status and the person who did the work
+- **Lage & Check**: availability, damage or closures of resources and operation
+  sectors
+
+Camera scanning uses the browser's `BarcodeDetector`, and manual entry always
+works. Entries can be filtered and exported as CSV. When the connection drops,
+the browser queues entries and sends them on the next contact.
+
+How the data is stored depends on `-deployment-mode`:
+
+| Mode | Storage | Suitable for |
+| --- | --- | --- |
+| `browser-local` | Only the browser's `localStorage`, exported as CSV | Single offline laptop or phone |
+| `single-user` (default) | `operations.json` on the server, protected by `-admin-token` if set | One user or a trusted team |
+| `multi-user` | Central history with a personal token for each operator, who is recorded in every entry | Teams |
 
 ```bash
-make help
-make run PBF=region.osm.pbf
-make bayern BAYERN_PBF=bayern.osm.pbf ADMIN_TOKEN='choose-a-secret'
-make offline PBF=region.osm.pbf ADMIN_TOKEN='choose-a-secret'
-make maplibre-assets
-make pbf-download GEOFABRIK_URL='https://download.geofabrik.de/europe/germany/bayern-latest.osm.pbf'
-make offline-prep
-make check
-```
-
-By default the server runs with settings updates open (no token needed) so it
-works out of the box. `make bayern` and `make offline` deliberately still
-require an admin token as a safety net for these more public-facing profiles;
-set `-admin-token` (or `OSMMINI_ADMIN_TOKEN`) yourself whenever a deployment
-should require a token before accepting settings writes.
-
-### Zustellnachweis und Wartungsprotokoll
-
-**Zustellung & Wartung** führt einen lokalen, mobil nutzbaren Audit-Log. Für
-einen Zustellnachweis werden Barcode/QR-Code oder eine Objekt-ID, empfangende
-Person, Referenz, Zeit und optional die aktuelle Position erfasst. Für
-Wartungen werden Arbeitstyp, Status und durchführende Person ergänzt. Der
-Modus **Lage & Check** hält außerdem Verfügbarkeit, Schäden oder Sperrungen
-von Ressourcen und Einsatzabschnitten fest. Der Kamera-Scan verwendet die
-eingebaute `BarcodeDetector`-Schnittstelle des Browsers; falls sie nicht
-verfügbar ist, funktioniert die manuelle Eingabe vollständig weiter.
-
-Die Einträge werden atomar in `operations.json` gespeichert, sind über die
-Historie filterbar und als CSV exportierbar. Bei temporärer fehlender
-Verbindung merkt der Browser fertige Einträge lokal vor und überträgt sie beim
-nächsten Kontakt. Sobald `-admin-token` gesetzt ist, schützt derselbe Token
-auch Lesen und Schreiben des Protokolls.
-
-### Betriebsarten
-
-`-deployment-mode` trennt die Datenhaltung klar nach Einsatzumgebung:
-
-- `browser-local`: Zustell-, Wartungs- und Lageprotokolle bleiben im
-  `localStorage` des Browsers. Das eignet sich für einen einzelnen, offline
-  arbeitenden Laptop oder ein Mobilgerät; CSV exportiert die Daten.
-- `single-user` (Standard): Die lokale Serverdatei `operations.json` ist die
-  dauerhafte Historie. Ein gesetzter `-admin-token` schützt sie.
-- `multi-user`: Eine zentrale Historie für ein Team. Jede Protokollanfrage
-  benötigt einen eigenen Bearbeiter-Token; der Server leitet den Bearbeitenden
-  aus dem Token ab und speichert ihn im Audit-Eintrag. Startbeispiel:
-
-```bash
-cp operators.example.json operators.json
-# Tokens durch lange, zufällige Werte ersetzen und die Datei schützen.
+cp operators.example.json operators.json   # replace the tokens with long random values
 go run ./cmd -deployment-mode multi-user -operators-file operators.json
 ```
 
-`operators.json` wird nicht versioniert. Für externe Bereitstellung gehören
-TLS, ein Reverse Proxy und eine sichere Verteilung der persönlichen Tokens
-vor den Server.
+### Emergency mode (Einsatzmodus)
 
-Flags
+Map overlays for fire hydrants (`emergency=fire_hydrant`) and fire stations.
+Stations can be enriched with vehicle rosters (call sign, equipment) manually or
+by CSV import. The rosters are stored only locally in `fire-stations.json`.
 
-- `-pbf`: Path to OSM PBF (default `region.osm.pbf`)
-- `-listen`: HTTP listen address (default `:8080`)
-- `-tiles-dir`: Tile cache directory
-- `-tile-upstream`: Upstream tile URL template
-- `-tinytiles-dir`: Directory for the generated local `.ttiles` artifact
-- `-tinytiles-max-memory-mb`: Maximum memory (MB) tinyTiles may use while building a `.ttiles` artifact (default `768`); raise this for larger PBF regions
-- `-tinytiles-readers`: Concurrent readers for a served offline map (default `4`)
-- `-tinytiles-reader-memory-mb`: tinySQL page-cache memory per reader while serving (default `32`); the aggregate reader budget is this value times `-tinytiles-readers`
-- `-tinytiles-tile-cache-mb`: Hot immutable tile cache in tinyTiles 2.4 (default `64`; use `-1` to disable it)
-- `-operations-file`: Local JSON file for delivery proofs and maintenance records (default `operations.json`)
-- `-deployment-mode`: `browser-local`, `single-user` (default) or `multi-user`
-- `-operators-file`: JSON map of operator name to token; required in `multi-user` mode
-- `pbf-index -pbf FILE`: Stream `FILE` into a reusable spatial block sidecar; use `-output PATH` to override the sidecar path
-- `region-extract -pbf FILE -bbox minLon,minLat,maxLon,maxLat -output REGION.osm.pbf`: Create a complete, streaming regional PBF for routing, search, and tinyTiles; uses `osmium`
-- `-build-ch`: Build experimental Contraction Hierarchies after graph load (default false)
-- `-admin-token`: Optional bearer token (or `OSMMINI_ADMIN_TOKEN`); when set, it is required for settings updates. When unset, settings updates are unauthenticated.
+## HTTP API
 
-## Project structure and development checks
+The full specification is in [`cmd/api/openapi.yaml`](cmd/api/openapi.yaml), and
+the server also serves it at `/api/v1/openapi.yaml`. Coordinates in GeoJSON are
+always `[lon, lat]`.
 
-- The root Go package provides streaming OSM extraction (`extract.go`), the
-  routing graph, address search and maneuvers (`router.go`), and territory and
-  dispatch calculations (`territory*.go`, `dispatch.go`).
-- `cmd/main.go` assembles the server, HTTP API, settings, search and trip solver.
-  Feature-specific handlers live beside it; `cmd/route_cache.go` contains the
-  bounded route-response cache and its expiry lifecycle.
-- `cmd/tinytiles*.go`, `cmd/offline_labels.go` and `cmd/pbf_index.go` provide
-  offline map generation, viewport overlays and PBF sidecar integration.
-- `cmd/web/index.html`, `app.js` and `style.css` form the embedded browser UI.
-  MapLibre assets are vendored separately. Search and route requests cancel
-  superseded work and discard late responses, including after a reset.
-- `cmd/api/openapi.yaml` documents the API; `cmd/docs` serves its viewer.
-  `cmd/wasm` and `cmd/export-graph` provide the separate browser-routing tools.
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/v1/health` | Liveness check (`{"ok":true}`) |
+| `GET /api/v1/status` | Version, uptime, graph size, bounds, cache statistics |
+| `GET /api/v1/search?q=…&limit=…` | Address, street and POI search |
+| `POST /api/v1/route[?format=gpx\|geojson]` | Route between two locations |
+| `POST /api/v1/trip/solve[?format=gpx\|geojson]` | Multi-stop trip, optionally optimised |
+| `GET /api/v1/geo/pois` | POIs as GeoJSON (`bbox` or `lat`/`lon`/`radius_m`, `category`, `q`, `limit`) |
+| `POST /api/v1/geo/measure` | Great-circle length of a polyline |
+| `GET /api/v1/poi/{id}` | Details and tags for a POI |
+| `GET /api/v1/territories[/{layer}]` | Loaded territory layers |
+| `GET\|POST /api/v1/operations` | Delivery/maintenance log |
+| `GET\|PUT /api/v1/settings` | Settings (writing requires `-admin-token` if set) |
+| `POST /api/v1/tinytiles/build` | Build the offline map |
 
-Run `make check` for Go tests, static analysis, a server build, JavaScript
-syntax validation and browser interaction regression tests. This requires Go
-and Node.js. The test and build targets verify the pinned local MapLibre assets
-and download them with `make maplibre-assets` when they are missing or have a
-different checksum, so a first `make check` also needs network access. The
-JavaScript tests use Node's built-in test runner with a small
-DOM/network harness, without downloading dependencies or map tiles. They
-cover request ordering, cancellation, repeated searches and waypoint reset.
-Run `make test-race` to check concurrent Go access, or `make test-js` to run
-only the browser regression tests.
-
-For a reproducible cache-capacity benchmark:
+### Examples
 
 ```bash
-go test ./cmd -run '^$' -bench '^BenchmarkRouteCacheEviction$' -benchmem
+# Search
+curl 'http://localhost:8080/api/v1/search?q=Rathaus%20Passau&limit=5'
+
+# Route as JSON; "from"/"to" accept {"lat","lon"} or {"query": "address"}
+curl -X POST http://localhost:8080/api/v1/route \
+  -H 'Content-Type: application/json' \
+  -d '{"from":{"query":"Passau Hauptbahnhof"},"to":{"lat":48.5667,"lon":13.4319}}'
+
+# The same route as a GPX file for a sat nav
+curl -X POST 'http://localhost:8080/api/v1/route?format=gpx' \
+  -H 'Content-Type: application/json' \
+  -d '{"from":{"query":"Passau Hauptbahnhof"},"to":{"lat":48.5667,"lon":13.4319}}' \
+  -o route.gpx
+
+# Optimised trip as GeoJSON (route + numbered stops)
+curl -X POST 'http://localhost:8080/api/v1/trip/solve?format=geojson' \
+  -H 'Content-Type: application/json' \
+  -d '{"plan":{"start":{"lat":48.574,"lon":13.46},"loop":true,"optimize":true,
+       "stops":[{"id":"A","location":{"lat":48.56,"lon":13.43}},
+                {"id":"B","location":{"lat":48.58,"lon":13.48}}]}}' \
+  -o tour.geojson
+
+# POIs within 5 km, filtered by category (German aliases work too)
+curl 'http://localhost:8080/api/v1/geo/pois?lat=48.57&lon=13.46&radius_m=5000&category=Apotheke'
 ```
 
-This measures inserting into a full 4,096-entry route cache, excluding fixture
-setup. It measures cache maintenance rather than pathfinding or PBF import.
+GPX responses use `application/gpx+xml`, GeoJSON responses use
+`application/geo+json`, and both come with `Content-Disposition: attachment`.
+An unknown `format` returns `400`.
 
-## GIS tools
+## Command-line tools
 
-Open **GIS & Geo-Werkzeuge** in the sidebar to search POIs in the viewport or
-within 1–50 km of the map centre, filter by name/category, and download the
-shown results as GeoJSON. The UI shows at most 320 points and reports when the
-result is truncated. API callers can request up to 1,000 points:
+All tools are subcommands of the same binary (`go run ./cmd <command>` or
+`bin/osmmini <command>`). `osmmini <command> -h` shows their flags.
+
+| Command | Purpose |
+| --- | --- |
+| `route` | Calculate a route directly from the PBF and print it as JSON, GPX or GeoJSON |
+| `territories load` / `territory lookup` | Check a territory layer, or find the territory for a coordinate |
+| `dispatch assign` / `dispatch manifests` | Assign CSV addresses to territories, or write one manifest per group |
+| `geodata import` | Import GeoJSON, KML/KMZ or Shapefile as a layer |
+| `pbf-index` / `region-extract` | Tools for [large PBF files](#large-pbf-files) |
+| `version` / `help` | Show the version / overview |
+
+```bash
+# Route as GPX without a running server
+go run ./cmd route -pbf region.osm.pbf -from 48.574,13.460 -to 48.567,13.432 -format gpx > route.gpx
+
+# Which delivery zone is a coordinate in?
+go run ./cmd territory lookup -layer delivery -lat 48.65 -lon 12.65 \
+  -territories testdata/territory/delivery-zones.geojson
+
+# Assign parcels (CSV with the columns parcel_id, lat, lon) to delivery zones
+go run ./cmd dispatch assign -territories testdata/territory/delivery-zones.geojson \
+  -input parcels.csv -output assignments.csv
+```
+
+The root Go package can also be used as a library for streaming OSM extraction
+and routing; see [`example/main.go`](example/main.go).
+
+## Configuration
+
+### Server flags
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `-pbf` | `region.osm.pbf` | OSM PBF for the graph, search and POIs |
+| `-listen` | `:8080` | HTTP address |
+| `-settings` | `settings.json` | Settings file (profile) |
+| `-admin-token` | `$OSMMINI_ADMIN_TOKEN` | Bearer token for writing settings, offline-map builds, imports and confidential objects. Without it, settings can be changed without authentication |
+| `-deployment-mode` | `single-user` | `browser-local`, `single-user` or `multi-user` |
+| `-operators-file` | – | Operator tokens (required for `multi-user`) |
+| `-operations-file` | `operations.json` | Delivery/maintenance log |
+| `-confidential-objects-file` | `confidential-objects.json` | Confidential editor objects |
+| `-tiles-dir` / `-tile-upstream` | `tiles-cache` / – | Cache and upstream for proxied raster tiles |
+| `-tinytiles-dir` | `offline-tiles` | Directory for the offline map |
+| `-tinytiles-max-memory-mb` | `768` | Memory limit when building the offline map; raise it for large regions |
+| `-tinytiles-readers` | `4` | Concurrent readers of the offline map |
+| `-tinytiles-reader-memory-mb` | `32` | Page cache per reader |
+| `-tinytiles-tile-cache-mb` | `64` | Hot-tile cache (`-1` = off) |
+| `-territories-dir` | `territories` | `*.geojson` territory layers (file name = layer name) |
+| `-imported-layers-dir` | `imported-layers` | Layers created by GIS imports |
+| `-geodata-tiles-dir` | `geodata-tiles` | Imported MBTiles/GeoTIFF map source |
+| `-window` | – | Load only the window `minLat,maxLat,minLon,maxLon` from the PBF |
+| `-window-buffer-m` | `0` | Buffer around `-window` in metres |
+| `-enforce-window` | `false` | Reject requests outside `-window` |
+| `-build-ch` | `false` | Experimental contraction hierarchies |
+
+### Settings file
+
+The settings file holds the routing defaults (`routing`: engine, objective,
+turn penalties, vehicle height and weight), the map source (`tiles`), optional
+AI endpoints (`ai`) and `default_highway_speeds` (km/h per `highway` type, as
+overrides of the built-in values). Most of these values can also be changed in
+the UI under **Einstellungen**. `allowed_highway_types` is applied only when the
+graph is built and requires a restart.
+
+The local assistant automatically detects [Ollama](https://ollama.com/)
+(`localhost:11434`) or LM Studio (`localhost:1234`). You can also configure any
+OpenAI-compatible endpoint with `ai.openai_base_url` and `ai.openai_api_key`.
+
+### Make targets
 
 ```text
-GET /api/v1/geo/pois?bbox=12.0,48.0,12.5,48.5&category=cafe
-GET /api/v1/geo/pois?lat=48.7&lon=12.7&radius_m=5000&limit=100
-POST /api/v1/geo/measure
-{"coordinates":[[12.7,48.7],[12.71,48.71]]}
+make help                  list all targets
+make run                   start the server (PBF, SETTINGS, LISTEN, ADMIN_TOKEN)
+make bayern / offline      start the Bavaria / offline profile (ADMIN_TOKEN required)
+make build                 build bin/osmmini
+make pbf-download          download a Geofabrik PBF (GEOFABRIK_URL, FORCE=1)
+make maplibre-assets       download the pinned MapLibre assets and verify them
+make offline-prep          pbf-download + maplibre-assets
+make check                 Go tests, vet, build, JS syntax and JS tests
 ```
 
-GeoJSON uses `[longitude, latitude]`. OSM nodes and mean way coordinates are
-exported as Points; polygon geometries and relations are not part of this
-endpoint. Radius results are sorted by spherical distance and support poles
-and antimeridian crossings. The spatial index is published with the POI index;
-the endpoint returns 503 while that index is still loading.
+## Running in production
 
-**Strecke messen** lets you click a polyline independently of route stops,
-remove its last point, or clear the measurement. Lengths are sums of
-spherical great-circle distances, not driving distances or survey-grade
-ellipsoidal measurements. Measurement layers survive map-source switches.
+- **Protection:** set `-admin-token` (or `OSMMINI_ADMIN_TOKEN`). Without it,
+  settings can be changed without authentication. `make bayern` and
+  `make offline` refuse to start without a token.
+- **TLS:** OSMmini serves plain HTTP. Put a reverse proxy (Caddy, nginx) in
+  front of it for public access and distribute personal tokens securely.
+- **Shutdown:** `SIGINT`/`SIGTERM` (Ctrl+C, `systemctl stop`, `docker stop`)
+  shut the server down cleanly. Open requests get up to 10 s to finish, and
+  the offline map is closed properly.
+- **Tile sources:** `raster-direct` is loaded by the browser directly, while
+  `raster` and `wms` go through the local `/tiles` cache. OSM standard tiles are
+  deliberately `raster-direct` and are never proxied or cached; see the
+  [OSM tile usage policy](https://operations.osmfoundation.org/policies/tiles/).
+  For heavy traffic, use your own or a commercial tile provider.
+- **Local data** (`operations.json`, `operators.json`, `fire-stations.json`,
+  `confidential-objects.json`, `territories/`, `imported-layers/`, `*.poi.json`)
+  is excluded by `.gitignore` and belongs in backups, not in the repository.
 
-The spatial grid shares existing tag maps and retains one representative point
-per POI. It adds index memory in exchange for fast viewport/radius queries;
-text search also reuses the precomputed way coordinates. Benchmark:
+Example systemd unit:
+
+```ini
+[Unit]
+Description=OSMmini
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/osmmini
+ExecStart=/opt/osmmini/bin/osmmini -pbf /opt/osmmini/region.osm.pbf -listen 127.0.0.1:8080
+Environment=OSMMINI_ADMIN_TOKEN=change-me
+Restart=on-failure
+User=osmmini
+
+[Install]
+WantedBy=multi-user.target
+```
+
+## Development
+
+### Project structure
+
+| Path | Contents |
+| --- | --- |
+| `extract.go`, `pbf_spatial_index.go` | Streaming PBF extraction and sidecar index |
+| `router.go`, `types.go` | Routing graph, A*/Dijkstra, address search, maneuvers |
+| `territory*.go`, `dispatch.go`, `imported_layers.go` | Territories, point-in-polygon, assignment |
+| `cmd/main.go` | Server, HTTP API, settings, search |
+| `cmd/route_export.go` | GPX/GeoJSON route export |
+| `cmd/tsp.go`, `cmd/route_cache.go` | Trip optimisation, route cache |
+| `cmd/tinytiles*.go`, `cmd/offline_labels.go` | Offline map, waterways, labels |
+| `cmd/geo*.go`, `cmd/geodata*.go` | POI geo index, GIS imports |
+| `cmd/web/` | Embedded UI (`index.html`, `app.js`, `style.css`, editor modules) |
+| `cmd/web_test/` | JS regression tests (Node test runner, no dependencies) |
+| `cmd/api/openapi.yaml` | API specification |
+| `cmd/wasm`, `cmd/export-graph` | Browser routing tools (built separately) |
+| `docs/` | Additional documentation |
+
+### Checks
 
 ```bash
-go test ./cmd -run '^$' -bench '^BenchmarkGeoViewport100k$' -benchmem
+make check      # go test, go vet, build, node --check, node --test
+make test-race  # Go race detector
+make test-js    # JS tests only
 ```
 
-## OSM-Edit (topology-aware draft editor)
+`make check` needs Go and Node.js. The first run downloads the pinned MapLibre
+assets (6.7.0) and verifies their checksums. The JS tests use a small DOM and
+network harness and download nothing. CI runs `make check` on every pull
+request.
 
-The **OSM-Edit** entry in the left rail opens a map-first editor for
-OpenStreetMap nodes, ways and relations. It never uploads anything; drafts
-stay in this browser (`localStorage`) and leave it only as an `.osc`
-changeset file or a `.json` backup for manual review and upload in a real OSM
-editor.
+### Performance notes and benchmarks
 
-1. **Finden** – click a recorded place on the map, search by name/type, place
-   a new point, or draw a brand-new way/area. Drawing snaps onto
-   already-recorded vertices within the loaded viewport so new ways connect
-   to the existing network instead of floating disconnected next to a road
-   they should join. Clicks and searches use the local POI index
-   (`/api/v1/geo/pois`); opening an object, checking its relation membership,
-   or snapping to the live network fetches from `api.openstreetmap.org`.
-2. **Bearbeiten** – typed fields per place type (café, bench, bus stop, …),
-   hints for common mistakes, a live change summary and an "all tags" table.
-   New places warn about recorded places within 30 m. For ways, **Punkte
-   bearbeiten** lets you drag existing vertices, and **Weg teilen** /
-   **Mit Weg-ID verbinden** split a way at an interior point or merge two
-   ways sharing an endpoint (unioning their tags, flagging real conflicts).
-   `Cmd/Ctrl+S` saves.
-3. **Entwürfe** – review, undo/redo, compare the base versions with OSM and
-   download the change file. A merge that removes a way, or an explicit
-   deletion, appears as its own group in the export; everything else keeps
-   existing geometries and versions unless you deliberately changed them, and
-   objects changed on OSM since the fetch block the export.
-4. **Relationen** – create a relation or load one by ID, reorder members,
-   edit roles, and add members either from your own drafts (including
-   not-yet-uploaded nodes/ways) or by OSM ID. Opening a node or way also
-   shows which relations already contain it, with a shortcut to edit them.
-
-Place types and their fields live in `cmd/web/osm-presets.js`; validation,
-topology and export logic in `cmd/web/osm-editor.js`. Both are covered by
-`cmd/web_test/osm-*.test.cjs` (`node --test cmd/web_test/`).
-
-## POI search and cache memory
-
-POI text normalization uses a single pass and avoids allocations for text that
-is already normalized. Search evaluates text scores before resolving way
-centroids and skips candidates that cannot enter the bounded result list.
-It does not retain an additional copy of normalized text for every POI.
-
-`cmd/poi_cache.go` reads and writes the existing version-3 JSON cache one entity
-at a time. Startup installs the decoded maps directly, avoiding a full-file
-JSON buffer and duplicate map tables. Saves use a temporary file and atomic
-replacement; a failed encoding leaves the previous cache intact.
-
-```bash
-go test ./cmd -run '^$' -bench 'BenchmarkPOINormalization$|BenchmarkPOISearch5000$' -benchmem
-```
-
-## Routing and trip optimization
-
-Routing cost queries use bounded initial map reservations that grow with the
-visited graph. Node-only Dijkstra skips predecessor storage and path
-reconstruction when only a cost is requested. Directed dead ends remain valid
-route destinations, and cancelled requests stop before allocating search state.
-
-`cmd/tsp.go` contains the trip optimizers: up to 16 stops use exact subset
-Dynamic Programming; 17–60 stops use nearest-neighbor construction followed by
-2-opt. Dependencies are checked for cycles before routing. Each solve shares a
-directed node-pair cost cache, including between the greedy and 2-opt phases.
-The 2-opt search evaluates reversed interior edges as well as endpoints, so it
-does not assume symmetric road costs. The larger-tour solver remains a
-heuristic and does not guarantee the global optimum.
-
-Additional benchmarks (synthetic graphs, no PBF or map downloads required):
+- **Routing:** search state grows with the visited part of the graph.
+  `dijkstra-node` skips predecessors and path reconstruction when only the cost
+  is needed. Cancelled requests stop before any search state is allocated.
+- **Trips:** up to 16 stops use exact dynamic programming over subsets; 17–60
+  stops use nearest neighbour followed by 2-opt (a heuristic, with no guarantee
+  of the global optimum). Road costs are treated as directed and cached for each
+  solve.
+- **POI search:** text normalisation is a single pass without allocations for
+  text that is already normalised. The POI cache (`cmd/poi_cache.go`, version 3)
+  is streamed entity by entity and replaced atomically.
+- **Geo index:** a grid with one representative point per POI provides fast
+  viewport and radius queries. It covers the poles and the antimeridian, and it
+  returns `503` while it is still loading.
 
 ```bash
 go test . -run '^$' -bench 'BenchmarkShortRouteCost$' -benchmem
 go test ./cmd -run '^$' -bench 'BenchmarkTSPExact12$' -benchmem
+go test ./cmd -run '^$' -bench '^BenchmarkRouteCacheEviction$' -benchmem
+go test ./cmd -run '^$' -bench '^BenchmarkGeoViewport100k$' -benchmem
+go test ./cmd -run '^$' -bench 'BenchmarkPOINormalization$|BenchmarkPOISearch5000$' -benchmem
 ```
 
-## Tile sources and production use
+## Citation
 
-`raster-direct` sources are fetched directly by the browser; `raster` and
-`wms` sources use the local `/tiles` cache proxy. The OpenStreetMap standard
-tiles are intentionally configured as `raster-direct`, because their public
-service must not be used as a general server-side tile proxy or offline tile
-cache. For a public high-traffic service, configure a suitable commercial or
-self-hosted global provider and follow its terms. See the
-[OpenStreetMap tile usage policy](https://operations.osmfoundation.org/policies/tiles/).
-
-Frontend / assets
-
-- The UI lives in `cmd/web`; own JS/CSS is committed, the third-party MapLibre
-  GL library is not.
-- MapLibre GL is the only map engine (Leaflet was removed). It is **not**
-  loaded from a CDN — the browser always loads it from
-  `cmd/web/static/maplibre`, which is not committed to the repository. Run
-  `make maplibre-assets` once (while online) to vendor a local,
-  checksum-verified copy before the first run; without it the map fails to
-  load rather than silently falling back to a CDN.
-- `make offline-prep` runs `make pbf-download` and `make maplibre-assets`
-  together as a one-shot "get everything needed for a fully offline
-  deployment" step.
-
-MapLibre GL JS is pinned to **6.7.0**. `make maplibre-assets` downloads and
-checksums the local ES module, shared module, worker, and stylesheet. WebGL2
-and a modern browser are required; no CDN is used at runtime.
+If you use OSMmini in academic work, please cite it through the Zenodo DOI
+[10.5281/zenodo.18929953](https://doi.org/10.5281/zenodo.18929953).
+Map data © [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors, ODbL.

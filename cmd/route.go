@@ -25,10 +25,20 @@ func runRouteCLI(args []string) {
 	territoryLayer := fs.String("territory-layer", "", "territory layer name to report route transitions for")
 	territoriesPath := fs.String("territories", "", "territory GeoJSON file for --territory-layer")
 	territoryEvents := fs.Bool("territory-events", false, "include territory transition events in the output")
+	format := fs.String("format", routeFormatJSON, "output format: json, gpx or geojson")
 	fs.Parse(args)
 
+	switch *format {
+	case routeFormatJSON, routeFormatGPX, routeFormatGeoJSON:
+	default:
+		log.Fatalf("route: invalid --format %q (want json, gpx or geojson)", *format)
+	}
+	if *territoryEvents && *format != routeFormatJSON {
+		log.Fatalf("route: --territory-events requires --format json")
+	}
+
 	if *from == "" || *to == "" {
-		fmt.Fprintln(os.Stderr, "usage: osmmini route --pbf FILE --from LAT,LON --to LAT,LON [--territory-layer NAME --territories FILE.geojson --territory-events]")
+		fmt.Fprintln(os.Stderr, "usage: osmmini route --pbf FILE --from LAT,LON --to LAT,LON [--format json|gpx|geojson] [--territory-layer NAME --territories FILE.geojson --territory-events]")
 		os.Exit(2)
 	}
 	fromCoord, ok := parseLatLon(*from)
@@ -72,6 +82,29 @@ func runRouteCLI(args []string) {
 	res, err := router.RouteWithOptions(context.Background(), startID, endID, osmmini.RouteOptions{})
 	if err != nil {
 		log.Fatalf("route: %v", err)
+	}
+
+	if *format != routeFormatJSON {
+		exp := routeExport{
+			Name:      fmt.Sprintf("%s → %s", *from, *to),
+			DistanceM: res.DistanceM,
+			DurationS: res.DurationS,
+			Engine:    string(res.Engine),
+			Path:      res.PathCoords,
+			Waypoints: []routeExportWaypoint{
+				{Role: "start", Name: *from, Coord: fromCoord},
+				{Role: "end", Name: *to, Coord: toCoord},
+			},
+			Steps: router.ManeuversForPath(res.Path, osmmini.RouteOptions{}),
+		}
+		encode := encodeRouteGeoJSON
+		if *format == routeFormatGPX {
+			encode = encodeRouteGPX
+		}
+		if err := encode(os.Stdout, exp); err != nil {
+			log.Fatalf("route: %v", err)
+		}
+		return
 	}
 
 	out := map[string]any{

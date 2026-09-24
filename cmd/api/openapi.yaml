@@ -307,6 +307,17 @@ paths:
   /api/v1/route:
     post:
       summary: Route between two locations
+      parameters:
+        - name: format
+          in: query
+          required: false
+          description: >-
+            Response format. `json` (default) returns the regular response;
+            `gpx` returns a GPX 1.1 download (waypoints, maneuvers as <rte>,
+            road geometry as <trk>) for navigation devices and GPS apps;
+            `geojson` returns a FeatureCollection with the route LineString and
+            one Point per waypoint ([lon, lat]).
+          schema: { type: string, enum: [json, gpx, geojson], default: json }
       requestBody:
         required: true
         content:
@@ -320,6 +331,10 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/RouteResponse"
+            application/gpx+xml:
+              schema: { type: string, format: binary }
+            application/geo+json:
+              schema: { type: object }
         "400":
           description: Bad request
           content:
@@ -328,6 +343,17 @@ paths:
   /api/v1/trip/solve:
     post:
       summary: Solve a trip (multi-stop) optionally optimized (TSP) with dependencies
+      parameters:
+        - name: format
+          in: query
+          required: false
+          description: >-
+            Response format. `json` (default) returns the regular response;
+            `gpx` returns a GPX 1.1 download (waypoints, maneuvers as <rte>,
+            road geometry as <trk>) for navigation devices and GPS apps;
+            `geojson` returns a FeatureCollection with the route LineString and
+            one Point per waypoint ([lon, lat]).
+          schema: { type: string, enum: [json, gpx, geojson], default: json }
       requestBody:
         required: true
         content:
@@ -341,6 +367,10 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/TripSolveResponse"
+            application/gpx+xml:
+              schema: { type: string, format: binary }
+            application/geo+json:
+              schema: { type: object }
         "400":
           description: Bad request
           content:
