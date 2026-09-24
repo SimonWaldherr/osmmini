@@ -18,12 +18,14 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode"
 
@@ -1355,8 +1357,12 @@ func main() {
 		case "region-extract":
 			runRegionExtractCLI(os.Args[2:])
 			return
+		case "version", "-version", "--version":
+			fmt.Println(versionString())
+			return
 		}
 	}
+	flag.Usage = func() { printUsage(flag.CommandLine.Output()) }
 
 	// Command-line flags. `-pbf` should point at the OSM PBF used to
 	// build the routing graph (e.g. a regional extract). If the file
@@ -1386,6 +1392,10 @@ func main() {
 	windowBufferM := flag.Float64("window-buffer-m", 0, "Expand window by meters for import (optional)")
 	enforceWindow := flag.Bool("enforce-window", false, "Reject requests outside window (if window set)")
 
+	if len(os.Args) > 1 && os.Args[1] == "help" {
+		printUsage(os.Stdout)
+		return
+	}
 	flag.Parse()
 	if *tinyTilesReaders < 1 {
 		log.Fatal("-tinytiles-readers must be at least 1")
@@ -1523,7 +1533,7 @@ func main() {
 		IdleTimeout:       2 * time.Minute,
 	}
 
-	log.Printf("Listening on %s", *listen)
+	log.Printf("%s listening on %s", versionString(), *listen)
 	// Optional data must never postpone opening the port. In particular,
 	// opening a generated .ttiles artifact can validate a sizeable local file.
 	// The corresponding handlers return a short "not ready" response until the
@@ -1539,7 +1549,27 @@ func main() {
 		srv.syncPolygonLayersToTerritories() // also loads plain -territories-dir layers
 		srv.loadCustomTiles()
 	}()
-	log.Fatal(httpSrv.ListenAndServe())
+	// Stop on Ctrl+C / SIGTERM (systemd, docker stop): finish in-flight
+	// requests, then return so the deferred cleanups close the offline map
+	// readers and the route cache.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- httpSrv.ListenAndServe() }()
+	select {
+	case err := <-serveErr:
+		if !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
+		}
+	case <-ctx.Done():
+		stop()
+		log.Printf("Shutting down (waiting up to 10s for open requests)...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("shutdown: %v", err)
+		}
+	}
 }
 
 // applyAllowedHighwayTypes configures graph import once at startup. The
@@ -2837,6 +2867,7 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	set := publicSettings(s.settings.Get())
 
 	out := map[string]any{
+		"version":   versionString(),
 		"uptime_s":  uptime,
 		"graph":     map[string]any{"nodes": s.router.NodeCount(), "edges": s.router.EdgeCount()},
 		"addresses": len(s.addrs),
@@ -3628,6 +3659,12 @@ func (s *server) handleRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	format, err := parseRouteFormat(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req RouteRequest
 	if err := readJSON(w, r, &req, 1<<20); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid json: "+err.Error())
@@ -3691,7 +3728,7 @@ func (s *server) handleRoute(w http.ResponseWriter, r *http.Request) {
 		cached.AppleMapsURL = buildAppleMapsURL([]osmmini.Coord{fromCoord, toCoord})
 		cached.Cached = true
 		s.prefetchTinyTilesRoute(cached.Path)
-		writeJSON(w, http.StatusOK, cached)
+		writeRouteResponse(w, format, cached)
 		return
 	}
 
@@ -3744,12 +3781,28 @@ func (s *server) handleRoute(w http.ResponseWriter, r *http.Request) {
 	}
 	s.routeCache.set(cacheKey, resp)
 	s.prefetchTinyTilesRoute(resp.Path)
-	writeJSON(w, http.StatusOK, resp)
+	writeRouteResponse(w, format, resp)
+}
+
+// writeRouteResponse writes a route as JSON or, for ?format=gpx|geojson, as a
+// downloadable file.
+func writeRouteResponse(w http.ResponseWriter, format string, resp RouteResponse) {
+	if format == routeFormatJSON {
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	writeRouteExport(w, format, routeExportFromRoute(resp))
 }
 
 func (s *server) handleTripSolve(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	format, err := parseRouteFormat(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -3767,6 +3820,10 @@ func (s *server) handleTripSolve(w http.ResponseWriter, r *http.Request) {
 	resp, err := s.solveTrip(r.Context(), req.Plan, opt)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, routeErrorMessage(err))
+		return
+	}
+	if format != routeFormatJSON {
+		writeRouteExport(w, format, routeExportFromTrip(resp))
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
