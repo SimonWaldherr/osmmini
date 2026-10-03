@@ -45,11 +45,16 @@
     el('mapPostTools').addEventListener('input',invalidate);
     map.on('moveend',invalidate);
     map.on('style.load',()=>{render();invalidate();});
-    const capture=()=>new Promise((resolve,reject)=>{
+    const capture=()=>{
+      // microMap does not emit `render` for triggerRepaint on an idle map.
+      // The loaded-tile check below makes its current composite safe to copy.
+      if(root.mapRenderer==='micromap') return Promise.resolve().then(()=>root.MapRenderer.capture(map));
+      return new Promise((resolve,reject)=>{
       const timeout=setTimeout(()=>{map.off('render',draw);reject(Error('Kartenbild konnte nicht erfasst werden. Bitte erneut versuchen.'));},5000);
-      function draw(){clearTimeout(timeout);try{const source=map.getCanvas(),copy=document.createElement('canvas');copy.width=source.width;copy.height=source.height;copy.getContext('2d').drawImage(source,0,0);resolve(copy);}catch(e){reject(e);}}
+      function draw(){clearTimeout(timeout);try{const source=root.MapRenderer ? root.MapRenderer.capture(map) : map.getCanvas(),copy=document.createElement('canvas');copy.width=source.width;copy.height=source.height;copy.getContext('2d').drawImage(source,0,0);resolve(copy);}catch(e){reject(e);}}
       map.once('render',draw);map.triggerRepaint();
-    });
+      });
+    };
     el('postGenerate').addEventListener('click',async()=>{
       if(busy)return;
       invalidate();
@@ -68,7 +73,7 @@
         if(f.description)y+=text(f.description,36,y,23,w-72,3)+12;
         const whenWhere=[f.location,f.date].filter(Boolean).join(' · ');
         if(whenWhere)y+=text(whenWhere,36,y,21,w-72,2,'#475569')+12;
-        const attribution=map.getContainer().querySelector('.maplibregl-ctrl-attrib-inner')?.textContent?.replace(/\s+/g,' ').trim()||'© OpenStreetMap contributors';
+        const attribution=map.getContainer().querySelector('.maplibregl-ctrl-attrib-inner, .micromap-ctrl-attrib-inner')?.textContent?.replace(/\s+/g,' ').trim()||'© OpenStreetMap contributors';
         ctx.font='16px system-ui, sans-serif';
         const credits=wrap(attribution+' · openstreetmap.org/copyright',s=>ctx.measureText(s).width,w-72,6);
         const footer=credits.length*21+52, mapHeight=h-y-footer;

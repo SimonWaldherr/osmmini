@@ -233,6 +233,9 @@ func TestTinyTilesOfflineStyleIsEmbedded(t *testing.T) {
 
 func TestOfflineMapAssetsAreEmbedded(t *testing.T) {
 	for _, path := range []string{
+		"web/map-renderer.js",
+		"web/static/micromap/micromap.mjs",
+		"web/static/micromap/LICENSE",
 		"web/static/maplibre/maplibre-gl.mjs",
 		"web/static/maplibre/maplibre-gl-shared.mjs",
 		"web/static/maplibre/maplibre-gl-worker.mjs",

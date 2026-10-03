@@ -149,7 +149,7 @@
     document.addEventListener('keydown',e=>{if(e.key==='Escape'&&active){e.preventDefault();stop('Skizze verworfen.');}});
     update();notice('Geometrietyp wählen und mit „Zeichnen“ beginnen.');
     return {get active(){return active;},render,cancel(){if(active) stop('Skizze verworfen.');},addPoint(event){
-      if(!active||event.originalEvent?.target?.closest?.('.maplibregl-marker, .maplibregl-popup')) return;
+      if(!active||event.originalEvent?.target?.closest?.('.maplibregl-marker, .maplibregl-popup, .micromap-marker, .micromap-popup')) return;
       if(draft.length>=500) return notice('Maximal 500 Punkte pro Geometrie.');
       const p=[((event.lngLat.lng+180)%360+360)%360-180,event.lngLat.lat];
       if(!p.every(Number.isFinite)||Math.abs(p[1])>85) return notice('Dieser Breitengrad wird nicht unterstützt.');

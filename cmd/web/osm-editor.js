@@ -1,4 +1,4 @@
-/* Versioned OSM drafts (nodes, ways, relations) with a map-first guided editor; no uploads. */
+/* Versioned OSM editing workspace (nodes, ways, relations), local history and OSC export. */
 (function(root){
   'use strict';
   const validID=n=>Number.isSafeInteger(n)&&n>0;
@@ -207,11 +207,14 @@
     const response=await fetcher(`https://api.openstreetmap.org/api/0.6/map.json?bbox=${west},${south},${east},${north}`,{signal:AbortSignal.timeout(12000),credentials:'omit'});
     if(!response.ok)throw Error('Kartendaten von OSM konnten nicht geladen werden.');
     const body=await response.json();
+    return candidatesFromElements(body.elements,lat,lon,radiusMeters);
+  }
+  function candidatesFromElements(elements,lat,lon,radiusMeters){
     const nodeCoords=new Map();
-    for(const e of body.elements||[])if(e.type==='node'&&Number.isFinite(e.lon)&&Number.isFinite(e.lat))nodeCoords.set(e.id,[e.lon,e.lat]);
+    for(const e of elements||[])if(e.type==='node'&&Number.isFinite(e.lon)&&Number.isFinite(e.lat))nodeCoords.set(e.id,[e.lon,e.lat]);
     const primaryCategory=tags=>root.OSMPresets?.primaryCategory(tags||{})||'';
     const out=[];
-    for(const e of body.elements||[]){
+    for(const e of elements||[]){
       if(e.type==='node'&&e.tags&&Object.keys(e.tags).length){
         const d=metersBetween(lat,lon,e.lat,e.lon);
         if(d<=radiusMeters)out.push({type:'node',id:e.id,label:e.tags.name||'',category:primaryCategory(e.tags),distance:d,coordinates:[e.lon,e.lat]});
@@ -223,10 +226,68 @@
           const hit=nearestPointOnSegment(lat,lon,a[1],a[0],b[1],b[0]);
           if(!best||hit.distance<best.distance)best=hit;
         }
+        const ring=e.nodes.map(id=>nodeCoords.get(id));
+        if(e.nodes.length>3&&e.nodes[0]===e.nodes[e.nodes.length-1]&&ring.every(Boolean)&&e.tags?.area!=='no'&&(!e.tags?.highway||e.tags?.area==='yes')){
+          let inside=false;
+          for(let i=0,j=ring.length-1;i<ring.length;j=i++){
+            const a=ring[i],b=ring[j];
+            if((a[1]>lat)!==(b[1]>lat)&&lon<(b[0]-a[0])*(lat-a[1])/(b[1]-a[1])+a[0])inside=!inside;
+          }
+          if(inside)best={distance:0,lon,lat};
+        }
         if(best&&best.distance<=radiusMeters)out.push({type:'way',id:e.id,label:e.tags?.name||'',category:primaryCategory(e.tags),distance:best.distance,coordinates:[best.lon,best.lat]});
       }
     }
     return out.sort((a,b)=>a.distance-b.distance).slice(0,20);
+  }
+
+  function editWayNodes(nodes,index,id){
+    if(!Array.isArray(nodes)||nodes.length<2||!Number.isInteger(index)||index<0||index>=nodes.length-1)throw Error('Ungültiger Wegabschnitt.');
+    const closed=nodes.length>3&&nodes[0]===nodes[nodes.length-1];
+    const next=nodes.slice();
+    if(id!==undefined){
+      if(!refID(id)||nodes.includes(id))throw Error('Ungültiger oder bereits verwendeter Knoten.');
+      next.splice(index+1,0,id);
+    }else{
+      const ring=closed?nodes.slice(0,-1):next;
+      ring.splice(index,1);
+      if(new Set(ring).size<(closed?3:2))throw Error(closed?'Eine Fläche braucht mindestens drei verschiedene Punkte.':'Ein Weg braucht mindestens zwei verschiedene Punkte.');
+      return closed?[...ring,ring[0]]:ring;
+    }
+    if(next.length>2000)throw Error('Maximal 2000 Wegpunkte.');
+    return next;
+  }
+  function validateWayCoordinates(coordinates,closed){
+    if(!Array.isArray(coordinates)||coordinates.some(p=>!Array.isArray(p)||p.length!==2||!p.every(Number.isFinite)))throw Error('Unvollständige Weggeometrie.');
+    const points=closed?coordinates.slice(0,-1):coordinates;
+    const minimum=closed?3:2;
+    if(new Set(points.map(p=>p.join(','))).size<minimum)throw Error(`Mindestens ${minimum} verschiedene Positionen nötig.`);
+    if(coordinates.some((p,i)=>i>0&&p[0]===coordinates[i-1][0]&&p[1]===coordinates[i-1][1]))throw Error('Aufeinanderfolgende Wegpunkte dürfen nicht an derselben Position liegen.');
+    if(!closed)return;
+    const cross=(a,b,c)=>(b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0]);
+    const on=(a,b,c)=>Math.abs(cross(a,b,c))<1e-14&&c[0]>=Math.min(a[0],b[0])&&c[0]<=Math.max(a[0],b[0])&&c[1]>=Math.min(a[1],b[1])&&c[1]<=Math.max(a[1],b[1]);
+    for(let i=0;i<coordinates.length-1;i++)for(let j=i+2;j<coordinates.length-1;j++){
+      if(i===0&&j===coordinates.length-2)continue;
+      const a=coordinates[i],b=coordinates[i+1],c=coordinates[j],d=coordinates[j+1];
+      if((cross(a,b,c)*cross(a,b,d)<0&&cross(c,d,a)*cross(c,d,b)<0)||on(a,b,c)||on(a,b,d)||on(c,d,a)||on(c,d,b))throw Error('Die Fläche überschneidet sich selbst. Korrigiere die Wegpunkte.');
+    }
+    const area=points.reduce((sum,p,i)=>{const q=points[(i+1)%points.length];return sum+(p[0]-points[0][0])*(q[1]-points[0][1])-(q[0]-points[0][0])*(p[1]-points[0][1]);},0);
+    if(Math.abs(area)<1e-14)throw Error('Die Fläche hat keine gültige Ausdehnung.');
+  }
+  function mapDataFeatures(elements){
+    const nodes=new Map((elements||[]).filter(e=>e.type==='node'&&Number.isFinite(e.lon)&&Number.isFinite(e.lat)).map(e=>[e.id,e]));
+    const features=[];
+    for(const e of elements||[]){
+      if(e.type==='relation')continue;
+      const properties={osm_type:e.type,osm_id:e.id,name:e.tags?.name||'',category:root.OSMPresets?.primaryCategory(e.tags||{})||''};
+      if(e.type==='node'&&nodes.has(e.id))features.push({type:'Feature',properties:{...properties,tagged:!!Object.keys(e.tags||{}).length},geometry:{type:'Point',coordinates:[e.lon,e.lat]}});
+      if(e.type==='way'&&e.nodes?.length>=2&&e.nodes.every(id=>nodes.has(id))){
+        const coordinates=e.nodes.map(id=>[nodes.get(id).lon,nodes.get(id).lat]);
+        const area=e.nodes.length>3&&e.nodes[0]===e.nodes[e.nodes.length-1]&&e.tags?.area!=='no'&&(!e.tags?.highway||e.tags?.area==='yes')&&!e.tags?.barrier;
+        features.push({type:'Feature',properties,geometry:area?{type:'Polygon',coordinates:[coordinates]}:{type:'LineString',coordinates}});
+      }
+    }
+    return {type:'FeatureCollection',features};
   }
 
   const iconHTML=id=>`<svg class="ui-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="#${id}"/></svg>`;
@@ -255,7 +316,8 @@
     let drafts=[],current=null,working=[],members=[],dirty=false,busy=false,viewActive=false,placing=false,tab='find';
     let candidates=[],highlighted='',nearbyPoint=null,lastSearch=null,missPoint=null,presetOpen=false,customKind=false,renderedKind='',careMode='basic',presetSearchTerm='',presetAllOpen=false;
     let undo=[],redo=[],checkedFor='',conflicts=[],validForm=false;
-    let geometryMode=false,dragNodeId=null,splitMode=false;const dragPreview=new Map();
+    let geometryMode=false,dragNodeId=null,splitMode=false,insertMode=false,selectedVertexId=null;
+    let mapElements=[],mapDataVisible=true;const dragPreview=new Map();
     let drawing=false,drawPoints=[],drawKind='line',drawSnapNodes=null,pendingDrawTags=null;
     const fieldNodes=new Map();
     try{const raw=localStorage.getItem(key);if(raw)drafts=restore(raw);}catch{say('Gespeicherte Entwürfe konnten nicht geladen werden.');}
@@ -291,15 +353,17 @@
     // point, or while drawing a new way/area. Dragging a vertex is a separate, always-armed
     // mousedown/mousemove/mouseup path gated on geometryMode, since it needs raw pointer events
     // rather than a settled click.
-    const mode=()=>drawing?'draw':placing?'place':viewActive&&tab==='find'&&!busy?'pick':null;
+    const mode=()=>!viewActive&& !drawing&&!placing?null:drawing?'draw':placing?'place':geometryMode?'geometry':viewActive&&tab==='find'&&!busy?'pick':null;
     function applyMode(){
       const m=mode();
-      map.getCanvas().style.cursor=m==='place'||m==='draw'?'crosshair':m==='pick'?'pointer':'';
+      map.getCanvas().style.cursor=m==='place'||m==='draw'||m==='geometry'?'crosshair':m==='pick'?'pointer':'';
       el('osmNew').setAttribute('aria-pressed',String(placing));
       el('osmNew').textContent=placing?'Punktsetzen abbrechen':'Neuen Ort eintragen';
       el('osmPickText').textContent=placing?'Klicke auf die Karte, um den neuen Ort zu setzen. Abbrechen mit Escape.':'Wähle auf der Karte einen Ort aus, den du bearbeiten möchtest.';
       el('osmPickHint').setAttribute('data-active',String(!!m));
       el('osmEditView').setAttribute('data-mode',m||'');
+      syncGeometryUI();
+      for(const [id,active] of [['osmToolPoint',placing],['osmToolLine',drawing&&drawKind==='line'],['osmToolArea',drawing&&drawKind==='area']])el(id)?.setAttribute('aria-pressed',String(active));
       const drawBar=el('osmDrawBar');if(drawBar)drawBar.hidden=!drawing;
       const drawCount=el('osmDrawCount');if(drawCount)drawCount.textContent=String(drawPoints.length);
       const geomButton=el('osmGeometryToggle');if(geomButton)geomButton.setAttribute('aria-pressed',String(geometryMode));
@@ -312,6 +376,7 @@
       if(hadDraw)render();
     }
     function setTab(name,focus=false){
+      if(name!=='edit'&&geometryMode){geometryMode=false;insertMode=false;selectedVertexId=null;if(dragNodeId!=null)map.dragPan?.enable?.();dragNodeId=null;dragPreview.clear();}
       tab=name;
       for(const [id,buttonId,panelId] of TABS){
         const selected=id===name,button=el(buttonId);
@@ -337,7 +402,7 @@
       if(dirty){say('Du hast ungespeicherte Änderungen. Speichere sie oder verwirf sie im Reiter „Bearbeiten“.');setTab('edit');el('osmSelected').focus?.();return false;}
       return !busy;
     }
-    function closeCurrent(){current=null;working=[];members=[];dirty=false;presetOpen=false;customKind=false;careMode='basic';presetSearchTerm='';presetAllOpen=false;geometryMode=false;dragNodeId=null;splitMode=false;dragPreview.clear();renderForm();applyMode();render();syncUI();}
+    function closeCurrent(){current=null;working=[];members=[];dirty=false;presetOpen=false;customKind=false;careMode='basic';presetSearchTerm='';presetAllOpen=false;geometryMode=false;dragNodeId=null;splitMode=false;insertMode=false;selectedVertexId=null;dragPreview.clear();renderForm();applyMode();render();syncUI();}
 
     // ── Analysis of the working tags: validity, diff, hints
     const display=(k,v)=>{
@@ -362,15 +427,17 @@
           const next=tags(trimmed());
           const tagDelta=changes(current.base?.tags||{},next);
           const memberDelta=isRelation&&current.base?memberChanges(current.base,{...current.value,members}):[];
-          delta=[...tagDelta,...memberDelta];
+          const geometryDelta=current.base?geometryChange(current.base,current.value):null;
+          const vertexDelta=(current.pendingNodes||[]).map(d=>d.base?geometryChange(d.base,d.value):{key:'_position',before:'Neuer Wegpunkt',after:`${d.value.lat.toFixed(5)}, ${d.value.lon.toFixed(5)}`}).filter(Boolean);
+          delta=[...tagDelta,...memberDelta,...(geometryDelta?[geometryDelta]:[]),...vertexDelta];
           el('osmSelected').textContent=label({...current.value,tags:next,...(isRelation?{members}:{})});
           for(const d of delta){
             const item=document.createElement('li');
-            item.textContent=d.key==='_member'?`Mitglied: ${d.before===undefined?'neu':d.before} → ${d.after===undefined?'entfernt':d.after}`:`${fieldLabel(d.key)}: ${d.before===undefined?'neu':display(d.key,d.before)} → ${d.after===undefined?'wird entfernt':display(d.key,d.after)}`;
+            item.textContent=d.key==='_position'||d.key==='_geometry'?`Geometrie: ${d.before} → ${d.after}`:d.key==='_member'?`Mitglied: ${d.before===undefined?'neu':d.before} → ${d.after===undefined?'entfernt':d.after}`:`${fieldLabel(d.key)}: ${d.before===undefined?'neu':display(d.key,d.before)} → ${d.after===undefined?'wird entfernt':display(d.key,d.after)}`;
             list.append(item);
           }
           if(!current.base&&!Object.values(next).some(v=>v.trim()))message=isRelation?'Ergänze mindestens eine Eigenschaft, z. B. die Art der Relation.':'Wähle eine Art aus oder ergänze eine Eigenschaft für den neuen Ort.';
-          else validForm=!!tagDelta.length||!!memberDelta.length||drafts.some(isCurrent);
+          else validForm=!!delta.length||!!current.pendingNodes?.length||drafts.some(isCurrent);
         }catch(e){message=e.message;}
         if(!delta.length&&!message){const item=document.createElement('li');item.textContent='Noch nichts geändert.';list.append(item);}
       }
@@ -502,10 +569,11 @@
         const query=search.value.trim().normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLocaleLowerCase('de');
         presetSearchTerm=search.value;
         results.replaceChildren();
-        const all=Object.entries(P.presets);
+        const geometry=current.value.type==='way'?(current.shape?.closed?'area':'line'):'point';
+        const all=Object.entries(P.presets).filter(([,p])=>!p.geometry||p.geometry===geometry);
         const searchable=([key,p])=>[key,p.label,p.group,...(p.synonyms||[]),...Object.entries(p.tags).flat()].join(' ').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLocaleLowerCase('de');
         const matches=query?all.filter(entry=>searchable(entry).includes(query)):all;
-        const quickKeys=['cafe','pharmacy','bus_stop','bench','toilets','drinking_water'];
+        const quickKeys=geometry==='area'?['building','house','garage','grass','playground','fire_station']:geometry==='line'?['footway','cycleway','path','residential','service']:['cafe','pharmacy','bus_stop','bench','toilets','drinking_water'];
         const shown=query||presetAllOpen?matches:all.filter(([key,p])=>quickKeys.includes(key)||p.group==='Feuerwehr & Erste Hilfe');
         if(query)results.append(h('p',{class:'osm-preset-picker-hint',text:`${matches.length} ${matches.length===1?'passende Art':'passende Arten'}`}));
         if(!matches.length){results.append(h('p',{class:'osm-empty',text:'Keine passende Art gefunden. Du kannst eigene OSM-Eigenschaften ergänzen.'}));return;}
@@ -562,7 +630,7 @@
       const advancedTags=el('osmAdvancedTags');if(advancedTags){advancedTags.hidden=careMode!=='professional';if(careMode==='professional')advancedTags.open=true;}
       const link=el('osmOsmLink');link.hidden=!base;if(base)link.href=`https://www.openstreetmap.org/${value.type}/${value.id}`;
       const geomToggle=el('osmGeometryToggle');
-      if(geomToggle){geomToggle.hidden=value.type!=='way';geomToggle.setAttribute('aria-pressed',String(geometryMode));geomToggle.textContent=geometryMode?'Punkte bearbeiten beenden':'Punkte bearbeiten';}
+      if(geomToggle){geomToggle.hidden=value.type==='relation'||!!current.confidentialID;geomToggle.setAttribute('aria-pressed',String(geometryMode));geomToggle.textContent=geometryMode?'Punkte bearbeiten beenden':'Punkte bearbeiten';}
       const topology=el('osmTopologyTools');
       if(topology)topology.hidden=value.type!=='way'||!base;
       const relationTools=el('osmRelationTools');
@@ -585,7 +653,9 @@
       careMode=current.base||current.value.type!=='node'?'professional':'basic';
       presetSearchTerm='';presetAllOpen=false;
       const confToggle=el('osmConfidentialToggle');if(confToggle){confToggle.checked=false;confToggle.disabled=false;confToggle.setAttribute('aria-checked','false');}
-      if(current.value.type==='way'&&!current.shape){const shape=localWayShape(current.value);if(shape)current.shape=shape;}
+      if(current.value.type==='way'&&!current.nodeElements)current.nodeElements=nodeIndex(mapElements);
+      if(current.value.type==='way'&&!current.shape){const shape=localWayShape(current.value)||wayShape(mapElements,current.value.id);if(shape)current.shape=shape;}
+      if(current.value.type==='way')current.shape={...current.shape,closed:current.value.nodes.length>3&&current.value.nodes[0]===current.value.nodes[current.value.nodes.length-1]};
       members=current.value.type==='relation'?current.value.members.map(m=>({...m})):[];
       presetOpen=!current.base&&current.value.type!=='relation'&&!P.presetKeyForTags(current.value.tags);customKind=false;
       el('osmDuplicates').hidden=true;el('osmDuplicates').replaceChildren();
@@ -669,16 +739,21 @@
       el('osmNearby').textContent=busy?'Bitte warten …':'Suchen';
       el('osmSave').disabled=busy||!current||!validForm;
       el('osmDiscard').disabled=busy;
+      if(el('osmDeleteObject')){el('osmDeleteObject').hidden=!current?.base||!!current?.confidentialID;el('osmDeleteObject').disabled=busy||dirty;}
       el('osmDiscard').textContent=dirty?'Änderungen verwerfen':'Schließen';
       el('osmEditState').textContent=dirty?'Nicht gespeichert':'Keine offenen Änderungen';
       el('osmEditState').setAttribute('data-state',dirty?'dirty':'clean');
       el('osmUndo').disabled=busy||dirty||!undo.length;
       el('osmRedo').disabled=busy||dirty||!redo.length;
+      for(const [tool,original] of [['osmToolUndo','osmUndo'],['osmToolRedo','osmRedo']])if(el(tool))el(tool).disabled=el(original).disabled;
+      for(const id of ['osmToolPoint','osmToolLine','osmToolArea','osmLoadMapData'])if(el(id))el(id).disabled=busy;
+      syncGeometryUI();
       el('osmCheck').disabled=busy||dirty||!drafts.some(d=>d.base);
       for(const id of ['osmExport','osmBackup'])el(id).disabled=busy||dirty||!drafts.length;
-      const count=el('osmDraftCount');count.textContent=String(drafts.length);count.hidden=!drafts.length;
-      el('osmTabDrafts').setAttribute('aria-label',`Entwürfe, ${drafts.length} im Arbeitsstand`);
-      el('osmDraftSummary').textContent=drafts.length?`${drafts.length} ${drafts.length===1?'Entwurf':'Entwürfe'} im Arbeitsstand.${dirty?' Offene Änderungen zuerst speichern oder verwerfen.':''}`:'Noch keine Entwürfe. Wähle einen Ort auf der Karte oder trage einen neuen ein.';
+      const mainCount=drafts.filter(d=>!supportingVertex(d)).length;
+      const count=el('osmDraftCount');count.textContent=String(mainCount);count.hidden=!drafts.length;
+      el('osmTabDrafts').setAttribute('aria-label',`Entwürfe, ${mainCount} Objekte im Arbeitsstand`);
+      el('osmDraftSummary').textContent=drafts.length?`${mainCount} ${mainCount===1?'Entwurf':'Entwürfe'} · ${drafts.length} OSM-Objekte im Export.${dirty?' Offene Änderungen zuerst speichern oder verwerfen.':''}`:'Noch keine Entwürfe. Wähle einen Ort auf der Karte oder trage einen neuen ein.';
       el('osmCheckState').textContent=!drafts.length?'':checkedFor===versions()&&conflicts.length?'OSM wurde inzwischen geändert. Sichere den Arbeitsstand und löse die Konflikte in einem OSM-Editor.':!drafts.some(d=>d.base)?'Nur neue Orte. Bitte vor der Veröffentlichung prüfen, ob sie bereits in OSM existieren.':checkedFor===versions()?'Beim letzten Vergleich waren die OSM-Versionen aktuell. Vor der Veröffentlichung erneut prüfen.':'Noch nicht mit dem aktuellen OSM-Stand verglichen. Internetverbindung erforderlich.';
       const overview=el('osmDraftOverview');overview.replaceChildren();
       if(drafts.length){
@@ -695,6 +770,22 @@
         if(state!=='ok')overview.append(next);
       }else overview.removeAttribute('data-state');
       if(checkedFor===versions()&&conflicts.length)el('osmExport').disabled=true;
+    }
+    function supportingVertex(d){
+      return !d.deleted&&d.value.type==='node'&&!Object.keys(d.value.tags).length&&drafts.some(other=>!other.deleted&&other.value.type==='way'&&other.value.nodes.includes(d.value.id));
+    }
+    function removeDraft(index){
+      if(!canSwitch())return;
+      try{
+        const removed=drafts[index],next=drafts.filter((_,i)=>i!==index);
+        const vertexIds=new Set(!removed.deleted&&removed.value.type==='way'?removed.value.nodes:[]);
+        for(let i=next.length-1;i>=0;i--){
+          const n=next[i];if(n.base||n.deleted||n.value.type!=='node'||n.value.id>0||!vertexIds.has(n.value.id)||Object.keys(n.value.tags).length)continue;
+          if(!next.some(d=>!d.deleted&&((d.value.type==='way'&&d.value.nodes.includes(n.value.id))||(d.value.type==='relation'&&d.value.members.some(m=>m.type==='node'&&m.ref===n.value.id)))))next.splice(i,1);
+        }
+        const issues=checkReferences(next);if(issues.length)throw Error(issues.join(' '));
+        drafts=next;say('Entwurf entfernt. Mit „Rückgängig“ wiederherstellen.'+persist());refresh();el('osmDraftSummary').focus?.();
+      }catch(e){say(userError(e));}
     }
     function draftNode(d,index){
       if(d.deleted){
@@ -714,16 +805,18 @@
       const locate=h('button',{type:'button',class:'osm-icon-button','aria-label':`${name} auf der Karte zeigen`,title:'Auf der Karte zeigen',innerHTML:iconHTML('icon-location'),on:{click:()=>flyToObject(d)}});
       locate.disabled=!positionOf(d);
       const remove=h('button',{type:'button',class:'osm-icon-button osm-danger','aria-label':`${name} aus dem Arbeitsstand entfernen`,title:'Entfernen',innerHTML:iconHTML('icon-close'),on:{click:()=>{
-        if(!canSwitch())return;
-        drafts.splice(index,1);
-        say('Entwurf entfernt. Mit „Rückgängig“ wiederherstellen.'+persist());refresh();el('osmDraftSummary').focus?.();
+        removeDraft(index);
       }}});
       return h('li',{class:'osm-draft'},edit,locate,remove);
     }
     function refresh(){
       syncUI();
       const list=el('osmDrafts');list.replaceChildren();
-      drafts.forEach((d,i)=>list.append(draftNode(d,i)));
+      drafts.forEach((d,i)=>{if(!supportingVertex(d))list.append(draftNode(d,i));});
+      const vertices=drafts.map((d,i)=>({d,i})).filter(({d})=>supportingVertex(d));
+      const vertexList=el('osmDraftVertices');if(vertexList){vertexList.replaceChildren();for(const {d,i} of vertices)vertexList.append(draftNode(d,i));}
+      if(el('osmDraftVertexDetails'))el('osmDraftVertexDetails').hidden=!vertices.length;
+      if(el('osmDraftVertexSummary'))el('osmDraftVertexSummary').textContent=`${vertices.length} zugehörige Wegpunkte`;
       const relationsList=el('osmRelationsList');
       if(relationsList){
         relationsList.replaceChildren();
@@ -756,6 +849,28 @@
       }catch{return false;}
     }
     let retry=null,attempts=0;
+    function rememberElements(elements){
+      const known=new Map(mapElements.map(e=>[e.type+'/'+e.id,e]));
+      for(const e of elements||[])known.set(e.type+'/'+e.id,e);
+      mapElements=[...known.values()].slice(-50000);
+    }
+    function draftGeometries(){
+      const known=nodeIndex(mapElements);
+      for(const d of drafts)if(!d.deleted&&d.value.type==='node')known.set(d.value.id,d.value);
+      const features=[];
+      for(const d of drafts){
+        const way=d.deleted?d.base:d.value;if(way.type!=='way'||isCurrent(d)||!way.nodes.every(id=>known.has(id)))continue;
+        const coordinates=way.nodes.map(id=>[known.get(id).lon,known.get(id).lat]);
+        const closed=way.nodes.length>3&&way.nodes[0]===way.nodes[way.nodes.length-1]&&way.tags.area!=='no'&&(!way.tags.highway||way.tags.area==='yes');
+        features.push({type:'Feature',properties:{deleted:!!d.deleted},geometry:closed?{type:'Polygon',coordinates:[coordinates]}:{type:'LineString',coordinates}});
+      }
+      return {type:'FeatureCollection',features};
+    }
+    // microMap draws line layers from LineStrings; provide explicit polygon outlines
+    // so both renderers show the same editing boundary without drawing it twice.
+    function withOutlines(data){
+      return {...data,features:data.features.flatMap(f=>f.geometry.type==='Polygon'?[f,...f.geometry.coordinates.map(ring=>({...f,geometry:{type:'LineString',coordinates:ring}}))]:[f])};
+    }
     function render(){
       const point=(coordinates,properties)=>({type:'Feature',properties,geometry:{type:'Point',coordinates}});
       const collection=features=>({type:'FeatureCollection',features});
@@ -763,9 +878,18 @@
       // dragged vertex immediately moves the outline too, not just its own point.
       const wayLine=current&&current.value.type==='way'?current.value.nodes.map((id,i)=>coordsOfNode(id)||current.shape?.coordinates?.[i]||null).filter(Boolean):null;
       let complete=true;
-      complete&=put('osm-selection',collection(wayLine&&wayLine.length>=2?[{type:'Feature',properties:{},geometry:current.shape?.closed?{type:'Polygon',coordinates:[wayLine]}:{type:'LineString',coordinates:wayLine}}]:[]),[
+      complete&=put('osm-map-data',withOutlines(mapDataVisible&&viewActive?mapDataFeatures(mapElements):collection([])),[
+        {id:'osm-map-data-fill',type:'fill',filter:['==','$type','Polygon'],paint:{'fill-color':'#64748b','fill-opacity':.12}},
+        {id:'osm-map-data-line',type:'line',filter:['==','$type','LineString'],paint:{'line-color':'#64748b','line-width':2}},
+        {id:'osm-map-data-nodes',type:'circle',filter:['==','$type','Point'],paint:{'circle-radius':['case',['get','tagged'],5,2.5],'circle-color':'#64748b','circle-stroke-color':'#fff','circle-stroke-width':1}},
+      ]);
+      complete&=put('osm-draft-geometries',withOutlines(viewActive?draftGeometries():collection([])),[
+        {id:'osm-draft-geometries-fill',type:'fill',filter:['==','$type','Polygon'],paint:{'fill-color':['case',['get','deleted'],'#dc2626','#8b5cf6'],'fill-opacity':.15}},
+        {id:'osm-draft-geometries-line',type:'line',filter:['==','$type','LineString'],paint:{'line-color':['case',['get','deleted'],'#dc2626','#8b5cf6'],'line-width':3}},
+      ]);
+      complete&=put('osm-selection',withOutlines(collection(wayLine&&wayLine.length>=2?[{type:'Feature',properties:{},geometry:current.shape?.closed?{type:'Polygon',coordinates:[wayLine]}:{type:'LineString',coordinates:wayLine}}]:[])),[
         {id:'osm-selection-fill',type:'fill',filter:['==','$type','Polygon'],paint:{'fill-color':'#2563eb','fill-opacity':.16}},
-        {id:'osm-selection-line',type:'line',paint:{'line-color':'#2563eb','line-width':4}},
+        {id:'osm-selection-line',type:'line',filter:['==','$type','LineString'],paint:{'line-color':'#2563eb','line-width':4}},
       ]);
       complete&=put('osm-candidates',collection(current?[]:candidates.filter(c=>c.coordinates).map(c=>point(c.coordinates,{active:highlighted===c.type+'/'+c.id}))),[
         {id:'osm-candidates-points',type:'circle',paint:{'circle-radius':['case',['get','active'],10,6],'circle-color':['case',['get','active'],'#2563eb','#60a5fa'],'circle-opacity':.9,'circle-stroke-width':2,'circle-stroke-color':'#fff'}},
@@ -774,9 +898,9 @@
       complete&=put('osm-drafts',collection(shown.map(d=>({d,at:d.value.type==='node'?[d.value.lon,d.value.lat]:d.center})).filter(x=>x.at).map(x=>point(x.at,{selected:isCurrent(x.d)}))),[
         {id:'osm-drafts-points',type:'circle',paint:{'circle-radius':['case',['get','selected'],10,7],'circle-color':['case',['get','selected'],'#2563eb','#8b5cf6'],'circle-stroke-width':2,'circle-stroke-color':'#fff'}},
       ]);
-      const vertices=geometryMode&&current&&current.value.type==='way'?[...new Set(current.value.nodes)]:[];
-      complete&=put('osm-vertices',collection(vertices.map(id=>coordsOfNode(id)).filter(Boolean).map((coord,i)=>point(coord,{dragging:vertices[i]===dragNodeId}))),[
-        {id:'osm-vertices-points',type:'circle',paint:{'circle-radius':['case',['get','dragging'],9,7],'circle-color':'#f59e0b','circle-stroke-width':2,'circle-stroke-color':'#fff'}},
+      const vertices=geometryMode&&current?(current.value.type==='way'?[...new Set(current.value.nodes)]:current.value.type==='node'?[current.value.id]:[]):[];
+      complete&=put('osm-vertices',collection(vertices.map(id=>coordsOfNode(id)).filter(Boolean).map((coord,i)=>point(coord,{dragging:vertices[i]===dragNodeId,selected:vertices[i]===selectedVertexId}))),[
+        {id:'osm-vertices-points',type:'circle',paint:{'circle-radius':['case',['get','dragging'],9,7],'circle-color':['case',['get','selected'],'#2563eb','#f59e0b'],'circle-stroke-width':2,'circle-stroke-color':'#fff'}},
       ]);
       const drawLine=drawPoints.length>1?[{type:'Feature',properties:{},geometry:drawKind==='area'&&drawPoints.length>2?{type:'Polygon',coordinates:[closeRing(drawPoints.map(p=>[p.lon,p.lat]))]}:{type:'LineString',coordinates:drawPoints.map(p=>[p.lon,p.lat])}}]:[];
       const drawVertices=drawPoints.map(p=>point([p.lon,p.lat],{snapped:!!p.nodeId}));
@@ -790,7 +914,7 @@
       // for why this never shares state with drafts/osc().
       complete&=put('osm-confidential',collection(confidentialObjects.map(o=>({type:'Feature',properties:{id:o.id},geometry:{type:o.geometry_type,coordinates:o.coordinates}}))),[
         {id:'osm-confidential-fill',type:'fill',filter:['==','$type','Polygon'],paint:{'fill-color':'#475569','fill-opacity':.14}},
-        {id:'osm-confidential-line',type:'line',filter:['!=','$type','Point'],paint:{'line-color':'#475569','line-width':2.5,'line-dasharray':[3,2]}},
+        {id:'osm-confidential-line',type:'line',filter:['==','$type','LineString'],paint:{'line-color':'#475569','line-width':2.5,'line-dasharray':[3,2]}},
         {id:'osm-confidential-points',type:'circle',filter:['==','$type','Point'],paint:{'circle-radius':7,'circle-color':'#475569','circle-stroke-width':2,'circle-stroke-color':'#fff'}},
         {id:'osm-confidential-lock',type:'symbol',filter:['==','$type','Point'],layout:{'text-field':'🔒','text-size':11,'text-offset':[0,-1.3],'text-allow-overlap':true}},
       ]);
@@ -802,7 +926,8 @@
     // While a vertex is being dragged its live position overrides the saved/base coordinate.
     function coordsOfNode(id){
       if(dragPreview.has(id))return dragPreview.get(id);
-      const draft=drafts.find(d=>!d.deleted&&d.value.type==='node'&&d.value.id===id)||current?.pendingNodes?.find(d=>d.value.id===id);
+      if(current?.value.type==='node'&&current.value.id===id)return [current.value.lon,current.value.lat];
+      const draft=current?.pendingNodes?.find(d=>d.value.id===id)||drafts.find(d=>!d.deleted&&d.value.type==='node'&&d.value.id===id);
       if(draft)return [draft.value.lon,draft.value.lat];
       const base=current?.nodeElements?.get(id);
       return base?[base.lon,base.lat]:null;
@@ -817,17 +942,89 @@
     // Both are opt-in (a toggle button, or an explicit "draw" action) so ordinary tag editing
     // never risks an accidental geometry change.
     function toggleGeometryMode(){
-      if(!current||current.value.type!=='way')return;
-      geometryMode=!geometryMode;dragNodeId=null;dragPreview.clear();
+      if(!current||current.value.type==='relation'||current.confidentialID||busy)return;
+      if(dragNodeId!=null)map.dragPan?.enable?.();
+      geometryMode=!geometryMode;insertMode=false;selectedVertexId=current.value.type==='node'?current.value.id:null;dragNodeId=null;dragPreview.clear();
       applyMode();render();
       const geomToggle=el('osmGeometryToggle');
       if(geomToggle){geomToggle.setAttribute('aria-pressed',String(geometryMode));geomToggle.textContent=geometryMode?'Punkte bearbeiten beenden':'Punkte bearbeiten';}
-      say(geometryMode?'Punkte bearbeiten aktiv. Ziehe einen Punkt auf der Karte, um ihn zu verschieben.':'Punkte bearbeiten beendet.');
+      say(geometryMode?'Geometrie bearbeiten: Punkte ziehen oder auswählen. Änderungen mit „Entwurf speichern“ übernehmen.':'Punkte bearbeiten beendet.');
+    }
+    function syncGeometryUI(){
+      const box=el('osmGeometryTools');if(!box)return;
+      box.hidden=!geometryMode||!current;
+      const selected=selectedVertexId!=null?coordsOfNode(selectedVertexId):null;
+      el('osmVertexStatus').textContent=selected?`Knoten ${selectedVertexId} ausgewählt`:'Wähle einen Wegpunkt auf der Karte.';
+      for(const [id,value] of [['osmVertexLon',selected?.[0]],['osmVertexLat',selected?.[1]]]){el(id).disabled=!selected||busy;el(id).value=value==null?'':value.toFixed(7);}
+      el('osmVertexApply').disabled=!selected||busy;
+      el('osmVertexRemove').disabled=!selected||busy||current?.value.type!=='way';
+      el('osmVertexInsert').hidden=current?.value.type!=='way';
+      el('osmVertexInsert').setAttribute('aria-pressed',String(insertMode));
+    }
+    function selectVertex(id){
+      if(!geometryMode||!current)return;
+      const ids=current.value.type==='node'?[current.value.id]:current.value.nodes;
+      if(!ids.includes(id))return;
+      selectedVertexId=id;syncGeometryUI();render();
+    }
+    function insertVertex(index,coordinate){
+      try{
+        if(!geometryMode||busy||current?.value.type!=='way'||current.confidentialID)return;
+        const id=nextTempId([...drafts,...(current.pendingNodes||[])],'node');
+        const nodes=editWayNodes(current.value.nodes,index,id);
+        const node=validateDraft({base:null,value:{type:'node',id,lon:coordinate[0],lat:coordinate[1],tags:{}}});
+        (current.pendingNodes||=[]).push(node);current.value.nodes=nodes;
+        selectedVertexId=id;insertMode=false;dirty=true;analyze();applyMode();render();
+        say('Wegpunkt eingefügt. Entwurf speichern, um die Änderung zu behalten.');
+      }catch(e){say(userError(e));}
+    }
+    function removeVertex(){
+      try{
+        if(!geometryMode||busy||selectedVertexId==null||current?.value.type!=='way')return;
+        const index=current.value.nodes.indexOf(selectedVertexId);
+        // The last vertex of an open line is removable too; insertion has a different range.
+        const nodes=index===current.value.nodes.length-1&&current.value.nodes[0]!==selectedVertexId
+          ?editWayNodes([...current.value.nodes].reverse(),0).reverse():editWayNodes(current.value.nodes,index);
+        current.value.nodes=nodes;
+        current.pendingNodes=(current.pendingNodes||[]).filter(d=>d.value.id!==selectedVertexId||nodes.includes(selectedVertexId));
+        selectedVertexId=null;dirty=true;analyze();applyMode();render();
+        say('Punkt aus diesem Weg entfernt. Gemeinsame OSM-Knoten bleiben erhalten.');
+      }catch(e){say(userError(e));}
+    }
+    function geometryClick(event){
+      if(!geometryMode||!current||busy)return;
+      const point=event.point||map.project([event.lngLat.lng,event.lngLat.lat]);
+      if(!insertMode){const id=vertexAt(point);if(id!=null)selectVertex(id);return;}
+      let best=null;
+      for(let i=0;i<current.value.nodes.length-1;i++){
+        const a=coordsOfNode(current.value.nodes[i]),b=coordsOfNode(current.value.nodes[i+1]);if(!a||!b)continue;
+        const pa=map.project(a),pb=map.project(b),dx=pb.x-pa.x,dy=pb.y-pa.y;
+        const length=dx*dx+dy*dy;if(!length)continue;
+        const t=Math.max(0,Math.min(1,((point.x-pa.x)*dx+(point.y-pa.y)*dy)/length));
+        const distance=Math.hypot(point.x-pa.x-t*dx,point.y-pa.y-t*dy);
+        if(!best||distance<best.distance)best={index:i,distance,coordinate:[a[0]+t*(b[0]-a[0]),a[1]+t*(b[1]-a[1])]};
+      }
+      if(best&&best.distance<20)insertVertex(best.index,best.coordinate);else say('Klicke direkt auf einen Wegabschnitt, um einen Punkt einzufügen.');
+    }
+    async function loadMapData(){
+      if(!canSwitch())return;
+      try{
+        if(map.getZoom()<16)throw Error('Zoome auf Stufe 16 oder näher, um OSM-Objekte zu laden.');
+        const b=map.getBounds(),bbox=[b.getWest(),b.getSouth(),b.getEast(),b.getNorth()];
+        if(!bbox.every(Number.isFinite)||bbox[0]>=bbox[2]||bbox[1]>=bbox[3]||(bbox[2]-bbox[0])*(bbox[3]-bbox[1])>.01)throw Error('Wähle einen kleineren Kartenausschnitt.');
+        setBusy(true);say('OSM-Objekte im sichtbaren Ausschnitt laden …');
+        const response=await fetch(`https://api.openstreetmap.org/api/0.6/map.json?bbox=${bbox.join(',')}`,{signal:AbortSignal.timeout(20000),credentials:'omit'});
+        if(!response.ok)throw Error(`OSM-Kartendaten konnten nicht geladen werden (HTTP ${response.status}).`);
+        const body=await response.json();if(!Array.isArray(body.elements)||body.elements.length>50000)throw Error('Ungültiger oder zu großer OSM-Ausschnitt.');
+        mapElements=body.elements;mapDataVisible=true;el('osmMapDataToggle').setAttribute('aria-pressed','true');
+        render();el('osmMapDataStatus').textContent=`${mapElements.filter(e=>e.type==='way').length} Wege · ${mapElements.filter(e=>e.type==='node').length} Knoten geladen`;
+        say('OSM-Objekte geladen. Wähle einen Punkt, Weg oder eine Fläche auf der Karte.');
+      }catch(e){say(userError(e));}finally{setBusy(false);}
     }
     function vertexAt(point){
-      if(!geometryMode||!current||current.value.type!=='way'||!map.project)return null;
+      if(!geometryMode||!current||busy||!map.project)return null;
       let best=null,bestDist=14;
-      for(const id of new Set(current.value.nodes)){
+      for(const id of new Set(current.value.type==='node'?[current.value.id]:current.value.nodes)){
         const coord=coordsOfNode(id);if(!coord)continue;
         const p=map.project(coord),dist=Math.hypot(p.x-point.x,p.y-point.y);
         if(dist<bestDist){bestDist=dist;best=id;}
@@ -835,17 +1032,20 @@
       return best;
     }
     function mapMouseDown(event){
-      if(event.originalEvent?.target?.closest?.('.maplibregl-marker, .maplibregl-popup'))return;
+      if(event.originalEvent?.target?.closest?.('.maplibregl-marker, .maplibregl-popup, .micromap-marker, .micromap-popup'))return;
+      if(!viewActive||insertMode||event.originalEvent?.button>0)return;
       const id=vertexAt(event.point);
       if(id==null)return;
       event.preventDefault?.();
       if(splitMode){performSplit(id);return;}
-      dragNodeId=id;dragPreview.set(id,[normLon(event.lngLat.lng),event.lngLat.lat]);
+      selectedVertexId=id;syncGeometryUI();
+      dragNodeId=id;dragPreview.set(id,coordsOfNode(id));
       map.dragPan?.disable?.();
       map.getCanvas().style.cursor='grabbing';
       render();
     }
     function mapMouseMove(event){
+      if(!viewActive)return;
       if(dragNodeId==null){
         if(geometryMode&&!busy)map.getCanvas().style.cursor=vertexAt(event.point)!=null?'grab':'crosshair';
         return;
@@ -860,26 +1060,25 @@
       map.dragPan?.enable?.();
       map.getCanvas().style.cursor=geometryMode?'grab':'';
       if(!coord){render();return;}
+      const prior=coordsOfNode(id);
+      if(prior&&prior[0]===coord[0]&&prior[1]===coord[1]){syncGeometryUI();render();return;}
       return commitNodeMove(id,coord);
     }
     async function commitNodeMove(id,[lon,lat]){
       try{
-        const index=drafts.findIndex(x=>!x.deleted&&x.value.type==='node'&&x.value.id===id);
-        const pendingIndex=current?.pendingNodes?.findIndex(x=>x.value.id===id)??-1;
-        if(index>=0)drafts[index]=validateDraft({...drafts[index],value:{...drafts[index].value,lon,lat}});
-        else if(pendingIndex>=0)current.pendingNodes[pendingIndex]=validateDraft({...current.pendingNodes[pendingIndex],value:{...current.pendingNodes[pendingIndex].value,lon,lat}});
-        else if(id<0)throw Error('Neuer Punkt ohne bekannte Basisdaten kann nicht verschoben werden.');
-        else{
-          let base=current?.nodeElements?.get(id);
-          if(!base){
-            const response=await fetch(`https://api.openstreetmap.org/api/0.6/node/${id}.json`,{signal:AbortSignal.timeout(15000),credentials:'omit'});
-            if(!response.ok)throw Error('Knoten konnte nicht geladen werden.');
-            const body=await response.json();
-            base=element(body.elements?.find(e=>e.type==='node'&&e.id===id));
-          }
-          drafts.push(validateDraft({base,value:{...base,lon,lat}}));
+        if(!Number.isFinite(lon)||!Number.isFinite(lat)||Math.abs(lon)>180||Math.abs(lat)>90)throw Error('Ungültige Koordinaten.');
+        if(current?.value.type==='node'&&current.value.id===id){
+          current.value={...current.value,lon,lat};current.center=[lon,lat];dirty=true;analyze();render();syncGeometryUI();return;
         }
-        say('Punkt verschoben.'+persist());refresh();
+        const prior=drafts.find(x=>!x.deleted&&x.value.type==='node'&&x.value.id===id);
+        const pending=current.pendingNodes||=[];
+        const pendingIndex=pending.findIndex(x=>x.value.id===id);
+        let base=pendingIndex>=0?pending[pendingIndex].base:prior?.base||current.nodeElements?.get(id);
+        const value=pendingIndex>=0?pending[pendingIndex].value:prior?.value||base;
+        if(!value)throw Error('Knotenbasis fehlt. Lade den Weg erneut von OSM.');
+        const moved=validateDraft({base:base||null,value:{...value,lon,lat}});
+        if(pendingIndex>=0)pending[pendingIndex]=moved;else pending.push(moved);
+        dirty=true;analyze();render();syncGeometryUI();say('Punkt verschoben. Entwurf speichern, um die Änderung zu behalten.');
       }catch(e){say(userError(e));render();}
     }
     // Snapping a drawn point onto an already-recorded vertex keeps new ways connected to the
@@ -910,6 +1109,7 @@
     }
     function startDrawing(kind){
       if(!canSwitch())return;
+      geometryMode=false;insertMode=false;setTab('find');
       cancel();options.onStart?.();
       drawing=true;drawKind=kind;drawPoints=[];
       applyMode();render();
@@ -936,6 +1136,8 @@
       const minimum=drawKind==='area'?3:2;
       if(drawPoints.length<minimum){say(`Mindestens ${minimum} Punkte nötig, um ${drawKind==='area'?'eine Fläche':'einen Weg'} abzuschließen.`);return;}
       try{
+        const drawingCoordinates=drawPoints.map(p=>[p.lon,p.lat]);
+        validateWayCoordinates(drawKind==='area'?[...drawingCoordinates,drawingCoordinates[0]]:drawingCoordinates,drawKind==='area');
         const pendingNodes=[];
         const nodeIds=drawPoints.map(p=>{
           if(p.nodeId)return p.nodeId;
@@ -1079,17 +1281,23 @@
           }catch{/* keep the empty local result; the status message below still explains it */}
         }
         renderCandidates();
-        say(candidates.length?`${candidates.length} ${candidates.length===1?'Ort':'Orte'} gefunden. Wähle einen aus, um ihn zu bearbeiten.`:'Keine erfassten Orte gefunden. Verschiebe die Karte, ändere die Suche oder trage einen neuen Ort ein.');
+        if(tab==='find')say(candidates.length?`${candidates.length} ${candidates.length===1?'Ort':'Orte'} gefunden. Wähle einen aus, um ihn zu bearbeiten.`:'Keine erfassten Orte gefunden. Verschiebe die Karte, ändere die Suche oder trage einen neuen Ort ein.');
       }catch(e){say(userError(e));}finally{setBusy(false);}
     }
     async function pick(lngLat){
       if(busy||!canSwitch())return;
       el('osmPickMiss').hidden=true;
       const radius=Math.round(pickRadiusMeters(lngLat.lat,map.getZoom?.()??17)),lat=lngLat.lat,lon=normLon(lngLat.lng);
+      const draftElements=drafts.filter(d=>!d.deleted).map(d=>d.value);
+      const workingElements=new Map(mapElements.map(e=>[e.type+'/'+e.id,e]));
+      for(const e of draftElements)workingElements.set(e.type+'/'+e.id,e);
+      const localHit=candidatesFromElements([...workingElements.values()],lat,lon,radius).find(c=>drafts.some(d=>!d.deleted&&d.value.type===c.type&&d.value.id===c.id));
+      if(localHit){const draft=drafts.find(d=>!d.deleted&&d.value.type===localHit.type&&d.value.id===localHit.id);cancel();open(draft);say('Lokalen Entwurf geöffnet.');return;}
       let hit=null;
       setBusy(true);say('Suche erfassten Ort an dieser Stelle …');
       try{
-        let found=await fetchPois({lat,lon,radius_m:radius,limit:10},8000);
+        let found=candidatesFromElements(mapElements,lat,lon,radius);
+        if(!found.length)found=await fetchPois({lat,lon,radius_m:radius,limit:10},8000);
         if(!found.length){
           say('Nichts in der lokalen Liste; prüfe direkt bei OpenStreetMap …');
           try{found=await resolveLiveCandidates(lat,lon,Math.max(radius,15));}catch{/* stays empty; miss message below covers it */}
@@ -1123,13 +1331,25 @@
       if(!canSwitch())return;
       if(!['node','way','relation'].includes(type)||!validID(Number(id))){say('Gib die numerische OSM-ID ein, zum Beispiel 123456. Du findest sie auf der Objektseite von OpenStreetMap.');return;}
       const existing=drafts.find(d=>!d.deleted&&d.value.type===type&&d.value.id===Number(id));
-      if(existing){cancel();open(existing);flyToObject(existing);say('Vorhandenen Entwurf geöffnet. Die Basisversion bleibt erhalten.');return;}
+      if(existing){
+        cancel();let enriched=existing;
+        if(type==='way'&&Number(id)>0){
+          setBusy(true);
+          try{
+            const response=await fetch(`https://api.openstreetmap.org/api/0.6/way/${id}/full.json`,{signal:AbortSignal.timeout(15000),credentials:'omit'});
+            if(response.ok){const body=await response.json();rememberElements(body.elements);enriched={...existing,nodeElements:nodeIndex(body.elements),shape:wayShape(body.elements,Number(id))};}
+          }catch{/* Saved tags remain editable offline; unavailable geometry stays uneditable. */}
+          finally{setBusy(false);}
+        }
+        open(enriched);flyToObject(enriched);say('Vorhandenen Entwurf geöffnet. Die Basisversion bleibt erhalten.');return;
+      }
       id=String(Number(id));
       cancel();setBusy(true);say('Aktuellen Stand von api.openstreetmap.org laden …');
       try{
         const response=await fetch(`https://api.openstreetmap.org/api/0.6/${type}/${id}${type==='node'?'':'/full'}.json`,{signal:AbortSignal.timeout(15000),credentials:'omit'});
         if(!response.ok)throw Error(response.status===404||response.status===410?'Dieses Objekt ist auf OSM nicht verfügbar. Prüfe die ID oder wähle ein anderes Objekt.':response.status===429?'OSM erhält gerade zu viele Anfragen. Warte kurz und versuche es erneut.':`OSM konnte das Objekt nicht laden (HTTP ${response.status}). Bitte erneut versuchen.`);
         const body=await response.json(),base=element(body.elements?.find(e=>e.type===type&&e.id===Number(id)));
+        rememberElements(body.elements);
         if(dirty)throw Error('Offene Änderungen erst speichern oder verwerfen, dann erneut laden.');
         const shape=base.type==='way'?wayShape(body.elements,base.id):null;
         const nodeElements=base.type==='way'?nodeIndex(body.elements):null;
@@ -1150,8 +1370,9 @@
       }catch(e){say(userError(e));}
     }
     function mapClick(event){
-      if(event.originalEvent?.target?.closest?.('.maplibregl-marker, .maplibregl-popup'))return;
+      if(event.originalEvent?.target?.closest?.('.maplibregl-marker, .maplibregl-popup, .micromap-marker, .micromap-popup'))return;
       const m=mode();
+      if(m==='geometry')return geometryClick(event);
       if(m==='draw')return addDrawPoint(event.lngLat);
       if(m==='place')return place(event.lngLat);
       if(m==='pick')return pick(event.lngLat);
@@ -1268,25 +1489,58 @@
         if(!current)return;
         if(current.confidentialID||(!current.base&&current.value.type!=='relation'&&el('osmConfidentialToggle')?.checked))return saveConfidential();
         const isRelation=current.value.type==='relation';
+        if(current.value.type==='way'&&(!current.base||geometryChange(current.base,current.value)||current.pendingNodes?.length)){
+          const coordinates=current.value.nodes.map(coordsOfNode);
+          if(coordinates.every(Boolean))validateWayCoordinates(coordinates,current.value.nodes.length>3&&current.value.nodes[0]===current.value.nodes[current.value.nodes.length-1]);
+        }
+        if(current.value.type==='way'){const coords=current.value.nodes.map(coordsOfNode).filter(Boolean);if(coords.length)current.center=[(Math.min(...coords.map(p=>p[0]))+Math.max(...coords.map(p=>p[0])))/2,(Math.min(...coords.map(p=>p[1]))+Math.max(...coords.map(p=>p[1])))/2];}
         const d=validateDraft({...current,value:{...current.value,tags:tags(trimmed()),...(isRelation?{members:members.map(m=>({...m}))}:{})}});
         const pending=current.pendingNodes||[];
         if(!d.base&&d.value.type==='node'&&!Object.keys(d.value.tags).length)throw Error('Ein neuer Punkt benötigt mindestens einen Tag.');
         const index=drafts.findIndex(x=>sameObject(x,d));
-        let message;
-        if(d.base&&!pending.length&&elementUnchanged(d.base,d.value)){if(index>=0)drafts.splice(index,1);message='Keine Änderungen; das Objekt ist nicht im Export.';}
-        else{
-          const next=drafts.slice();
-          for(const n of pending)next.push(n);
-          if(index<0)next.push(d);else next[index]=d;
-          if(next.length>100)throw Error('Maximal 100 Entwürfe.');
-          const issues=checkReferences(next);
-          if(issues.length)throw Error(issues.join(' '));
-          drafts=next;
-          message=`Entwurf gespeichert (${drafts.length} im Arbeitsstand). Wähle den nächsten Ort oder öffne „Entwürfe“ zum Export.`;
+        const before=new Set(drafts.find(x=>sameObject(x,d))?.value?.nodes||[]);
+        const next=drafts.slice();
+        for(const n of pending){const at=next.findIndex(x=>sameObject(x,n));if(at<0)next.push(n);else next[at]=n;}
+        const unchanged=d.base&&elementUnchanged(d.base,d.value);
+        if(unchanged){if(index>=0)next.splice(index,1);}
+        else if(index<0)next.push(d);else next[index]=d;
+        if(d.value.type==='way'){
+          for(let i=next.length-1;i>=0;i--){
+            const n=next[i];if(n.base||n.deleted||n.value.type!=='node'||n.value.id>0||!before.has(n.value.id)||Object.keys(n.value.tags).length)continue;
+            if(!next.some(x=>!x.deleted&&((x.value.type==='way'&&x.value.nodes.includes(n.value.id))||(x.value.type==='relation'&&x.value.members.some(m=>m.type==='node'&&m.ref===n.value.id)))))next.splice(i,1);
+          }
         }
+        if(next.length>100)throw Error('Maximal 100 Entwürfe.');
+        const issues=checkReferences(next);if(issues.length)throw Error(issues.join(' '));
+        drafts=next;
+        const message=unchanged&&!pending.length?'Keine Änderungen; das Objekt ist nicht im Export.':`Entwurf gespeichert (${drafts.length} im Arbeitsstand). Wähle das nächste Objekt oder öffne „Entwürfe“ zum Export.`;
         closeCurrent();say(message+persist());refresh();setTab(isRelation?'relations':'find');
         status.focus?.();
       }catch(e){say(userError(e));}finally{syncUI();}
+    }
+    async function deleteObject(){
+      if(!current?.base||current.confidentialID||!canSwitch())return;
+      const base=current.base;
+      if(!confirm(`„${label(current.value)}“ als Löschentwurf vormerken? Die Löschung bleibt lokal und kann rückgängig gemacht werden.`))return;
+      setBusy(true);
+      try{
+        const endpoints=base.type==='node'?['ways','relations']:['relations'];
+        for(const endpoint of endpoints){
+          const response=await fetch(`https://api.openstreetmap.org/api/0.6/${base.type}/${base.id}/${endpoint}.json`,{signal:AbortSignal.timeout(15000),credentials:'omit'});
+          if(!response.ok)throw Error('Verwendungen des Objekts konnten nicht geprüft werden. Löschentwurf nicht angelegt.');
+          const body=await response.json();if(!Array.isArray(body.elements))throw Error('Ungültige Antwort bei der Prüfung der Verwendungen.');
+          const used=body.elements.filter(e=>{
+            const parent=drafts.find(d=>(d.deleted?d.base:d.value).type===e.type&&(d.deleted?d.base:d.value).id===e.id);
+            if(!parent)return true;if(parent.deleted)return false;
+            return parent.value.type==='way'?parent.value.nodes.includes(base.id):parent.value.members.some(m=>m.type===base.type&&m.ref===base.id);
+          });
+          if(used.length)throw Error(`Objekt wird noch von ${used.length} ${endpoint==='ways'?'Wegen':'Relationen'} verwendet. Zuerst die Verwendungen bearbeiten.`);
+        }
+        const next=drafts.filter(d=>keyOf(d)!==keyOf(current));next.push(validateDraft({base,deleted:true}));
+        if(next.length>100)throw Error('Maximal 100 Entwürfe.');
+        const issues=checkReferences(next);if(issues.length)throw Error(issues.join(' '));
+        drafts=next;closeCurrent();say('Löschentwurf angelegt. Mit „Rückgängig“ wiederherstellen.'+persist());refresh();setTab('drafts');
+      }catch(e){say(userError(e));}finally{setBusy(false);}
     }
     function discard(){
       const wasRelation=current?.value.type==='relation';
@@ -1303,7 +1557,7 @@
     el('osmNew').addEventListener('click',()=>{
       if(!canSwitch())return;
       if(placing){cancel();say('Punktsetzen beendet.');return;}
-      options.onStart?.();placing=true;el('osmPickMiss').hidden=true;applyMode();
+      cancel();geometryMode=false;setTab('find');options.onStart?.();placing=true;el('osmPickMiss').hidden=true;applyMode();
       say('Punktsetzen aktiv. Klicke auf die genaue Position des neuen Ortes.');syncUI();
     });
     el('osmPickPlace').addEventListener('click',()=>{if(missPoint&&canSwitch()){const point=missPoint;missPoint=null;el('osmPickMiss').hidden=true;placing=true;place(point);}});
@@ -1312,6 +1566,16 @@
     el('osmDrawUndo')?.addEventListener('click',undoDrawPoint);
     el('osmDrawFinish')?.addEventListener('click',finishDraw);
     el('osmDrawCancel')?.addEventListener('click',()=>{cancel();say('Zeichnen abgebrochen.');});
+    for(const [tool,original] of [['osmToolPoint','osmNew'],['osmToolLine','osmDrawLine'],['osmToolArea','osmDrawArea'],['osmToolUndo','osmUndo'],['osmToolRedo','osmRedo']])el(tool)?.addEventListener('click',()=>el(original).click());
+    el('osmLoadMapData')?.addEventListener('click',loadMapData);
+    el('osmMapDataToggle')?.addEventListener('click',()=>{mapDataVisible=!mapDataVisible;el('osmMapDataToggle').setAttribute('aria-pressed',String(mapDataVisible));render();});
+    el('osmVertexInsert')?.addEventListener('click',()=>{insertMode=!insertMode;syncGeometryUI();say(insertMode?'Klicke auf einen Wegabschnitt, um einen Punkt einzufügen.':'Punkt einfügen beendet.');});
+    el('osmVertexRemove')?.addEventListener('click',removeVertex);
+    el('osmVertexApply')?.addEventListener('click',()=>{
+      const lon=el('osmVertexLon').value.trim(),lat=el('osmVertexLat').value.trim();
+      if(!lon||!lat){say('Beide Koordinaten ausfüllen.');return;}
+      return commitNodeMove(selectedVertexId,[Number(lon),Number(lat)]);
+    });
     el('osmGeometryToggle')?.addEventListener('click',toggleGeometryMode);
     el('osmSplit')?.addEventListener('click',startSplit);
     el('osmMergeGo')?.addEventListener('click',()=>mergeWith(el('osmMergeId').value));
@@ -1334,10 +1598,11 @@
     el('osmAddTag').addEventListener('click',()=>{const pair=['',''];working.push(pair);dirty=true;renderTable();analyze();el('osmTags').children[el('osmTags').children.length-1]?.children[0].focus?.();});
     el('osmSave').addEventListener('click',save);
     el('osmDiscard').addEventListener('click',discard);
+    el('osmDeleteObject')?.addEventListener('click',deleteObject);
     el('osmLocate').addEventListener('click',()=>{if(current)flyToObject(current);});
     el('osmEmptyFind').addEventListener('click',()=>setTab('find',true));
     for(const [id,buttonId] of TABS){
-      el(buttonId).addEventListener('click',()=>setTab(id,false));
+      el(buttonId).addEventListener('click',()=>{setTab(id,false);if(id==='drafts')say(dirty?'Offene Änderungen zuerst speichern oder verwerfen.':drafts.length?'Arbeitsstand lokal gespeichert. Prüfe die Änderungen vor dem Export.':'Noch keine Entwürfe im Arbeitsstand.');});
       el(buttonId).addEventListener('keydown',event=>{
         const order=TABS.map(t=>t[0]),at=order.indexOf(id);
         const next={ArrowRight:order[(at+1)%order.length],ArrowLeft:order[(at+order.length-1)%order.length],Home:order[0],End:order[order.length-1]}[event.key];
@@ -1377,7 +1642,19 @@
     });
     root.addEventListener?.('beforeunload',e=>{if(dirty){e.preventDefault();e.returnValue='';}});
     document.addEventListener('keydown',e=>{
-      if(e.key==='Escape'&&splitMode){splitMode=false;say('Weg teilen abgebrochen.');}
+      const editingInput=/^(INPUT|TEXTAREA|SELECT)$/.test(e.target?.tagName)||e.target?.isContentEditable;
+      if(viewActive&&!editingInput&&!busy){
+        if((e.ctrlKey||e.metaKey)&&(e.key||'').toLowerCase()==='z'){e.preventDefault();el(e.shiftKey?'osmRedo':'osmUndo').click();return;}
+        if(!e.ctrlKey&&!e.metaKey&&!e.altKey){
+          if(e.key==='Enter'&&drawing){e.preventDefault();finishDraw();return;}
+          if((e.key==='Delete'||e.key==='Backspace')&&geometryMode){e.preventDefault();removeVertex();return;}
+          const shortcut={p:'osmToolPoint',l:'osmToolLine',a:'osmToolArea'}[(e.key||'').toLowerCase()];
+          if(shortcut){e.preventDefault();el(shortcut).click();return;}
+        }
+      }
+      if(e.key==='Escape'&&insertMode){insertMode=false;syncGeometryUI();say('Punkt einfügen abgebrochen.');}
+      else if(e.key==='Escape'&&geometryMode&&!splitMode){toggleGeometryMode();}
+      else if(e.key==='Escape'&&splitMode){splitMode=false;say('Weg teilen abgebrochen.');}
       else if(e.key==='Escape'&&(placing||drawing)){const wasDrawing=drawing;cancel();say(wasDrawing?'Zeichnen abgebrochen.':'Punktsetzen beendet.');}
       const view=el('osmEditView');
       if((e.ctrlKey||e.metaKey)&&(e.key||'').toLowerCase()==='s'&&current&&!view.hidden&&view.offsetParent!==null){e.preventDefault();if(!el('osmSave').disabled)save();}
@@ -1391,14 +1668,15 @@
       startAt(point){if(!canSwitch())return;options.onStart?.();placing=true;place(point);},
       findNearby(point){if(!canSwitch())return;setTab('find');el('osmSearch').value='';nearbyPoint=point;search();status.focus?.();},
       enter(){
-        viewActive=true;options.onStart?.();applyMode();
+        viewActive=true;options.onStart?.();applyMode();render();
         // Deferred so an action that opens the view (context menu, hover) can claim the editor first.
         setTimeout(()=>{if(viewActive&&tab==='find'&&!busy&&!current&&(!candidates.length||movedAway()))search();},0);
         return loadConfidentialObjects();
       },
-      leave(){viewActive=false;placing=false;applyMode();},
+      leave(){viewActive=false;cancel();geometryMode=false;dragNodeId=null;dragPreview.clear();map.dragPan?.enable?.();applyMode();render();},
       load,cancel,render,setTab,mapClick,addPoint:mapClick,
       startDrawing,finishDraw,undoDrawPoint,toggleGeometryMode,startSplit,mergeWith,
+      loadMapData,insertVertex,removeVertex,selectVertex,commitNodeMove,removeDraft,deleteObject,
       newRelation,loadRelation:id=>load('relation',id),addMember,
       mapMouseDown,mapMouseMove,mapMouseUp,
       get active(){return mode()!==null;},
@@ -1411,5 +1689,5 @@
     };
     return api;
   }
-  root.OSMEditor={tags,element,changes,geometryChange,memberChanges,validateDraft,nextTempId,checkReferences,osc,restore,checkVersions,wayShape,nodeIndex,pickRadiusMeters,formatDistance,metersBetween,nearestPointOnSegment,resolveLiveCandidates,create};
+  root.OSMEditor={tags,element,changes,geometryChange,memberChanges,validateDraft,nextTempId,checkReferences,osc,restore,checkVersions,wayShape,nodeIndex,pickRadiusMeters,formatDistance,metersBetween,nearestPointOnSegment,resolveLiveCandidates,candidatesFromElements,editWayNodes,validateWayCoordinates,mapDataFeatures,create};
 })(typeof window==='undefined'?globalThis:window);

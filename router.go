@@ -18,6 +18,7 @@ import (
 // internal error text.
 var (
 	ErrRouteEngineNotReady    = errors.New("ch: not built")
+	ErrRouteEngineUnsupported = errors.New("ch routing is unavailable: shortcut graph is incomplete")
 	ErrRouteNoPath            = errors.New("no path found")
 	ErrRouteStartUnreachable  = errors.New("start node missing in graph")
 	ErrRouteTargetUnreachable = errors.New("target node missing in graph")
@@ -35,9 +36,9 @@ const (
 	// that ignores turn-state penalties and uses per-edge costs only.
 	// It is provided as an alternative algorithm for comparison/testing.
 	EngineDijkstraNode RouteEngine = "dijkstra-node"
-	// EngineCH is a minimal Contraction Hierarchies query over an upward-only
-	// graph using bidirectional Dijkstra. Preprocessing builds ranks and
-	// upward adjacency; shortcut generation is minimal and can be extended.
+	// EngineCH is retained for compatibility but rejected explicitly. The
+	// experimental upward graph has no shortcuts and cannot answer routes
+	// reliably. Use A* or Dijkstra until a complete CH implementation exists.
 	EngineCH RouteEngine = "ch"
 )
 
@@ -1149,16 +1150,12 @@ func (r *Router) RouteCostWithOptions(ctx context.Context, from, to int64, opt R
 			return 0, err
 		}
 	}
+	if opt.Engine == EngineCH {
+		return 0, ErrRouteEngineUnsupported
+	}
 	opt = opt.withDefaults()
 	if opt.Engine == EngineDijkstraNode {
 		_, cost, err := r.dijkstraNodeSearch(ctx, from, to, opt, false)
-		return cost, err
-	}
-	if opt.Engine == EngineCH {
-		if r.ch == nil {
-			return 0, ErrRouteEngineNotReady
-		}
-		_, cost, err := r.chQuery(ctx, from, to, opt)
 		return cost, err
 	}
 	_, cost, _, err := r.astar(ctx, from, to, opt, false)
@@ -1170,6 +1167,9 @@ func (r *Router) RouteWithOptions(ctx context.Context, from, to int64, opt Route
 		if err := ctx.Err(); err != nil {
 			return RouteResult{}, err
 		}
+	}
+	if opt.Engine == EngineCH {
+		return RouteResult{}, ErrRouteEngineUnsupported
 	}
 	opt = opt.withDefaults()
 	if opt.Engine == EngineDijkstraNode {
@@ -1189,27 +1189,6 @@ func (r *Router) RouteWithOptions(ctx context.Context, from, to int64, opt Route
 			Engine:     opt.Engine,
 		}, nil
 	}
-	if opt.Engine == EngineCH {
-		if r.ch == nil {
-			return RouteResult{}, ErrRouteEngineNotReady
-		}
-		path, cost, err := r.chQuery(ctx, from, to, opt)
-		if err != nil {
-			return RouteResult{}, err
-		}
-		coords := r.CoordsForPath(path)
-		distM, durS := r.computeMetrics(path, opt)
-		return RouteResult{
-			Path:       path,
-			PathCoords: coords,
-			DistanceM:  distM,
-			DurationS:  durS,
-			Cost:       cost,
-			Objective:  opt.Objective,
-			Engine:     opt.Engine,
-		}, nil
-	}
-
 	goalState, cost, came, err := r.astar(ctx, from, to, opt, true)
 	if err != nil {
 		return RouteResult{}, err
@@ -1375,8 +1354,9 @@ type chData struct {
 	up   map[int64][]Edge // upward adjacency (to higher rank)
 }
 
-// BuildCH constructs a minimal CH upward graph using a simple rank heuristic.
-// This placeholder can be extended to add full shortcut generation.
+// BuildCH constructs an incomplete experimental upward graph.
+// Deprecated: RouteWithOptions rejects EngineCH because this graph lacks the
+// shortcuts needed for correct shortest paths.
 func (r *Router) BuildCH() {
 	ndeg := make(map[int64]int32, len(r.g.adj))
 	for id, es := range r.g.adj {

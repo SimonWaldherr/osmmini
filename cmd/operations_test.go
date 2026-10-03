@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -144,5 +146,83 @@ func TestOperationsFailedWriteDoesNotPublishIndex(t *testing.T) {
 	}
 	if len(store.records) != 1 || len(store.newest) != 1 || len(store.List("", 10)) != 1 {
 		t.Fatal("failed write leaked into history")
+	}
+}
+
+func TestOperationsClientEventIDRetryAndConflict(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "operations.json")
+	store := NewOperationsStore(path)
+	input := OperationRecord{
+		ClientEventID: "offline-event-1", Type: operationTypeCheck,
+		AssetCode: "WATER-1", Status: "available", Actor: "alice",
+		OccurredAt: time.Now().Add(-time.Minute).UTC(),
+	}
+	first, err := store.Create(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry, err := store.Create(input)
+	if err != nil || retry.ID != first.ID || len(store.List("", 10)) != 1 {
+		t.Fatalf("same-session retry: record=%#v err=%v", retry, err)
+	}
+	reloaded := NewOperationsStore(path)
+	if err := reloaded.Load(); err != nil {
+		t.Fatal(err)
+	}
+	retry, err = reloaded.Create(input)
+	if err != nil || retry.ID != first.ID || len(reloaded.List("", 10)) != 1 {
+		t.Fatalf("reloaded retry: record=%#v err=%v", retry, err)
+	}
+	for _, changed := range []OperationRecord{
+		func() OperationRecord { item := input; item.Status = "unavailable"; return item }(),
+		func() OperationRecord { item := input; item.Actor = "bob"; return item }(),
+	} {
+		if _, err := reloaded.Create(changed); !errors.Is(err, ErrOperationIdempotencyConflict) {
+			t.Fatalf("changed retry error = %v", err)
+		}
+	}
+	if len(reloaded.List("", 10)) != 1 {
+		t.Fatal("conflicting retries changed the store")
+	}
+}
+
+func TestOperationsRejectNonFiniteCoordinatesAndInvalidEventID(t *testing.T) {
+	store := NewOperationsStore(filepath.Join(t.TempDir(), "operations.json"))
+	lat, lon := math.NaN(), 12.0
+	base := OperationRecord{Type: operationTypeCheck, AssetCode: "TEST", Status: "available", Latitude: &lat, Longitude: &lon}
+	if _, err := store.Create(base); err == nil {
+		t.Fatal("NaN latitude accepted")
+	}
+	lat, lon = 48, math.Inf(1)
+	if _, err := store.Create(base); err == nil {
+		t.Fatal("infinite longitude accepted")
+	}
+	base.Latitude, base.Longitude = nil, nil
+	base.ClientEventID = "unsafe/id"
+	if _, err := store.Create(base); err == nil {
+		t.Fatal("invalid event ID accepted")
+	}
+}
+
+func TestOperationsHandlerIdempotentRetryAndConflict(t *testing.T) {
+	s := &server{operations: NewOperationsStore(filepath.Join(t.TempDir(), "operations.json"))}
+	record := OperationRecord{ClientEventID: "retry-1", Type: operationTypeCheck, AssetCode: "WATER-1", Status: "available"}
+	post := func(input OperationRecord) *httptest.ResponseRecorder {
+		payload, err := json.Marshal(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := httptest.NewRecorder()
+		s.handleOperations(response, httptest.NewRequest(http.MethodPost, "/api/v1/operations", bytes.NewReader(payload)))
+		return response
+	}
+	first := post(record)
+	retry := post(record)
+	if first.Code != http.StatusCreated || retry.Code != http.StatusCreated || first.Body.String() != retry.Body.String() {
+		t.Fatalf("retry status/body: first=%d %s retry=%d %s", first.Code, first.Body.String(), retry.Code, retry.Body.String())
+	}
+	record.Status = "unavailable"
+	if conflict := post(record); conflict.Code != http.StatusConflict {
+		t.Fatalf("conflict status = %d: %s", conflict.Code, conflict.Body.String())
 	}
 }

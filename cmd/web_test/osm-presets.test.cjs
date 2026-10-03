@@ -51,3 +51,11 @@ test('value hints flag common OSM mistakes but stay silent for good input',()=>{
  assert.match(P.checkValue(f('opening_hours'),'Mo–Fr 09:00–18:00'),/Bindestrich/);assert.match(P.checkValue(f('opening_hours'),'täglich ✓'),/Ungewöhnliche/);
  assert.equal(P.checkValue(f('name'),'anything'),'');assert.equal(P.checkValue(f('website'),''),'');
 });
+
+test('building and road presets expose geometry fields while POI use stays primary',()=>{
+ assert.equal(OSMPresets.presetKeyForTags({building:'yes',amenity:'cafe'}),'cafe');
+ assert.equal(OSMPresets.presets.building.geometry,'area');
+ assert.ok(OSMPresets.fieldsFor({building:'house'}).fields.some(f=>f.key==='building:levels'));
+ assert.equal(OSMPresets.presets.footway.geometry,'line');
+ assert.ok(OSMPresets.fieldsFor({highway:'residential'}).fields.some(f=>f.key==='oneway'));
+});

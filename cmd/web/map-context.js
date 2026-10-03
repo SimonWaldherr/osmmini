@@ -30,7 +30,7 @@
       menu.style.top=Math.max(8,Math.min(clientY,root.innerHeight-menu.offsetHeight-8))+'px';
       focusAt(0);
     }
-    const isControl=target=>target.closest?.('.maplibregl-ctrl, .maplibregl-popup, button, input, select, textarea, a');
+    const isControl=target=>target.closest?.('.maplibregl-ctrl, .maplibregl-popup, .micromap-ctrl-corner, .micromap-popup, button, input, select, textarea, a');
     container.addEventListener('contextmenu',event=>{
       if(isControl(event.target))return;
       event.preventDefault();event.stopPropagation();

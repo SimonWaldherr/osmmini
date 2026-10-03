@@ -35,7 +35,7 @@ import (
 	osmmini "simonwaldherr.de/go/osmmini"
 )
 
-//go:embed web/index.html web/style.css web/app.js web/ai-ui.js web/offline-style.js web/planning.js web/map-post.js web/osm-editor.js web/osm-presets.js web/osm-hover.js web/map-context.js web/static api/openapi.yaml
+//go:embed web/index.html web/style.css web/app.js web/ai-ui.js web/offline-style.js web/planning.js web/map-post.js web/osm-editor.js web/osm-presets.js web/osm-hover.js web/map-context.js web/map-renderer.js web/static api/openapi.yaml
 var embedded embed.FS
 
 const buildVersion = "dev"
@@ -274,6 +274,7 @@ type AISettings struct {
 }
 
 type Settings struct {
+	MapDisplay MapDisplaySettings `json:"map_display"`
 	// UseCase records the selected operating context. It labels a coherent set
 	// of user-applied defaults; individual settings remain freely editable.
 	UseCase string               `json:"use_case,omitempty"`
@@ -382,6 +383,8 @@ func publicSettings(v Settings) Settings {
 // routing objective is set to minimize duration and motorway speeds are
 // assumed higher (e.g. 150 km/h). Adjust `settings.json` to override.
 func DefaultSettings(cacheDir, upstream string) Settings {
+	display := MapDisplaySettings{}
+	normalizeMapDisplay(&display)
 	mapType := "raster"
 	styleURL := ""
 	maxZoom := 19
@@ -399,7 +402,8 @@ func DefaultSettings(cacheDir, upstream string) Settings {
 		mapType = "raster-direct"
 	}
 	return Settings{
-		UseCase: "private",
+		MapDisplay: display,
+		UseCase:    "private",
 		Routing: osmmini.RouteOptions{
 			Engine: osmmini.EngineAStar,
 			// Default routing objective for Germany: minimize duration
@@ -479,6 +483,7 @@ type SettingsStore struct {
 }
 
 func NewSettingsStore(path string, def Settings) *SettingsStore {
+	normalizeMapDisplay(&def.MapDisplay)
 	return &SettingsStore{path: path, v: def}
 }
 
@@ -495,6 +500,10 @@ func (s *SettingsStore) Load() error {
 	}
 	var v Settings
 	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	normalizeMapDisplay(&v.MapDisplay)
+	if err := validateMapDisplay(v.MapDisplay); err != nil {
 		return err
 	}
 	s.v = v
@@ -1372,7 +1381,7 @@ func main() {
 	settingsPath := flag.String("settings", "settings.json", "Settings JSON file")
 	tilesDir := flag.String("tiles-dir", "tiles-cache", "Tile cache directory")
 	tileUpstream := flag.String("tile-upstream", "", "Tile upstream template (empty uses the local offline map)")
-	buildCH := flag.Bool("build-ch", false, "Build experimental Contraction Hierarchies after graph load")
+	buildCH := flag.Bool("build-ch", false, "Deprecated; rejected because experimental CH lacks shortcuts")
 	adminToken := flag.String("admin-token", os.Getenv("OSMMINI_ADMIN_TOKEN"), "Optional bearer token; when set, it is required for settings updates")
 	tinyTilesDir := flag.String("tinytiles-dir", "offline-tiles", "Directory for generated tinyTiles .ttiles artifacts")
 	territoriesDir := flag.String("territories-dir", "territories", "Directory of *.geojson territory layers (file name without extension = layer name); optional")
@@ -1397,6 +1406,9 @@ func main() {
 		return
 	}
 	flag.Parse()
+	if *buildCH {
+		log.Fatal("-build-ch is unavailable: the experimental CH graph lacks shortcuts and cannot return reliable routes")
+	}
 	if *tinyTilesReaders < 1 {
 		log.Fatal("-tinytiles-readers must be at least 1")
 	}
@@ -1471,11 +1483,6 @@ func main() {
 		log.Printf("Graph bounds: lat[%.6f..%.6f] lon[%.6f..%.6f]", b.MinLat, b.MaxLat, b.MinLon, b.MaxLon)
 	}
 	log.Printf("Graph ready: nodes=%d edges=%d addresses=%d", r.NodeCount(), r.EdgeCount(), len(addrs))
-	if *buildCH {
-		log.Printf("Building experimental CH (upward graph)...")
-		r.BuildCH()
-		log.Printf("Experimental CH ready")
-	}
 
 	tileCache := NewTileCache(store.Get().Tiles)
 	rCache := newRouteCache(5*time.Minute, routeCacheDefaultMaxItems)
@@ -2318,7 +2325,7 @@ func routeErrorMessage(err error) string {
 		return "Der Startpunkt liegt außerhalb des geladenen Kartenausschnitts oder ist nicht an das Straßennetz angebunden."
 	case errors.Is(err, osmmini.ErrRouteTargetUnreachable):
 		return "Der Zielpunkt liegt außerhalb des geladenen Kartenausschnitts oder ist nicht an das Straßennetz angebunden."
-	case errors.Is(err, osmmini.ErrRouteEngineNotReady):
+	case errors.Is(err, osmmini.ErrRouteEngineNotReady), errors.Is(err, osmmini.ErrRouteEngineUnsupported):
 		return "Das gewählte Routing-Verfahren ist gerade nicht verfügbar. Bitte versuche es mit einem anderen Profil erneut."
 	default:
 		return "Route konnte nicht berechnet werden: " + err.Error()
@@ -2346,7 +2353,7 @@ func readJSON(w http.ResponseWriter, r *http.Request, dst any, maxBytes int64) e
 // A stable "dev" version otherwise lets browsers reuse CSS/JS from older UIs.
 func webAssetVersion() string {
 	h := sha256.New()
-	for _, name := range []string{"style.css", "app.js", "ai-ui.js", "offline-style.js", "planning.js", "map-post.js", "osm-editor.js", "osm-presets.js", "osm-hover.js", "map-context.js"} {
+	for _, name := range []string{"style.css", "app.js", "ai-ui.js", "offline-style.js", "planning.js", "map-post.js", "osm-editor.js", "osm-presets.js", "osm-hover.js", "map-context.js", "map-renderer.js", "static/micromap/micromap.mjs"} {
 		data, err := os.ReadFile(filepath.Join("cmd", "web", name))
 		if err != nil {
 			data, _ = embedded.ReadFile("web/" + name)
@@ -2961,6 +2968,10 @@ func (s *server) handleOperations(w http.ResponseWriter, r *http.Request) {
 		record.Actor = actor
 		created, err := s.operations.Create(record)
 		if err != nil {
+			if errors.Is(err, ErrOperationIdempotencyConflict) {
+				writeJSONError(w, http.StatusConflict, err.Error())
+				return
+			}
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -3029,6 +3040,15 @@ func (s *server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if v.UseCase != "" && useCaseByID(v.UseCase) == nil {
 			writeJSONError(w, http.StatusBadRequest, "unknown use_case")
+			return
+		}
+		// Older clients do not send map_display; retain the configured renderer.
+		if v.MapDisplay == (MapDisplaySettings{}) {
+			v.MapDisplay = s.settings.Get().MapDisplay
+		}
+		normalizeMapDisplay(&v.MapDisplay)
+		if err := validateMapDisplay(v.MapDisplay); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		normalizeTileSettings(&v.Tiles)

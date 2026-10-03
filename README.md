@@ -34,7 +34,7 @@ service.
 **Search and maps**
 - Address, street and POI search with German and English category aliases
   ([category catalog](docs/osm-categories.md))
-- Map-first MapLibre GL UI with a mobile layout and a keyboard shortcut
+- Map-first microMap UI (MapLibre GL optional) with a mobile layout and a keyboard shortcut
   (<kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>K</kbd>) to focus search
 - Offline vector basemap generated from your PBF (tinyTiles) with adjustable
   styles; alternatively, OSM raster, BayernAtlas vector/WMTS or your own
@@ -57,7 +57,7 @@ service.
 PBF extract, for example from [Geofabrik](https://download.geofabrik.de/).
 
 ```bash
-# 1. Download a PBF and the pinned MapLibre assets (one-off, needs network):
+# 1. Download a PBF and the optional pinned MapLibre assets (one-off, needs network):
 make offline-prep GEOFABRIK_URL='https://download.geofabrik.de/europe/germany/bayern/niederbayern-latest.osm.pbf'
 
 # 2. Start the server:
@@ -106,8 +106,34 @@ first enter it under **Einstellungen → Administrationsschutz**.
   `/tinytiles/postcode/at?lon=13.46&lat=48.57`.
 - Complex multipolygon areas need a more detailed tile generator.
 
-For a truly offline browser, the MapLibre assets must be present locally
-(`make maplibre-assets`). OSMmini never loads them from a CDN.
+The default renderer is [microMap](https://github.com/Karte-Bayern/microMap)
+0.3.0. Its bundle and MIT license are included locally and embedded in the
+server, so vector maps also work with Canvas 2D when WebGL is unavailable.
+Routes, markers, popups, GeoJSON overlays and map controls use its
+MapLibre-compatible API.
+
+Choose **Einstellungen → Kartenanzeige → Kartenrenderer** to switch between
+microMap and MapLibre GL. **Speichern** persists the selection in `settings.json`
+(`map_display`) and reloads the UI when rendering options change, preserving
+the map centre and zoom. The setting becomes the default for clients after
+reloading; saving requires the configured administrator token, if any.
+
+microMap has the presets **Standard**, **Sparsam** and **Perspektive**, plus
+individual settings for rendering resolution (1×, up to 1.5× or 2×), initial
+pitch (0°, 45° or 60°), WebGL/Canvas 2D buildings, sky visibility and rotation/
+pitch gestures. Its options are retained when switching to MapLibre.
+3D buildings depend on the selected map style supplying them.
+
+`?renderer=maplibre` or `?renderer=micromap` temporarily overrides the saved
+selection; saving the form removes the override. MapLibre's local assets
+require `make maplibre-assets`. No renderer loads from a CDN.
+`make ensure-micromap-assets` verifies the bundled microMap checksums;
+`make micromap-assets` rebuilds the pinned upstream source.
+
+microMap supports a subset of MapLibre styles: terrain, hillshade and globe
+projection are unavailable, and labels use browser fonts. Route fitting respects
+sidebar padding; microMap does not support persistent camera padding. For map
+image export, use a flat, north-facing view (0° pitch and bearing).
 
 ## Large PBF files
 
@@ -177,17 +203,21 @@ OSM-Edit never uploads anything. Drafts stay in the browser (`localStorage`)
 and can only be exported as an `.osc` change file or a `.json` backup for manual
 upload in a full OSM editor.
 
-1. **Finden**: select a place on the map, search for one, add a point, or draw
+1. **Finden**: load the visible OSM working geometry from zoom 16 with **OSM-Ausschnitt laden**, select a place on the map, search for one, add a point, or draw
    a way or area. New vertices snap to existing ones.
 2. **Bearbeiten**: typed fields for each place type, hints for common mistakes,
    a change summary and the full tag table. For ways, the editor can move
-   vertices (**Punkte bearbeiten**), split a way (**Weg teilen**) and join two
+   vertices (**Punkte bearbeiten**), edit coordinates, insert vertices on a segment, remove vertices without deleting shared OSM nodes, split a way (**Weg teilen**) and join two
    ways (**Mit Weg-ID verbinden**). <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>S</kbd>
-   saves.
+   saves tags and geometry together; **Verwerfen** discards pending geometry too.
 3. **Entwürfe**: undo/redo, compare with the current OSM state, export. If an
    object has changed on OSM in the meantime, the export is blocked.
 4. **Relationen**: create a relation or load one by ID, reorder members and
    edit their roles.
+
+The sticky editor toolbar provides point/way/area tools and saved-change undo/redo. Shortcuts: **P**, **L**, **A** to draw, **Enter** to finish, **Escape** to cancel, **Delete** to detach a selected way vertex, and **Ctrl/⌘ Z** / **Ctrl/⌘ Shift Z** for saved-change history. Text inputs keep their native keyboard shortcuts. Loaded working geometry can be hidden and is cleared visually when leaving the editor.
+
+Existing objects can be marked as a reversible **Löschentwurf** after their parent ways/relations have been checked. Used objects cannot be deleted without changing their parents. Untagged support vertices are grouped below their main drafts; removing a new way cleans up only its unused new vertices. Areas that overlap themselves or collapse to a line are rejected. Map reads, full-object loading and parent checks use the [OSM API v0.6](https://wiki.openstreetmap.org/wiki/API_v0.6). Building and road presets include addresses, building levels, height, surface, width, speed limits and direction as applicable.
 
 Objects marked **vertraulich speichern** (for example fire-brigade internals or
 access information) are stored only on the server, in
@@ -209,7 +239,16 @@ This local audit log is designed for mobile use:
 
 Camera scanning uses the browser's `BarcodeDetector`, and manual entry always
 works. Entries can be filtered and exported as CSV. When the connection drops,
-the browser queues entries and sends them on the next contact.
+the browser queues entries and retries them on reconnection and while the page
+remains online. Each operation carries a `client_event_id`; repeating the same
+request returns the original record, while reusing the ID with different data
+returns HTTP 409. The offline queue accepts 100 entries and the browser-local
+history accepts 500; reaching either limit shows an error and preserves the
+existing entries.
+Failed transfers remain queued with the same ID and show an error in the log
+status. If browser storage is malformed, the app keeps its raw value instead
+of replacing it with an empty log; back up the local browser data before
+repairing it.
 
 How the data is stored depends on `-deployment-mode`:
 
@@ -340,7 +379,7 @@ and routing; see [`example/main.go`](example/main.go).
 | `-window` | – | Load only the window `minLat,maxLat,minLon,maxLon` from the PBF |
 | `-window-buffer-m` | `0` | Buffer around `-window` in metres |
 | `-enforce-window` | `false` | Reject requests outside `-window` |
-| `-build-ch` | `false` | Experimental contraction hierarchies |
+| `-build-ch` | `false` | Deprecated; startup rejects it because the incomplete CH graph cannot return reliable routes |
 
 ### Settings file
 

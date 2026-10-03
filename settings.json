@@ -1,4 +1,15 @@
 {
+  "map_display": {
+    "renderer": "micromap",
+    "micromap": {
+      "quality": "sharp",
+      "view": "perspective",
+      "buildings": "auto",
+      "sky": "auto",
+      "interaction": "full"
+    }
+  },
+  "use_case": "private",
   "routing": {
     "engine": "astar",
     "objective": "distance",
@@ -15,11 +26,12 @@
   },
   "tiles": {
     "cache_dir": "tiles-cache",
+    "upstream": "",
     "user_agent": "osmmini-routerd/1.0 (offline routing)",
     "map_type": "vector",
+    "style_url": "/static/styles/tinytiles-minimal.json",
     "attribution": "© OpenStreetMap contributors",
-    "max_zoom": 14,
-    "style_url": "/static/styles/tinytiles-minimal.json"
+    "max_zoom": 14
   },
   "ai": {},
   "save_poi_cache": true,

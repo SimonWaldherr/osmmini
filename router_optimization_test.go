@@ -29,6 +29,21 @@ func TestRoutingToDirectedSinkAndCancelledShortRoute(t *testing.T) {
 	}
 }
 
+func TestIncompleteCHIsRejectedInsteadOfFallingBackToAStar(t *testing.T) {
+	r := NewRouterFromGraph(
+		map[int64]Coord{1: {Lat: 48, Lon: 12}, 2: {Lat: 48.001, Lon: 12}},
+		map[int64][]Edge{1: {{To: 2, DistM: 112, SpeedKph: 50, HwyType: "residential"}}},
+	)
+	r.BuildCH()
+	options := RouteOptions{Engine: EngineCH, Objective: ObjectiveDistance}
+	if _, err := r.RouteWithOptions(context.Background(), 1, 2, options); !errors.Is(err, ErrRouteEngineUnsupported) {
+		t.Fatalf("CH route error = %v", err)
+	}
+	if _, err := r.RouteCostWithOptions(context.Background(), 1, 2, options); !errors.Is(err, ErrRouteEngineUnsupported) {
+		t.Fatalf("CH cost error = %v", err)
+	}
+}
+
 func BenchmarkShortRouteCost(b *testing.B) {
 	r, from, _ := buildGridRouter(40, 40)
 	for _, engine := range []RouteEngine{EngineAStar, EngineDijkstraNode} {

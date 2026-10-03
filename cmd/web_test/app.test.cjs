@@ -544,12 +544,12 @@ test('compact panel hides its controls and restores content without losing state
   const elements = Object.fromEntries(['mapsPanelContent','mapsPanelToggle','mapsPanelExpand'].map(id => [id,new Element()]));
   const shell = {classList:{toggle(name, enabled){if(enabled) classes.add(name); else classes.delete(name);},remove(name){classes.delete(name);}}};
   let paddingUpdates=0;
-  const context=vm.createContext({document:{querySelector:()=>shell,getElementById:id=>elements[id]},map:{setPadding(){paddingUpdates++;}},mapsCameraPadding:()=>({left:40})});
+  const context=vm.createContext({document:{querySelector:()=>shell,getElementById:id=>elements[id]},map:{setPadding(){paddingUpdates++;}},mapsCameraPadding:()=>({left:40}),syncLayersButton() {}});
   vm.runInContext(section('function setMapsPanelCollapsed(', "document.getElementById('mapsPanelToggle')?"),context);
   context.setMapsPanelCollapsed(true);
   assert.equal(elements.mapsPanelContent.hidden,true);
   assert.equal(elements.mapsPanelToggle.attributes['aria-expanded'],'false');
-  assert.equal(elements.mapsPanelToggle.textContent,'Details zeigen');
+  assert.equal(elements.mapsPanelToggle.attributes['aria-label'],'Sidebar aufklappen');
   assert.equal(classes.has('panel-expanded'),false);
   assert.equal(elements.mapsPanelExpand.attributes['aria-pressed'],'false');
   context.setMapsPanelCollapsed(false);
@@ -619,4 +619,73 @@ test('GPX export of a trip lists numbered stops and leg maneuvers', () => {
   assert.match(gpx, /<name>1\. Kunde<\/name><type>stop<\/type>/);
   assert.match(gpx, /<name>Ankunft<\/name>/);
   assert.match(gpx, /<metadata><name>OSMmini Route<\/name>/);
+});
+
+test('view switching completes when the optional layers back button is missing', () => {
+  const shell = new Element();
+  const title = new Element();
+  const content = new Element();
+  const collapsed = [];
+  let resizes = 0;
+  const elements = {mapsPanelTitle:title,mapsPanelContent:content};
+  const context = vm.createContext({
+    document: {querySelector:()=>shell,querySelectorAll:()=>[],getElementById:id=>elements[id] || null},
+    window: {}, layersReturnState: null,
+    setMapsPanelCollapsed:value=>collapsed.push(value),
+    map: {resize(){resizes++;}}, mapsCameraPadding:()=>({}),
+    openMapsSection(){}, hydrateVisibleTilePreviews(){},
+  });
+  context.window.setTimeout = () => {};
+  vm.runInContext(section('function setMapsView(', "\nif (typeof ResizeObserver"), context);
+  context.setMapsView('route');
+  assert.equal(shell.attributes['data-view'], 'route');
+  assert.equal(title.textContent, 'Route planen');
+  assert.equal(content.scrollTop, 0);
+  assert.deepEqual(collapsed, [false]);
+  assert.equal(resizes, 1);
+  const back = elements.mapsPanelBack = new Element();
+  context.setMapsView('maps');
+  assert.equal(back.hidden, false);
+  context.setMapsView('route');
+  assert.equal(back.hidden, true);
+});
+
+test('closing the layers menu restores the previous view, panel size and scroll position', () => {
+  const classes = new Set();
+  const elements = Object.fromEntries(['mapsPanelContent','mapsPanelExpand','mapsLayers'].map(id => [id,new Element()]));
+  const shell = {dataset:{view:'maps'},classList:{contains:name=>classes.has(name),toggle(name,on){if(on)classes.add(name);else classes.delete(name);}}};
+  elements.mapsLayers.focus = () => { elements.mapsLayers.focused = true; };
+  const views=[],collapsed=[];
+  const context=vm.createContext({document:{querySelector:()=>shell,getElementById:id=>elements[id]},setMapsView:view=>views.push(view),setMapsPanelCollapsed:value=>collapsed.push(value)});
+  vm.runInContext(section('let layersReturnState = null;', '// Map-first navigation keeps'),context);
+  vm.runInContext("layersReturnState = {view:'edit',expanded:true,collapsed:false,scroll:218}",context);
+  context.closeLayersPanel();
+  assert.deepEqual(views,['edit']);
+  assert.equal(classes.has('panel-expanded'),true);
+  assert.equal(elements.mapsPanelContent.scrollTop,218);
+  assert.equal(elements.mapsPanelExpand.attributes['aria-pressed'],'true');
+  assert.deepEqual(collapsed,[false]);
+  assert.equal(elements.mapsLayers.focused,true);
+  context.closeLayersPanel();
+  assert.equal(views.at(-1),'explore');
+});
+
+test('layers submenu keeps custom source values and opens offline content without clearing selection', () => {
+  const buttons=['base','offline','custom'].map(menu=>Object.assign(new Element(),{dataset:{layerMenu:menu}}));
+  const view={dataset:{},querySelectorAll:()=>buttons};
+  const advanced={hidden:true};
+  const toggle=new Element();
+  let scrolls=0;const opened=[];
+  const context=vm.createContext({document:{getElementById:id=>({mapsView:view,tileSourceAdvanced:advanced,tileSourceAdvancedToggle:toggle,mapsPanelContent:{scrollTo(){scrolls++;}}})[id]},window:{setTimeout(){}},hydrateVisibleTilePreviews(){},openMapsSection:(...args)=>opened.push(args)});
+  vm.runInContext(section('function setLayersMenu(', 'function sourceSelectionHint('),context);
+  context.setLayersMenu('custom');
+  assert.equal(advanced.hidden,false);
+  assert.equal(toggle.attributes['aria-expanded'],'true');
+  context.setLayersMenu('offline');
+  assert.equal(advanced.hidden,true);
+  assert.equal(view.dataset.layerMenu,'offline');
+  assert.equal(buttons[1].attributes['aria-pressed'],'true');
+  assert.equal(opened[0][1],'tinyTilesSettings');
+  context.setLayersMenu('unknown');
+  assert.equal(scrolls,2);
 });

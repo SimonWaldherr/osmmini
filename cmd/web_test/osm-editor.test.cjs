@@ -334,12 +334,12 @@ test('drawing a new way places its vertices as bare nodes and needs a type befor
  assert.equal(h.editor.drawing,false);assert.equal(h.editor.tab,'edit');
  assert.equal(h.drafts().length,0);
  assert.match(e.osmValidation.textContent,/Art/);
- h.preset('Bushaltestelle');
+ h.preset('Fußweg');
  e.osmSave.click();
  const ways=h.drafts().filter(d=>d.value.type==='way'),nodes=h.drafts().filter(d=>d.value.type==='node');
  assert.equal(ways.length,1);assert.equal(nodes.length,2);
  assert.deepEqual(ways[0].value.nodes,[nodes[0].value.id,nodes[1].value.id]);
- assert.equal(ways[0].value.tags.highway,'bus_stop');
+ assert.equal(ways[0].value.tags.highway,'footway');
  assert.equal(Object.keys(nodes[0].value.tags).length,0);
  assert.doesNotThrow(()=>E.osc(h.drafts()));
 }));
@@ -349,7 +349,7 @@ test('drawing snaps onto an already-recorded node instead of creating a duplicat
  await h.editor.mapClick({lngLat:{lat:48,lng:12}});
  await h.editor.mapClick({lngLat:{lat:48.001,lng:12.001}});
  h.editor.finishDraw();
- h.preset('Bushaltestelle');
+ h.preset('Fußweg');
  h.es.osmSave.click();
  const ways=h.drafts().filter(d=>d.value.type==='way'),nodes=h.drafts().filter(d=>d.value.type==='node');
  assert.equal(ways[0].value.nodes[0],501);
@@ -378,17 +378,21 @@ test('dragging an existing way vertex moves the node without disturbing the way'
  h.editor.toggleGeometryMode();
  assert.equal(h.editor.geometryMode,true);
  const hitPoint=h.map.project([12,48]);
+ await h.editor.enter();
  h.editor.mapMouseDown({point:hitPoint,lngLat:{lng:12,lat:48},originalEvent:{}});
  assert.equal(h.map.dragPan.disabled,true);
  h.editor.mapMouseMove({point:hitPoint,lngLat:{lng:12.0007,lat:48.0007}});
  await h.editor.mapMouseUp();
  assert.equal(h.map.dragPan.disabled,false);
+ assert.equal(h.drafts().length,0,'dragging stays uncommitted until Save');
+ const line=h.data('osm-selection').features[0].geometry.coordinates;
+ assert.ok(Math.abs(line[0][1]-48.0007)<1e-9,'preview outline follows the unsaved move');
+ h.es.osmSave.click();
  const nodeDraft=h.drafts().find(d=>d.value.type==='node'&&d.value.id===1);
  assert.ok(nodeDraft);assert.equal(nodeDraft.base.version,5);
  assert.ok(Math.abs(nodeDraft.value.lat-48.0007)<1e-9);
  assert.equal(h.drafts().some(d=>d.value.type==='way'),false);
- const line=h.data('osm-selection').features[0].geometry.coordinates;
- assert.ok(Math.abs(line[0][1]-48.0007)<1e-9,'the outline follows the dragged vertex, not its pre-drag position');
+
 }));
 
 test('splitting a way at an interior point keeps the base way and drafts a new segment',withHarness([],{'way/9/full.json':{body:{elements:[
@@ -401,6 +405,7 @@ test('splitting a way at an interior point keeps the base way and drafts a new s
  h.editor.startSplit();
  assert.equal(h.editor.splitMode,true);assert.equal(h.editor.geometryMode,true);
  const point=h.map.project([12.001,48]);
+ await h.editor.enter();
  h.editor.mapMouseDown({point,lngLat:{lng:12.001,lat:48}});
  assert.equal(h.editor.splitMode,false);
  const ways=h.drafts().filter(d=>!d.deleted&&d.value.type==='way');
@@ -421,6 +426,7 @@ test('splitting at an endpoint is rejected because both parts would be degenerat
  await h.editor.load('way',9);
  h.editor.startSplit();
  const point=h.map.project([12,48]);
+ await h.editor.enter();
  h.editor.mapMouseDown({point,lngLat:{lng:12,lat:48}});
  assert.equal(h.drafts().length,0);
  assert.match(h.es.osmEditorStatus.textContent,/inneren Punkt/);
@@ -626,3 +632,126 @@ test('layers wait for a loading style and redraw once it is ready',async()=>{
  }finally{global.setTimeout=original;}
  assert.equal(h.es.osmEditView.attrs['data-tab'],'find');
 });
+
+const geometryElements=[
+ {type:'node',id:1,version:5,lon:12,lat:48,tags:{}},
+ {type:'node',id:2,version:3,lon:12.002,lat:48,tags:{}},
+ {type:'node',id:3,version:1,lon:12.002,lat:48.002,tags:{}},
+ {type:'node',id:4,version:2,lon:12,lat:48.002,tags:{}},
+ {type:'way',id:9,version:2,nodes:[1,2,3,4,1],tags:{building:'yes'}},
+];
+const geometryRoutes={'way/9/full.json':{body:{elements:geometryElements}},'map.json?bbox=':{body:{elements:geometryElements}}};
+
+test('vertex edits preserve closure and block degenerate lines and areas',()=>{
+ assert.deepEqual(E.editWayNodes([1,2,3,1],0,4),[1,4,2,3,1]);
+ assert.deepEqual(E.editWayNodes([1,2,3,4,1],0),[2,3,4,2]);
+ assert.deepEqual(E.editWayNodes([1,2,3],0),[2,3]);
+ assert.throws(()=>E.editWayNodes([1,2],0),/mindestens zwei/);
+ assert.throws(()=>E.editWayNodes([1,2,3,1],1),/mindestens drei/);
+ assert.throws(()=>E.editWayNodes([1,2,3],0,2),/bereits verwendeter/);
+});
+test('loaded OSM geometry skips incomplete ways and picks inside buildings',()=>{
+ const data=E.mapDataFeatures([...geometryElements,{type:'way',id:99,nodes:[1,999]}]);
+ assert.equal(data.features.filter(f=>f.properties.osm_type==='way').length,1);
+ assert.equal(data.features.find(f=>f.properties.osm_id===9).geometry.type,'Polygon');
+ const hit=E.candidatesFromElements(geometryElements,48.001,12.001,10);
+ assert.equal(hit[0].id,9);assert.equal(hit[0].distance,0);
+});
+test('inserted and removed way vertices save atomically, retain version and undo together',withHarness([],geometryRoutes,async h=>{
+ await h.editor.load('way',9);h.editor.toggleGeometryMode();
+ h.editor.insertVertex(0,[12.001,48]);
+ assert.equal(h.es.osmEditState.attrs['data-state'],'dirty');
+ assert.equal(h.drafts().length,0);
+ assert.match(h.es.osmDiff.children.map(n=>n.textContent).join(' '),/Geometrie/);
+ assert.equal(h.data('osm-selection').features[0].geometry.coordinates[0].length,6);
+ h.es.osmSave.click();
+ const saved=h.drafts(),way=saved.find(d=>d.value.type==='way'),node=saved.find(d=>d.value.type==='node');
+ assert.equal(way.base.version,2);assert.equal(way.value.nodes[1],node.value.id);
+ assert.match(E.osc(saved),/<create>[\s\S]*<node/);assert.match(E.osc(saved),/<modify>[\s\S]*<way/);
+ h.es.osmUndo.click();assert.equal(h.drafts().length,0);
+ h.es.osmRedo.click();assert.equal(h.drafts().length,2);
+ await h.editor.load('way',9);h.editor.toggleGeometryMode();h.editor.selectVertex(node.value.id);h.editor.removeVertex();h.es.osmSave.click();
+ assert.equal(h.drafts().length,0,'restoring the way drops its unused new untagged vertex');
+}));
+test('discard reverses pending moves and insertions without touching shared nodes',withHarness([],geometryRoutes,async h=>{
+ await h.editor.load('way',9);h.editor.toggleGeometryMode();
+ await h.editor.commitNodeMove(1,[12.0005,48.0005]);h.editor.insertVertex(1,[12.002,48.001]);
+ assert.equal(h.drafts().length,0);h.es.osmDiscard.click();assert.equal(h.drafts().length,0);
+ await h.editor.load('way',9);h.editor.toggleGeometryMode();h.editor.selectVertex(2);h.editor.removeVertex();h.es.osmSave.click();
+ const saved=h.drafts();assert.equal(saved.length,1);assert.deepEqual(saved[0].value.nodes,[1,3,4,1]);assert.equal(saved.some(d=>d.deleted),false);
+}));
+test('node coordinate edits validate, stay unsaved until Save, and retain tags and version',withHarness([],{'node/42.json':{body:{elements:[cafe]}}},async h=>{
+ await h.editor.load('node',42);h.editor.toggleGeometryMode();
+ await h.editor.commitNodeMove(42,[181,48]);assert.match(h.es.osmEditorStatus.textContent,/Ungültige/);assert.equal(h.drafts().length,0);
+ await h.editor.commitNodeMove(42,[12.1,48.1]);assert.equal(h.drafts().length,0);assert.equal(h.es.osmSave.disabled,false);
+ h.es.osmSave.click();const d=h.drafts()[0];assert.equal(d.value.lon,12.1);assert.equal(d.base.version,3);assert.equal(d.value.tags.website,cafe.tags.website);
+}));
+test('OSM map data loads on demand, toggles visibility and leaves the base map untouched',withHarness([],geometryRoutes,async h=>{
+ await h.editor.enter();await h.editor.loadMapData();
+ assert.equal(h.data('osm-map-data').features.length,6);assert.match(h.es.osmMapDataStatus.textContent,/1 Wege/);
+ h.es.osmMapDataToggle.click();assert.equal(h.data('osm-map-data').features.length,0);
+ h.es.osmMapDataToggle.click();assert.equal(h.data('osm-map-data').features.length,6);
+ h.editor.leave();assert.equal(h.data('osm-map-data').features.length,0);assert.equal(h.editor.active,false);
+}));
+
+test('geometry validation rejects coincident vertices, collapsed areas and bow-tie polygons',()=>{
+ assert.throws(()=>E.validateWayCoordinates([[12,48],[12,48]],false),/verschiedene/);
+ assert.throws(()=>E.validateWayCoordinates([[0,0],[1,1],[2,2],[0,0]],true),/Ausdehnung/);
+ assert.throws(()=>E.validateWayCoordinates([[0,0],[1,1],[0,1],[1,0],[0,0]],true),/überschneidet/);
+ assert.doesNotThrow(()=>E.validateWayCoordinates([[0,0],[1,0],[1,1],[0,1],[0,0]],true));
+});
+test('saved draft ways keep a visible outline and geometry edits upsert shared nodes once',withHarness([],geometryRoutes,async h=>{
+ await h.editor.enter();await h.editor.load('way',9);h.editor.toggleGeometryMode();await h.editor.commitNodeMove(1,[11.9999,48]);h.es.osmSave.click();
+ const initial=h.drafts();assert.equal(initial.length,1);assert.equal(initial[0].value.type,'node');
+ await h.editor.load('way',9);h.editor.toggleGeometryMode();await h.editor.commitNodeMove(1,[11.9998,48]);h.editor.insertVertex(1,[12.002,48.001]);h.es.osmSave.click();
+ const saved=h.drafts();assert.equal(saved.filter(d=>d.value.type==='node'&&d.value.id===1).length,1);
+ assert.equal(saved.find(d=>d.value.id===1).base.version,5);
+ assert.equal(h.data('osm-draft-geometries').features.length,2);
+ assert.equal(h.data('osm-draft-geometries').features[0].geometry.coordinates[0].length,6);
+}));
+test('OSM map download refuses zoomed-out views and reports failures without replacing loaded data',withHarness([],geometryRoutes,async h=>{
+ await h.editor.enter();await h.editor.loadMapData();const initial=JSON.stringify(h.data('osm-map-data'));
+ h.map.getZoom=()=>10;const before=h.requests.length;await h.editor.loadMapData();
+ assert.equal(h.requests.length,before);assert.match(h.es.osmEditorStatus.textContent,/Zoome/);assert.equal(JSON.stringify(h.data('osm-map-data')),initial);
+}));
+test('tool shortcuts finish a drawing but leave native text-input undo alone',withHarness([],{},async h=>{
+ await h.editor.enter();
+ h.keydowns.forEach(f=>f({key:'l',target:{tagName:'INPUT'},preventDefault(){throw Error('text input shortcut intercepted');}}));assert.equal(h.editor.drawing,false);
+ h.keydowns.forEach(f=>f({key:'l',target:{tagName:'DIV'},preventDefault(){}}));assert.equal(h.editor.drawing,true);
+ await h.editor.mapClick({lngLat:{lng:12,lat:48}});await h.editor.mapClick({lngLat:{lng:12.001,lat:48.001}});
+ h.keydowns.forEach(f=>f({key:'Enter',target:{tagName:'DIV'},preventDefault(){}}));assert.equal(h.editor.drawing,false);assert.equal(h.editor.tab,'edit');
+ h.preset('Fußweg');h.es.osmSave.click();assert.equal(h.drafts().length,3);
+ h.keydowns.forEach(f=>f({key:'z',ctrlKey:true,target:{tagName:'INPUT'},preventDefault(){throw Error('input undo intercepted');}}));assert.equal(h.drafts().length,3);
+ h.keydowns.forEach(f=>f({key:'z',ctrlKey:true,target:{tagName:'DIV'},preventDefault(){}}));assert.equal(h.drafts().length,0);
+}));
+
+test('removing a drafted way removes only its unused new vertices and remains undoable',withHarness([],{},async h=>{
+ await h.editor.startDrawing('line');await h.editor.mapClick({lngLat:{lng:12,lat:48}});await h.editor.mapClick({lngLat:{lng:12.001,lat:48.001}});h.editor.finishDraw();h.preset('Fußweg');h.es.osmSave.click();
+ assert.equal(h.es.osmDrafts.children.length,1);assert.equal(h.es.osmDraftVertices.children.length,2);assert.equal(h.es.osmDraftCount.textContent,'1');
+ h.editor.removeDraft(h.drafts().findIndex(d=>d.value.type==='way'));assert.equal(h.drafts().length,0);
+ h.es.osmUndo.click();assert.equal(h.drafts().length,3);assert.doesNotThrow(()=>E.osc(h.drafts()));
+}));
+test('clicking a new local way opens its draft without sending its negative ID to OSM',withHarness([],{},async h=>{
+ await h.editor.startDrawing('line');await h.editor.mapClick({lngLat:{lng:12,lat:48}});await h.editor.mapClick({lngLat:{lng:12.001,lat:48.001}});h.editor.finishDraw();h.preset('Fußweg');h.es.osmSave.click();
+ await h.editor.enter();const before=h.requests.length;await h.editor.mapClick({lngLat:{lng:12.0005,lat:48.0005}});
+ assert.equal(h.editor.tab,'edit');assert.match(h.es.osmSelected.textContent,/Fußweg/);assert.equal(h.requests.length,before);
+}));
+test('a deletion draft requires successful parent checks and keeps the original version',withHarness([],{'node/42.json':{body:{elements:[cafe]}},'node/42/ways.json':{body:{elements:[]}},'node/42/relations.json':{body:{elements:[]}}},async h=>{
+ const originalConfirm=global.confirm;global.confirm=()=>true;
+ try{
+  await h.editor.load('node',42);await h.editor.deleteObject();
+  const d=h.drafts()[0];assert.equal(d.deleted,true);assert.equal(d.base.version,3);assert.match(E.osc(h.drafts()),/<delete>[\s\S]*id="42" version="3"/);
+  h.es.osmUndo.click();assert.equal(h.drafts().length,0);
+ }finally{global.confirm=originalConfirm;}
+}));
+test('parent references block deletion and preserve the working object',withHarness([],{'node/42.json':{body:{elements:[cafe]}},'node/42/ways.json':{body:{elements:[{type:'way',id:9}]}}},async h=>{
+ const originalConfirm=global.confirm;global.confirm=()=>true;
+ try{await h.editor.load('node',42);await h.editor.deleteObject();assert.equal(h.drafts().length,0);assert.match(h.es.osmEditorStatus.textContent,/verwendet/);assert.equal(h.es.osmForm.hidden,false);}
+ finally{global.confirm=originalConfirm;}
+}));
+
+test('a failed parent lookup cannot create a deletion draft',withHarness([],{'node/42.json':{body:{elements:[cafe]}},'node/42/ways.json':{ok:false,status:503,body:{}}},async h=>{
+ const originalConfirm=global.confirm;global.confirm=()=>true;
+ try{await h.editor.load('node',42);await h.editor.deleteObject();assert.equal(h.drafts().length,0);assert.match(h.es.osmEditorStatus.textContent,/nicht geprüft/);assert.equal(h.es.osmForm.hidden,false);}
+ finally{global.confirm=originalConfirm;}
+}));

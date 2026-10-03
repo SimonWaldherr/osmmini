@@ -57,6 +57,11 @@
     shelter_type:{key:'shelter_type',label:'Art des Unterstands',type:'choice',options:[['public_transport','Haltestelle'],['picnic_shelter','Rastplatz'],['weather_shelter','Wetterschutz']]},
     door:{key:'door',label:'Türtyp',type:'choice',options:[['hinged','Drehtür'],['sliding','Schiebetür'],['revolving','Karussell'],['no','Ohne Tür']]},
     automatic_door:{key:'automatic_door',label:'Automatische Tür',type:'choice',options:yesNo},
+    'building:levels':{key:'building:levels',label:'Geschosse über dem Boden',type:'text',placeholder:'z. B. 2',hint:'Ohne Keller und Dachgeschosse; nur bekannte Werte eintragen.'},
+    height:{key:'height',label:'Gesamthöhe (Meter)',type:'text',placeholder:'z. B. 8.5'},
+    maxspeed:{key:'maxspeed',label:'Höchstgeschwindigkeit',type:'text',placeholder:'z. B. 30 oder walk'},
+    oneway:{key:'oneway',label:'Einbahnstraße',type:'choice',options:[['yes','In Zeichenrichtung'],['-1','Gegen Zeichenrichtung'],['no','Nein']]},
+    width:{key:'width',label:'Breite (Meter)',type:'text',placeholder:'z. B. 2.5'},
     surface:{key:'surface',label:'Untergrund',type:'text',placeholder:'z. B. sand, gravel'},
     type:{key:'type',label:'Art der Relation',type:'choice',options:[['multipolygon','Multipolygon (Fläche aus mehreren Wegen)'],['route','Route'],['boundary','Grenze'],['restriction','Abbiegebeschränkung'],['associatedStreet','Straße mit Adressen']]},
   });
@@ -73,6 +78,15 @@
 
   const business=['name','opening_hours','website','phone','wheelchair'];
   const presets=Object.assign(Object.create(null),{
+    building:{label:'Gebäude',icon:'🏠',group:'Gebäude & Flächen',geometry:'area',tags:{building:'yes'},fields:['name','building:levels','height']},
+    house:{label:'Wohnhaus',icon:'🏠',group:'Gebäude & Flächen',geometry:'area',tags:{building:'house'},fields:['name','building:levels','height']},
+    garage:{label:'Garage',icon:'🏠',group:'Gebäude & Flächen',geometry:'area',tags:{building:'garage'},fields:['name','height']},
+    grass:{label:'Grünfläche',icon:'🌳',group:'Gebäude & Flächen',geometry:'area',tags:{landuse:'grass'},fields:['name','operator']},
+    footway:{label:'Fußweg',icon:'🚶',group:'Straßen & Wege',geometry:'line',tags:{highway:'footway'},fields:['name','surface','width','wheelchair','access']},
+    cycleway:{label:'Radweg',icon:'🚲',group:'Straßen & Wege',geometry:'line',tags:{highway:'cycleway'},fields:['name','surface','width','oneway','access']},
+    path:{label:'Pfad',icon:'🚶',group:'Straßen & Wege',geometry:'line',tags:{highway:'path'},fields:['name','surface','width','access']},
+    residential:{label:'Wohnstraße',icon:'🚗',group:'Straßen & Wege',geometry:'line',tags:{highway:'residential'},fields:['name','maxspeed','oneway','surface','width']},
+    service:{label:'Zufahrt',icon:'🚗',group:'Straßen & Wege',geometry:'line',tags:{highway:'service'},fields:['name','maxspeed','oneway','surface','access']},
     cafe:{label:'Café',icon:'☕',group:'Essen & Trinken',tags:{amenity:'cafe'},fields:[...business,'outdoor_seating','internet_access','takeaway']},
     restaurant:{label:'Restaurant',icon:'🍽️',group:'Essen & Trinken',tags:{amenity:'restaurant'},fields:[...business,'cuisine','outdoor_seating','takeaway']},
     fast_food:{label:'Imbiss',icon:'🍔',group:'Essen & Trinken',tags:{amenity:'fast_food'},fields:[...business,'cuisine','outdoor_seating','takeaway']},
@@ -104,7 +118,7 @@
   const genericFields=['name','opening_hours','website','phone','email','wheelchair'];
 
   // Most specific preset wins, so a wheelchair-accessible entrance beats a plain amenity match.
-  const ranked=Object.entries(presets).sort((a,b)=>Object.keys(b[1].tags).length-Object.keys(a[1].tags).length);
+  const ranked=Object.entries(presets).sort((a,b)=>Object.keys(b[1].tags).length-Object.keys(a[1].tags).length||Number(Object.hasOwn(a[1].tags,'building'))-Number(Object.hasOwn(b[1].tags,'building')));
   const presetKeyForTags=tagSet=>ranked.find(([,preset])=>Object.entries(preset.tags).every(([key,value])=>tagSet[key]===value))?.[0]||'';
   const presetForTags=tagSet=>presets[presetKeyForTags(tagSet)]||null;
   const fieldsFor=tagSet=>{

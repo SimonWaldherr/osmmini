@@ -23,8 +23,8 @@ test('image export validates required text and produces PNG plus companion downl
  const drawn=[];
  const context={drawImage:()=>drawn.push('map'),fillRect(){},fillText:text=>drawn.push(text),measureText:text=>({width:text.length*10}),save(){},restore(){},beginPath(){},rect(){},clip(){}};
  const elements={};global.document={getElementById:id=>elements[id]??=new Element(),createElement:()=>new Element()};
- const source=new Element(),handlers={};let loaded=true;
- const map={on:(e,fn)=>handlers[e]=fn,once:(e,fn)=>handlers[e]=fn,off(){},triggerRepaint:()=>handlers.render(),getCanvas:()=>source,isStyleLoaded:()=>loaded,areTilesLoaded:()=>loaded,getContainer:()=>({querySelector:()=>({textContent:'© Testkartenquelle'}),querySelectorAll:()=>[]})};
+ const source=new Element(),handlers={};let loaded=true,repaints=0;
+ const map={on:(e,fn)=>handlers[e]=fn,once:(e,fn)=>handlers[e]=fn,off(){},triggerRepaint:()=>{repaints++;handlers.render();},getCanvas:()=>source,isStyleLoaded:()=>loaded,areTilesLoaded:()=>loaded,getContainer:()=>({querySelector:()=>({textContent:'© Testkartenquelle'}),querySelectorAll:()=>[]})};
  MapPost.create(map);elements.postFormat=new Element();elements.postFormat.value='square';
  await elements.postGenerate.click();assert.match(elements.postStatus.textContent,/Überschrift und Bildbeschreibung/);
  elements.postTitle.value='Neue Verbindung';elements.postAlt.value='Karte mit einer neuen Verbindung';
@@ -36,4 +36,14 @@ test('image export validates required text and produces PNG plus companion downl
  assert.ok(drawn.includes('map'));assert.ok(drawn.some(x=>x.includes('Testkartenquelle')));
  assert.match(await (await fetch(elements.postTXT.href)).text(),/Bildbeschreibung: Karte mit einer neuen Verbindung/);
  handlers.moveend();assert.equal(elements.postPNG.hidden,true);assert.equal(elements.postPreview.src,undefined);
+ // microMap needs a composite capture and never emits render on idle repaint.
+ const originalRenderer=global.mapRenderer,originalAPI=global.MapRenderer;
+ try {
+   const previousRepaints=repaints;let captures=0;
+   global.mapRenderer='micromap';global.MapRenderer={capture:()=>{captures++;return source;}};
+   await elements.postGenerate.click();
+   assert.equal(captures,1);assert.equal(repaints,previousRepaints);
+   assert.equal(elements.postPNG.hidden,false);assert.match(elements.postStatus.textContent,/Vorschau bereit/);
+ }finally{global.mapRenderer=originalRenderer;global.MapRenderer=originalAPI;}
+ handlers.moveend();
 });

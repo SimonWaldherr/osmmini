@@ -83,6 +83,41 @@ paths:
             application/json:
               schema:
                 type: object
+  /api/v1/operations:
+    get:
+      summary: List local delivery, maintenance and check records
+      description: Requires an operator bearer token in multi-user mode or the configured admin token in single-user mode. Unavailable in browser-local mode.
+      parameters:
+        - { name: type, in: query, schema: { type: string, enum: [pod, maintenance, check] } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
+      responses:
+        "200":
+          description: Newest records first
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/OperationRecord" }
+        "401": { description: Authentication required }
+        "503": { description: Operations log unavailable }
+    post:
+      summary: Create or retry an operation
+      description: Supply a stable client_event_id for retries. An identical retry returns the original record; a different payload or operator using the same ID receives 409.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OperationRecord" }
+      responses:
+        "201":
+          description: Created record or original record for an identical retry
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OperationRecord" }
+        "400": { description: Invalid operation }
+        "401": { description: Authentication required }
+        "409": { description: Client event ID conflicts with another operation }
+        "503": { description: Operations log unavailable }
   /api/v1/settings:
     get:
       summary: Get settings
@@ -397,6 +432,25 @@ components:
       type: object
       properties:
         error: { type: string }
+    OperationRecord:
+      type: object
+      required: [type, asset_code, status]
+      properties:
+        id: { type: string, readOnly: true }
+        client_event_id: { type: string, maxLength: 128, pattern: "^[A-Za-z0-9_-]*$" }
+        type: { type: string, enum: [pod, maintenance, check] }
+        actor: { type: string, readOnly: true }
+        asset_code: { type: string, maxLength: 160 }
+        status: { type: string, maxLength: 80 }
+        recipient: { type: string, maxLength: 240 }
+        reference: { type: string, maxLength: 240 }
+        technician: { type: string, maxLength: 240 }
+        work_type: { type: string, maxLength: 240 }
+        notes: { type: string, maxLength: 4096 }
+        latitude: { type: number, minimum: -90, maximum: 90 }
+        longitude: { type: number, minimum: -180, maximum: 180 }
+        occurred_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time, readOnly: true }
     Tags:
       type: object
       additionalProperties: { type: string }
@@ -427,7 +481,11 @@ components:
       properties:
         engine:
           type: string
-          enum: [astar, dijkstra]
+          enum: [astar, dijkstra, dijkstra-node]
+          description: The experimental ch engine is unavailable and rejected.
+        profile:
+          type: string
+          enum: [car, delivery, truck, travel, firefighting, emergency, thw, cycling, walking]
         objective:
           type: string
           enum: [distance, duration, economy]
@@ -536,6 +594,7 @@ components:
     Settings:
       type: object
       properties:
+        map_display: { $ref: "#/components/schemas/MapDisplaySettings" }
         routing: { $ref: "#/components/schemas/RouteOptions" }
         tiles:
           type: object
@@ -549,6 +608,18 @@ components:
             attribution: { type: string }
             max_zoom: { type: integer, minimum: 0, maximum: 22 }
             mem_cache_size: { type: integer, minimum: 0 }
+    MapDisplaySettings:
+      type: object
+      properties:
+        renderer: { type: string, enum: [micromap, maplibre], default: micromap }
+        micromap:
+          type: object
+          properties:
+            quality: { type: string, enum: [economy, balanced, sharp], default: balanced }
+            view: { type: string, enum: [flat, perspective, steep], default: flat }
+            buildings: { type: string, enum: [auto, canvas], default: auto }
+            sky: { type: string, enum: [auto, off], default: auto }
+            interaction: { type: string, enum: [full, simple], default: full }
     TileSourcePreset:
       type: object
       required: [id, label, map_type, attribution]

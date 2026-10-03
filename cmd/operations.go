@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -25,28 +26,32 @@ const (
 // asset, work performed, and current state. Coordinates are optional because
 // indoor maintenance must work without GPS.
 type OperationRecord struct {
-	ID         string    `json:"id"`
-	Type       string    `json:"type"`
-	Actor      string    `json:"actor,omitempty"`
-	AssetCode  string    `json:"asset_code"`
-	Status     string    `json:"status"`
-	Recipient  string    `json:"recipient,omitempty"`
-	Reference  string    `json:"reference,omitempty"`
-	Technician string    `json:"technician,omitempty"`
-	WorkType   string    `json:"work_type,omitempty"`
-	Notes      string    `json:"notes,omitempty"`
-	Latitude   *float64  `json:"latitude,omitempty"`
-	Longitude  *float64  `json:"longitude,omitempty"`
-	OccurredAt time.Time `json:"occurred_at"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID            string    `json:"id"`
+	ClientEventID string    `json:"client_event_id,omitempty"`
+	Type          string    `json:"type"`
+	Actor         string    `json:"actor,omitempty"`
+	AssetCode     string    `json:"asset_code"`
+	Status        string    `json:"status"`
+	Recipient     string    `json:"recipient,omitempty"`
+	Reference     string    `json:"reference,omitempty"`
+	Technician    string    `json:"technician,omitempty"`
+	WorkType      string    `json:"work_type,omitempty"`
+	Notes         string    `json:"notes,omitempty"`
+	Latitude      *float64  `json:"latitude,omitempty"`
+	Longitude     *float64  `json:"longitude,omitempty"`
+	OccurredAt    time.Time `json:"occurred_at"`
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 type OperationsStore struct {
-	mu      sync.RWMutex
-	path    string
-	records []OperationRecord
-	newest  []int // Record offsets, newest first; persisted append order stays intact.
+	mu           sync.RWMutex
+	path         string
+	records      []OperationRecord
+	newest       []int // Record offsets, newest first; persisted append order stays intact.
+	clientEvents map[string]int
 }
+
+var ErrOperationIdempotencyConflict = errors.New("client_event_id already belongs to a different operation")
 
 func NewOperationsStore(path string) *OperationsStore { return &OperationsStore{path: path} }
 
@@ -64,6 +69,16 @@ func (s *OperationsStore) Load() error {
 	if err := json.Unmarshal(data, &records); err != nil {
 		return fmt.Errorf("decode operations log: %w", err)
 	}
+	clientEvents := make(map[string]int)
+	for i, record := range records {
+		if record.ClientEventID == "" {
+			continue
+		}
+		if _, exists := clientEvents[record.ClientEventID]; exists {
+			return fmt.Errorf("duplicate client_event_id in operations log")
+		}
+		clientEvents[record.ClientEventID] = i
+	}
 	newest := make([]int, len(records))
 	for i := range records {
 		newest[i] = i
@@ -77,7 +92,7 @@ func (s *OperationsStore) Load() error {
 	})
 	// Publish only after successful decoding, preserving a usable store if a
 	// reload encounters an invalid or partially written external file.
-	s.records, s.newest = records, newest
+	s.records, s.newest, s.clientEvents = records, newest, clientEvents
 	return nil
 }
 
@@ -98,6 +113,20 @@ func (s *OperationsStore) Create(input OperationRecord) (OperationRecord, error)
 	if err := validateOperation(&input); err != nil {
 		return OperationRecord{}, err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if input.ClientEventID != "" {
+		if index, exists := s.clientEvents[input.ClientEventID]; exists {
+			existing := s.records[index]
+			if input.OccurredAt.IsZero() {
+				input.OccurredAt = existing.OccurredAt
+			}
+			if !sameOperation(existing, input) {
+				return OperationRecord{}, ErrOperationIdempotencyConflict
+			}
+			return cloneOperation(existing), nil
+		}
+	}
 	id, err := operationID()
 	if err != nil {
 		return OperationRecord{}, err
@@ -109,9 +138,6 @@ func (s *OperationsStore) Create(input OperationRecord) (OperationRecord, error)
 		input.OccurredAt = input.OccurredAt.UTC()
 	}
 	input.CreatedAt = time.Now().UTC()
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.records = append(s.records, input)
 	if err := s.saveLocked(); err != nil {
 		s.records = s.records[:len(s.records)-1]
@@ -124,7 +150,26 @@ func (s *OperationsStore) Create(input OperationRecord) (OperationRecord, error)
 	s.newest = append(s.newest, 0)
 	copy(s.newest[position+1:], s.newest[position:len(s.newest)-1])
 	s.newest[position] = idx
+	if input.ClientEventID != "" {
+		if s.clientEvents == nil {
+			s.clientEvents = make(map[string]int)
+		}
+		s.clientEvents[input.ClientEventID] = idx
+	}
 	return cloneOperation(input), nil
+}
+
+func sameOperation(a, b OperationRecord) bool {
+	if a.ClientEventID != b.ClientEventID || a.Type != b.Type || a.Actor != b.Actor ||
+		a.AssetCode != b.AssetCode || a.Status != b.Status || a.Recipient != b.Recipient ||
+		a.Reference != b.Reference || a.Technician != b.Technician || a.WorkType != b.WorkType ||
+		a.Notes != b.Notes || !a.OccurredAt.Equal(b.OccurredAt) {
+		return false
+	}
+	if (a.Latitude == nil) != (b.Latitude == nil) || (a.Longitude == nil) != (b.Longitude == nil) {
+		return false
+	}
+	return a.Latitude == nil || (*a.Latitude == *b.Latitude && *a.Longitude == *b.Longitude)
 }
 
 func (s *OperationsStore) List(kind string, limit int) []OperationRecord {
@@ -164,6 +209,7 @@ func (s *OperationsStore) saveLocked() error {
 
 func validateOperation(record *OperationRecord) error {
 	record.Type = strings.ToLower(strings.TrimSpace(record.Type))
+	record.ClientEventID = strings.TrimSpace(record.ClientEventID)
 	record.Actor = strings.TrimSpace(record.Actor)
 	record.AssetCode = strings.TrimSpace(record.AssetCode)
 	record.Status = strings.TrimSpace(record.Status)
@@ -174,6 +220,15 @@ func validateOperation(record *OperationRecord) error {
 	record.Notes = strings.TrimSpace(record.Notes)
 	if record.Type != operationTypePOD && record.Type != operationTypeMaintenance && record.Type != operationTypeCheck {
 		return errors.New("operation type must be pod, maintenance or check")
+	}
+	if len(record.ClientEventID) > 128 {
+		return errors.New("client_event_id must be at most 128 characters")
+	}
+	for _, char := range record.ClientEventID {
+		if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') || char == '-' || char == '_') {
+			return errors.New("client_event_id contains an invalid character")
+		}
 	}
 	if record.AssetCode == "" || len(record.AssetCode) > 160 {
 		return errors.New("asset_code is required and must be at most 160 characters")
@@ -204,7 +259,9 @@ func validateOperation(record *OperationRecord) error {
 	if (record.Latitude == nil) != (record.Longitude == nil) {
 		return errors.New("latitude and longitude must be supplied together")
 	}
-	if record.Latitude != nil && (*record.Latitude < -90 || *record.Latitude > 90 || *record.Longitude < -180 || *record.Longitude > 180) {
+	if record.Latitude != nil && (math.IsNaN(*record.Latitude) || math.IsInf(*record.Latitude, 0) ||
+		math.IsNaN(*record.Longitude) || math.IsInf(*record.Longitude, 0) ||
+		*record.Latitude < -90 || *record.Latitude > 90 || *record.Longitude < -180 || *record.Longitude > 180) {
 		return errors.New("invalid coordinates")
 	}
 	return nil

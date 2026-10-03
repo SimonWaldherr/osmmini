@@ -15,12 +15,12 @@ GOTAGS ?= sqliteimport
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build run bayern offline maplibre-assets ensure-maplibre-assets pbf-download offline-prep test test-js test-race vet fmt check check-js clean
+.PHONY: help build run bayern offline micromap-assets ensure-micromap-assets maplibre-assets ensure-maplibre-assets pbf-download offline-prep test test-js test-race vet fmt check check-js clean
 
 help: ## Show available commands.
 	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z0-9_-]+:.*##/ {printf "  %-12s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
-build: ensure-maplibre-assets ## Build the server into bin/osmmini.
+build: ensure-micromap-assets ensure-maplibre-assets ## Build the server into bin/osmmini.
 	@mkdir -p "$(BIN_DIR)"
 	$(GO) build -tags=$(GOTAGS) -o "$(BIN_DIR)/$(APP)" ./cmd
 
@@ -40,6 +40,20 @@ offline: ## Run the fully local tinyTiles profile; set ADMIN_TOKEN and PBF.
 		exit 2; \
 	fi
 	OSMMINI_ADMIN_TOKEN="$(ADMIN_TOKEN)" $(GO) run -tags=$(GOTAGS) ./cmd -pbf "$(PBF)" -settings settings.tinytiles.json -listen "$(LISTEN)"
+
+micromap-assets: ## Rebuild microMap 0.3.0 from the pinned upstream commit (network required).
+	@set -e; stage=$$(mktemp -d); trap 'rm -rf "$$stage"' EXIT; \
+		git clone https://github.com/Karte-Bayern/microMap.git "$$stage/source"; \
+		git -C "$$stage/source" checkout --detach 57e41ae403c916415ff779d9c17a77ea68523bb2; \
+		(cd "$$stage/source" && npm ci && npm run build); \
+		mkdir -p "$$stage/cmd/web/static/micromap"; \
+		cp "$$stage/source/dist/micromap.mjs" "$$stage/source/LICENSE" "$$stage/cmd/web/static/micromap/"; \
+		cp cmd/web/static/micromap/SHA256SUMS "$$stage/checksums"; \
+		(cd "$$stage" && shasum -a 256 -c checksums); \
+		cp "$$stage/cmd/web/static/micromap/micromap.mjs" "$$stage/cmd/web/static/micromap/LICENSE" cmd/web/static/micromap/
+
+ensure-micromap-assets: ## Verify the committed microMap bundle and license (no network required).
+	shasum -a 256 -c cmd/web/static/micromap/SHA256SUMS
 
 maplibre-assets: ## Refresh the pinned MapLibre 6.7.0 ESM assets (network required).
 	@mkdir -p cmd/web/static/maplibre
@@ -63,17 +77,18 @@ pbf-download: ## Download a Geofabrik PBF extract into PBF (set GEOFABRIK_URL to
 		curl -fsSL --retry 3 "$(GEOFABRIK_URL)" -o "$(PBF)"; \
 	fi
 
-offline-prep: pbf-download maplibre-assets ## Prepare everything needed for a fully offline deployment: PBF extract + vendored MapLibre GL assets (no CDN needed at runtime).
+offline-prep: pbf-download ensure-micromap-assets maplibre-assets ## Prepare everything needed for a fully offline deployment: PBF extract + local microMap and MapLibre assets (no CDN needed at runtime).
 	@echo ""
 	@echo "Offline assets ready:"
 	@echo "  PBF:      $(PBF)"
+	@echo "  microMap: cmd/web/static/micromap/micromap.mjs"
 	@echo "  MapLibre: cmd/web/static/maplibre/maplibre-gl.mjs + shared/worker modules + CSS"
 	@echo ""
 	@echo "Next: build the local tinyTiles map + start the offline profile:"
 	@echo "  make offline ADMIN_TOKEN=<token>"
 	@echo "Then use the 'Offline-Karte (tinyTiles)' source in Einstellungen to build the vector basemap from the loaded PBF."
 
-test: ensure-maplibre-assets ## Run all unit tests.
+test: ensure-micromap-assets ensure-maplibre-assets ## Run all unit tests.
 	$(GO) test -tags=$(GOTAGS) ./...
 
 test-race: ## Run the test suite with Go's race detector.
@@ -92,6 +107,7 @@ test-js: ## Run browser request and interaction regression tests (requires Node.
 
 check-js: ## Validate the browser JavaScript syntax (requires Node.js).
 	node --check cmd/web/app.js
+	node --check cmd/web/map-renderer.js
 	node --check cmd/web/offline-style.js
 
 clean: ## Remove locally built binaries.

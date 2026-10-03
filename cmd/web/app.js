@@ -31,7 +31,9 @@ const map = new maplibregl.Map({
   // add our own explicitly below (so it's easy to find/adjust), which would
   // otherwise render twice.
   attributionControl: false,
+  ...MapRenderer.mapOptions(),
 });
+MapRenderer.bindMap(map);
 map.addControl(new maplibregl.NavigationControl(), 'bottom-right');
 map.addControl(new maplibregl.AttributionControl(), 'bottom-left');
 OfflineMapStyle.bind(queueOfflineLabels);
@@ -1042,7 +1044,7 @@ async function applyTileLayer(settings, { directPreview = false } = {}) {
   // This prevents an OSM tile from being reused after switching to BayernAtlas.
   const proxyURL = '/tiles/{z}/{x}/{y}.png?source=' + tileSourceCacheKey(mapType, tiles);
 
-  if (mapType === 'vector' && tiles.style_url && supportsWebGL()) {
+  if (mapType === 'vector' && tiles.style_url && (window.mapRenderer === 'micromap' || supportsWebGL())) {
     try {
       map.setStyle(tiles.style_url);
       const ready = await waitForStyleReady();
@@ -1057,7 +1059,7 @@ async function applyTileLayer(settings, { directPreview = false } = {}) {
       rehydrateMapLayers();
       return true;
     } catch (e) {
-      console.warn('MapLibre GL style load failed, falling back to raster tiles', e);
+      console.warn('Vector style load failed, falling back to raster tiles', e);
     }
   } else if (mapType === 'vector' && tiles.style_url) {
     console.warn('WebGL is unavailable, falling back to raster tiles');
@@ -3111,6 +3113,7 @@ optimizeEl.addEventListener('change', (ev) => {
 // Initialize settings UI
 function initializeSettingsUI(s) {
   if (!s) return;
+    MapRenderer.bindSettingsUI(s.map_display);
     setUseCaseSelection(s.use_case || 'private', { announce: false });
     if(s.routing) {
         document.getElementById('engine').value = (s.routing.engine || 'astar');
@@ -3457,13 +3460,24 @@ function setTileSourceForm(preset) {
   updateMapTypeVisibility(preset.map_type || 'raster');
 }
 
-function setTileSourceAdvancedOpen(open) {
+function setLayersMenu(menu) {
+  if (!['base', 'offline', 'custom'].includes(menu)) return;
+  const view = document.getElementById('mapsView');
+  if (!view) return;
+  view.dataset.layerMenu = menu;
+  view.querySelectorAll('button[data-layer-menu]').forEach(button => {
+    button.setAttribute('aria-pressed', String(button.dataset.layerMenu === menu));
+  });
   const advanced = document.getElementById('tileSourceAdvanced');
-  const toggle = document.getElementById('tileSourceAdvancedToggle');
-  if (!advanced || !toggle) return;
-  advanced.hidden = !open;
-  toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
-  toggle.textContent = open ? 'Auswahl schließen' : 'Eigene Quelle';
+  if (advanced) advanced.hidden = menu !== 'custom';
+  document.getElementById('tileSourceAdvancedToggle')?.setAttribute('aria-expanded', String(menu === 'custom'));
+  if (menu === 'offline') openMapsSection('tinyTilesHeader', 'tinyTilesSettings', 'tinyTilesSettingsOpen');
+  document.getElementById('mapsPanelContent')?.scrollTo({ top: 0 });
+  window.setTimeout(hydrateVisibleTilePreviews, 0);
+}
+
+function setTileSourceAdvancedOpen(open) {
+  setLayersMenu(open ? 'custom' : 'base');
 }
 
 function sourceSelectionHint(preset = null) {
@@ -3593,7 +3607,7 @@ function setTileSourceFilter(filter) {
   document.querySelectorAll('.tile-source-filter').forEach((button) => {
     const active = button.dataset.tileFilter === filter;
     button.classList.toggle('is-active', active);
-    button.setAttribute('aria-selected', active ? 'true' : 'false');
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
   });
   renderTileSourceCards();
 }
@@ -3690,14 +3704,12 @@ function openMapsSection(headerID, contentID, storageKey) {
   try { localStorage.setItem(storageKey, '1'); } catch (_) {}
 }
 
-function showMapSourcePicker(filter = 'recommended') {
+function showMapSourcePicker(filter = activeTileSourceFilter) {
   setMapsView('maps');
   openMapsSection('mapHeader', 'mapSettings', 'mapSettingsOpen');
+  setLayersMenu('base');
   setTileSourceFilter(filter);
-  window.setTimeout(() => {
-    document.getElementById('tileSourceCards')?.scrollIntoView({ block: 'center', behavior: 'smooth' });
-    hydrateVisibleTilePreviews();
-  }, 0);
+  window.setTimeout(hydrateVisibleTilePreviews, 0);
 }
 
 function openMapSourcePicker() {
@@ -3761,15 +3773,8 @@ document.getElementById('tileSourceFilters')?.addEventListener('click', (event) 
   if (button) setTileSourceFilter(button.dataset.tileFilter);
 });
 
-document.getElementById('tileSourceAdvancedToggle')?.addEventListener('click', () => {
-  const advanced = document.getElementById('tileSourceAdvanced');
-  const open = Boolean(advanced?.hidden);
-  setTileSourceAdvancedOpen(open);
-  if (open) {
-    activeTilePresetID = '';
-    renderTileSourceCards();
-    sourceSelectionHint(null);
-  }
+document.querySelectorAll('.layers-menu [data-layer-menu]').forEach(button => {
+  button.addEventListener('click', () => setLayersMenu(button.dataset.layerMenu));
 });
 
 document.getElementById('mapHeader')?.addEventListener('click', () => window.setTimeout(hydrateVisibleTilePreviews, 0));
@@ -4217,10 +4222,7 @@ async function fetchTinyTilesStatus({ silent = false } = {}) {
 
 function openTinyTilesBuilder() {
   setMapsView('maps');
-  openMapsSection('tinyTilesHeader', 'tinyTilesSettings', 'tinyTilesSettingsOpen');
-  window.setTimeout(() => {
-    document.getElementById('tinyTilesSettings')?.scrollIntoView({ block: 'center', behavior: 'smooth' });
-  }, 0);
+  setLayersMenu('offline');
 }
 
 async function selectTinyTilesSource({ fromWelcome = false } = {}) {
@@ -4932,6 +4934,8 @@ document.getElementById('geodataMBTilesRemoveBtn')?.addEventListener('click', as
 const operationsEndpoint = '/api/v1/operations';
 const operationsQueueKey = 'osmmini.operations.pending.v1';
 const operationsLocalKey = 'osmmini.operations.local.v1';
+const operationsQueueLimit = 100;
+let pendingOperationsFlush = null;
 let operationCoordinates = null;
 let operationScanStream = null;
 let operationScanTimer = null;
@@ -4971,36 +4975,63 @@ function setOperationMode(type) {
 }
 
 function pendingOperations() {
+  const raw = localStorage.getItem(operationsQueueKey);
+  if (raw === null) return [];
   try {
-    const parsed = JSON.parse(localStorage.getItem(operationsQueueKey) || '[]');
-    return Array.isArray(parsed) ? parsed : [];
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed;
   } catch (_) {
-    return [];
+    // Keep the original value intact for recovery/export from browser storage.
   }
+  throw new Error('Die Offline-Warteschlange ist beschädigt und wurde nicht überschrieben. Bitte die lokalen Browserdaten sichern.');
 }
 
 function savePendingOperations(records) {
-  localStorage.setItem(operationsQueueKey, JSON.stringify(records.slice(-100)));
+  if (records.length > operationsQueueLimit) {
+    throw new Error('Die Offline-Warteschlange ist voll. Bitte zuerst die vorgemerkten Einträge übertragen.');
+  }
+  localStorage.setItem(operationsQueueKey, JSON.stringify(records));
 }
 
 function queueOperation(record) {
   const queue = pendingOperations();
+  if (!record.client_event_id) throw new Error('Der Eintrag hat keine Ereignis-ID und kann nicht sicher vorgemerkt werden.');
+  if (queue.some((item) => item.client_event_id === record.client_event_id)) return;
+  if (queue.length >= operationsQueueLimit) {
+    throw new Error('Die Offline-Warteschlange ist voll. Dieser Eintrag wurde nicht gespeichert.');
+  }
   queue.push(record);
   savePendingOperations(queue);
   setOperationStatus(`Offline vorgemerkt (${queue.length}). Der Eintrag wird beim nächsten Kontakt übertragen.`);
 }
 
-function localOperations() {
-  try {
-    const records = JSON.parse(localStorage.getItem(operationsLocalKey) || '[]');
-    return Array.isArray(records) ? records : [];
-  } catch (_) {
-    return [];
+function operationEventID() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  if (!globalThis.crypto?.getRandomValues) {
+    throw new Error('Der Browser kann keine sichere Ereignis-ID erzeugen.');
   }
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  return 'op_' + Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function localOperations() {
+  const raw = localStorage.getItem(operationsLocalKey);
+  if (raw === null) return [];
+  try {
+    const records = JSON.parse(raw);
+    if (Array.isArray(records)) return records;
+  } catch (_) {
+    // Do not replace a malformed local record set with an empty history.
+  }
+  throw new Error('Das lokale Protokoll ist beschädigt und wurde nicht überschrieben. Bitte die lokalen Browserdaten sichern.');
 }
 
 function saveLocalOperations(records) {
-  localStorage.setItem(operationsLocalKey, JSON.stringify(records.slice(0, 500)));
+  if (records.length > 500) {
+    throw new Error('Das lokale Protokoll ist voll. Bitte die Einträge vor weiteren Aufnahmen exportieren.');
+  }
+  localStorage.setItem(operationsLocalKey, JSON.stringify(records));
 }
 
 function operationHeaders(headers = {}) {
@@ -5046,6 +5077,7 @@ function operationPayload() {
   if (!assetCode) throw new Error('Barcode oder Objekt-ID fehlt.');
   if (type === 'pod' && !recipient) throw new Error('Für den Zustellnachweis fehlt die empfangende Person.');
   const payload = {
+    client_event_id: operationEventID(),
     type,
     asset_code: assetCode,
     status: type === 'pod' ? 'delivered' : type === 'maintenance' ? (document.getElementById('operationStatus')?.value || 'completed') : (document.getElementById('operationCheckStatus')?.value || 'checked'),
@@ -5065,8 +5097,11 @@ function operationPayload() {
 
 async function submitOperation(record) {
   if (deployment.browser_local_operations) {
-    const created = { ...record, id: `browser_${globalThis.crypto?.randomUUID?.() || Date.now()}`, actor: 'browser-local', created_at: new Date().toISOString() };
+    const created = { ...record, id: `browser_${record.client_event_id}`, actor: 'browser-local', created_at: new Date().toISOString() };
     const records = localOperations();
+    if (records.length >= 500) {
+      throw new Error('Das lokale Protokoll ist voll. Bitte die Einträge vor weiteren Aufnahmen exportieren.');
+    }
     records.unshift(created);
     saveLocalOperations(records);
     return created;
@@ -5113,7 +5148,8 @@ function renderOperationsHistory(records) {
 
 async function loadOperations() {
   if (deployment.browser_local_operations) {
-    operationRecords = localOperations();
+    try { operationRecords = localOperations(); }
+    catch (error) { setOperationStatus(error.message); return; }
     renderOperationsHistory(operationRecords);
     return;
   }
@@ -5129,21 +5165,42 @@ async function loadOperations() {
 }
 
 async function flushPendingOperations() {
-  if (deployment.browser_local_operations) return;
-  const queued = pendingOperations();
-  if (queued.length === 0 || !navigator.onLine) return;
-  const remaining = [];
-  for (const record of queued) {
-    try {
-      await submitOperation(record);
-    } catch (_) {
-      remaining.push(record);
+  if (pendingOperationsFlush) return pendingOperationsFlush;
+  pendingOperationsFlush = (async () => {
+    if (deployment.browser_local_operations || !navigator.onLine) return;
+    const queued = pendingOperations().map((record) => (
+      record.client_event_id ? record : { ...record, client_event_id: operationEventID() }
+    ));
+    if (queued.length === 0) return;
+    // Persist IDs on legacy queued records before their first network attempt.
+    savePendingOperations(queued);
+    let transferred = 0;
+    let failure = null;
+    for (const record of queued) {
+      try {
+        await submitOperation(record);
+        // Read the current queue: a new entry may have arrived during fetch.
+        savePendingOperations(pendingOperations().filter((item) => item.client_event_id !== record.client_event_id));
+        transferred++;
+      } catch (error) {
+        // Keep this exact payload and ID for a later retry.
+        failure = error;
+      }
     }
-  }
-  savePendingOperations(remaining);
-  if (remaining.length < queued.length) {
-    setOperationStatus(remaining.length ? `${queued.length - remaining.length} Offline-Einträge übertragen; ${remaining.length} warten noch.` : 'Offline-Einträge übertragen.');
-    await loadOperations();
+    if (transferred > 0 || failure) {
+      const remaining = pendingOperations().length;
+      setOperationStatus(failure
+        ? `${remaining} Offline-Einträge warten noch: ${failure instanceof Error ? failure.message : 'Übertragung fehlgeschlagen.'}`
+        : 'Offline-Einträge übertragen.');
+      if (transferred > 0) await loadOperations();
+    }
+  })();
+  try {
+    return await pendingOperationsFlush;
+  } catch (error) {
+    setOperationStatus(error instanceof Error ? error.message : 'Offline-Einträge konnten nicht geprüft werden.');
+  } finally {
+    pendingOperationsFlush = null;
   }
 }
 
@@ -5229,8 +5286,9 @@ document.getElementById('operationLocation')?.addEventListener('click', () => {
 });
 document.getElementById('operationForm')?.addEventListener('submit', async (event) => {
   event.preventDefault();
+  let record;
   try {
-    const record = operationPayload();
+    record = operationPayload();
     const created = await submitOperation(record);
     operationRecords.unshift(created);
     operationRecords = operationRecords.slice(0, 100);
@@ -5240,8 +5298,8 @@ document.getElementById('operationForm')?.addEventListener('submit', async (even
     setOperationMode(created.type);
     setOperationStatus('Lokal und dauerhaft gespeichert.');
   } catch (error) {
-    if (error instanceof TypeError || !navigator.onLine) {
-      try { queueOperation(operationPayload()); } catch (payloadError) { setOperationStatus(payloadError instanceof Error ? payloadError.message : 'Eintrag konnte nicht vorgemerkt werden.'); }
+    if (record && (error instanceof TypeError || !navigator.onLine)) {
+      try { queueOperation(record); } catch (payloadError) { setOperationStatus(payloadError instanceof Error ? payloadError.message : 'Eintrag konnte nicht vorgemerkt werden.'); }
       return;
     }
     setOperationStatus(error instanceof Error ? error.message : 'Eintrag konnte nicht gespeichert werden.');
@@ -5255,6 +5313,7 @@ document.getElementById('operationToken')?.addEventListener('change', () => {
   void loadOperations();
 });
 window.addEventListener('online', () => { void flushPendingOperations(); });
+window.setInterval(() => { if (navigator.onLine) void flushPendingOperations(); }, 30000);
 window.addEventListener('pagehide', stopOperationScanner, { once: true });
 setOperationMode('pod');
 void (async () => {
@@ -5328,6 +5387,8 @@ document.getElementById('save').onclick = async () => {
     speedInputs.forEach(si => { const k=si.dataset.type; const v=parseFloat(si.value); if(!isNaN(v)) cur.default_highway_speeds[k]=v; });
     // collect tile/map source settings
     cur.tiles = tileSettingsFromUI(cur.tiles || {});
+    cur.map_display = MapRenderer.readSettingsUI();
+    await MapRenderer.preflight(cur.map_display);
     // Remote API key
     cur.ai = cur.ai || {};
     const keyEl = document.getElementById('openaiApiKey');
@@ -5343,6 +5404,7 @@ document.getElementById('save').onclick = async () => {
     const saved = await apiPutSettings(cur);
     preloadedSettings = saved;
     apiCache.delete('settings'); // Invalidate cache
+    if (MapRenderer.applySavedSettings(saved.map_display, map)) return;
     // Refresh map tile layer with updated settings
     applyTileLayer(cur);
     // Invalidate AI provider cache so new API key takes effect immediately.
@@ -5485,8 +5547,8 @@ if ('IntersectionObserver' in window) {
 }
 
 document.getElementById('resetSettings').addEventListener('click', async ()=>{
-  if (!confirm('Einstellungen zurücksetzen? Die Seite wird neu geladen.')) return;
-  showToast('Einstellungen werden zurückgesetzt...', 'info', 1500);
+  if (!confirm('Ungespeicherte Änderungen verwerfen und die Seite neu laden?')) return;
+  showToast('Gespeicherte Einstellungen werden geladen …', 'info', 1500);
   setTimeout(() => window.location.reload(), 500);
 });
 
@@ -6112,7 +6174,7 @@ function updateGISMeasurement() {
   }, 100);
 }
 function addGISMeasurePoint(event) {
-  if (event.originalEvent?.target?.closest?.('.maplibregl-marker, .maplibregl-popup')) return;
+  if (event.originalEvent?.target?.closest?.('.maplibregl-marker, .maplibregl-popup, .micromap-marker, .micromap-popup')) return;
   if (gisMeasurePoints.length >= 10000) { showToast('Maximal 10.000 Messpunkte', 'info'); return; }
   gisMeasurePoints.push([gisLongitude(event.lngLat.lng), event.lngLat.lat]);
   updateGISMeasurement();
@@ -6172,7 +6234,31 @@ function mapsCameraPadding() {
   }
   return mobile
     ? { top: 60, right: 40, bottom: Math.min(panelHeight + 48, window.innerHeight * .5), left: 40 }
-    : { top: 80, right: 50, bottom: 40, left: 410 };
+    : { top: 80, right: 50, bottom: 40, left: (document.querySelector('.sidebar')?.getBoundingClientRect().right || 370) + 24 };
+}
+
+let layersReturnState = null;
+function syncLayersButton() {
+  const shell = document.querySelector('.maps-shell');
+  const open = shell?.dataset.view === 'maps' && !shell.classList.contains('panel-collapsed');
+  const button = document.getElementById('mapsLayers');
+  button?.setAttribute('aria-expanded', String(open));
+  button?.setAttribute('title', open ? 'Kartenebenen schließen' : 'Kartenebenen öffnen');
+}
+function closeLayersPanel() {
+  const previous = layersReturnState;
+  layersReturnState = null;
+  setMapsView(previous?.view || 'explore');
+  if (previous) {
+    document.querySelector('.maps-shell')?.classList.toggle('panel-expanded', previous.expanded);
+    const expand = document.getElementById('mapsPanelExpand');
+    expand?.setAttribute('aria-pressed', String(previous.expanded));
+    if (expand) expand.textContent = previous.expanded ? 'Weniger Platz' : 'Mehr Platz';
+    setMapsPanelCollapsed(previous.collapsed);
+    const content = document.getElementById('mapsPanelContent');
+    if (content) content.scrollTop = previous.scroll;
+  }
+  document.getElementById('mapsLayers')?.focus();
 }
 
 // Map-first navigation keeps the existing route and specialist tools intact.
@@ -6180,7 +6266,10 @@ function setMapsView(view) {
   if (!['explore', 'route', 'tools', 'assistant', 'maps', 'edit'].includes(view)) return;
   if (view !== 'tools') window.planningTools?.cancel();
   document.querySelector('.maps-shell')?.setAttribute('data-view', view);
-  document.getElementById('mapsPanelTitle').textContent = {explore:'Entdecken',route:'Route planen',assistant:'Kartenassistent',tools:'Werkzeuge',maps:'Karten',edit:'OSM-Edit'}[view];
+  document.getElementById('mapsPanelTitle').textContent = {explore:'Entdecken',route:'Route planen',assistant:'Kartenassistent',tools:'Werkzeuge',maps:'Kartenebenen',edit:'OSM-Edit'}[view];
+  const back = document.getElementById('mapsPanelBack');
+  if (back) back.hidden = view !== 'maps';
+  if (view !== 'maps') layersReturnState = null;
   if (view === 'edit') window.osmEditor?.enter(); else window.osmEditor?.leave();
   setMapsPanelCollapsed(false);
   document.querySelectorAll('.maps-rail [data-map-view]').forEach(button => {
@@ -6196,15 +6285,15 @@ function setMapsView(view) {
     window.setTimeout(hydrateVisibleTilePreviews, 0);
   }
   map.resize();
-  map.setPadding(mapsCameraPadding());
+  map.setPadding?.(mapsCameraPadding());
 }
 
 if (typeof ResizeObserver !== 'undefined') {
-  const mapsPanelObserver = new ResizeObserver(() => map.setPadding(mapsCameraPadding()));
+  const mapsPanelObserver = new ResizeObserver(() => map.setPadding?.(mapsCameraPadding()));
   const mapsPanel = document.querySelector('.sidebar');
   if (mapsPanel) mapsPanelObserver.observe(mapsPanel);
 }
-window.addEventListener('resize', () => map.setPadding(mapsCameraPadding()));
+window.addEventListener('resize', () => map.setPadding?.(mapsCameraPadding()));
 
 document.querySelectorAll('[data-map-view]').forEach(button => {
   button.addEventListener('click', () => {
@@ -6214,7 +6303,29 @@ document.querySelectorAll('[data-map-view]').forEach(button => {
     if (focusTarget) document.getElementById(focusTarget)?.focus();
   });
 });
-document.getElementById('mapsLayers')?.addEventListener('click', () => revealSidebarTool('map'));
+document.getElementById('mapsLayers')?.addEventListener('click', () => {
+  const shell = document.querySelector('.maps-shell');
+  if (shell.dataset.view === 'maps' && !shell.classList.contains('panel-collapsed')) {
+    closeLayersPanel();
+    return;
+  }
+  if (shell.dataset.view !== 'maps') layersReturnState = {
+    view: shell.dataset.view, collapsed: shell.classList.contains('panel-collapsed'),
+    expanded: shell.classList.contains('panel-expanded'),
+    scroll: document.getElementById('mapsPanelContent')?.scrollTop || 0
+  };
+  showMapSourcePicker();
+  document.querySelector('.layers-menu [aria-pressed="true"]')?.focus();
+});
+document.getElementById('mapsPanelBack')?.addEventListener('click', closeLayersPanel);
+document.addEventListener('keydown', event => {
+  if (event.key !== 'Escape' || event.defaultPrevented) return;
+  if (document.querySelector('.maps-shell')?.dataset.view !== 'maps') return;
+  if (!document.getElementById('mapWelcomeOverlay')?.hidden) return;
+  if (document.querySelector('.maps-shell')?.classList.contains('panel-collapsed')) return;
+  event.preventDefault();
+  closeLayersPanel();
+});
 document.getElementById('mapsLocation')?.addEventListener('click', () => document.getElementById('useLocationBtn')?.click());
 
 let placeSearchRequest = null;
@@ -6376,13 +6487,15 @@ function setMapsPanelCollapsed(collapsed) {
   content.hidden = collapsed;
   const toggle = document.getElementById('mapsPanelToggle');
   toggle.setAttribute('aria-expanded', String(!collapsed));
-  toggle.textContent = collapsed ? 'Details zeigen' : 'Nur Karte';
+  toggle.setAttribute('aria-label', collapsed ? 'Sidebar aufklappen' : 'Sidebar einklappen');
+  toggle.setAttribute('title', collapsed ? 'Sidebar aufklappen' : 'Sidebar einklappen');
+  syncLayersButton();
   if (collapsed) {
     shell.classList.remove('panel-expanded');
     document.getElementById('mapsPanelExpand').setAttribute('aria-pressed', 'false');
     document.getElementById('mapsPanelExpand').textContent = 'Mehr Platz';
   }
-  map.setPadding(mapsCameraPadding());
+  map.setPadding?.(mapsCameraPadding());
 }
 document.getElementById('mapsPanelToggle')?.addEventListener('click', () => {
   setMapsPanelCollapsed(!document.querySelector('.maps-shell').classList.contains('panel-collapsed'));
@@ -6480,3 +6593,10 @@ window.mapContext = MapContext.create(map, [
     document.getElementById('planKind').focus();
   } }
 ]);
+
+// Restore the settings panel after the renderer has been replaced by a reload.
+if (MapRenderer.restoreSettingsPanel) {
+  setMapsView('tools');
+  setSettingsOpen(true);
+  document.getElementById('mapDisplaySettings')?.scrollIntoView({block:'start'});
+}
