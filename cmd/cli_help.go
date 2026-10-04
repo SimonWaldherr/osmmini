@@ -18,6 +18,7 @@ var cliSubcommands = []struct{ name, summary string }{
 	{"territory lookup", "Find the territory containing a coordinate"},
 	{"dispatch assign", "Assign CSV parcels/addresses to territories"},
 	{"dispatch manifests", "Write one CSV manifest per territory group"},
+	{"dispatch plan", "Allocate JSON jobs to vehicles or teams with capacity and skill rules"},
 	{"geodata import", "Import GeoJSON, KML/KMZ or Shapefile as a map layer"},
 	{"pbf-index", "Write a spatial block sidecar index for a large PBF"},
 	{"region-extract", "Cut a complete regional PBF from a large one (uses osmium)"},

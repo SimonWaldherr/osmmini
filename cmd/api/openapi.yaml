@@ -5,6 +5,36 @@ info:
 servers:
   - url: /
 paths:
+  /api/v1/dispatch/plan:
+    post:
+      summary: Allocate jobs to vehicles or teams with capacity, skills and territory rules
+      description: Stateless priority-greedy heuristic using great-circle distance from each resource location. No PBF is needed unless routing manifests afterwards. Does not compute routes, stop order, time windows or a globally optimal allocation. Same public access policy as routing; request body limited to 4 MiB.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                resources:
+                  type: array
+                  maxItems: 256
+                  items: { $ref: '#/components/schemas/WorkResource' }
+                jobs:
+                  type: array
+                  maxItems: 5000
+                  items: { $ref: '#/components/schemas/WorkJob' }
+                layer: { type: string, description: Optional loaded territory layer; unknown layers are rejected }
+                vehicle_key: { type: string, default: territory_id, description: Resource property holding the territory ID; requires layer }
+      responses:
+        '200':
+          description: Deterministic resource manifests and explicit reasons for all unassigned jobs
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkPlan' }
+        '400': { description: Invalid JSON, input limits, unknown layer or invalid planning data }
+        '405': { description: POST required }
   /api/v1/geo/pois:
     get:
       summary: Local POIs as GeoJSON Points (nodes and way centroids)
@@ -232,6 +262,49 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+  /api/v1/tinytiles/buildings:
+    get:
+      summary: Get offline building footprints and estimated heights for the visible map
+      description: Returns complete closed-way polygons intersecting the viewport from zoom 14. Heights use OSM height, then building levels at 3 metres per level, then type-specific defaults. Responses are limited to 3000 buildings and 100000 vertices. Large viewports are rejected. Estimated heights are identified by height_source.
+      parameters:
+        - name: bbox
+          in: query
+          required: true
+          description: Visible WGS84 bounds as minLon,minLat,maxLon,maxLat.
+          schema: { type: string }
+        - name: zoom
+          in: query
+          schema: { type: integer, minimum: 0, maximum: 22 }
+      responses:
+        "200":
+          description: GeoJSON building polygons; an empty collection when unavailable or below zoom 14
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [type, features]
+                properties:
+                  type: { type: string, enum: [FeatureCollection] }
+                  truncated: { type: boolean, description: True when a response limit was reached }
+                  features:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        type: { type: string, enum: [Feature] }
+                        id: { type: integer, format: int64 }
+                        geometry: { type: object, description: Complete GeoJSON Polygon }
+                        properties:
+                          type: object
+                          properties:
+                            class: { type: string }
+                            render_height: { type: number, description: Total height above ground in metres }
+                            render_min_height: { type: number, description: Base above ground in metres }
+                            height_source: { type: string, enum: [height, levels, default] }
+        "400":
+          description: Invalid or excessive bounding box
+        "405":
+          description: Method not allowed
   /api/v1/offline-labels:
     get:
       summary: Get local town and street labels for the tinyTiles map
@@ -428,6 +501,58 @@ components:
       scheme: bearer
       bearerFormat: opaque
   schemas:
+    WorkLocation:
+      type: object
+      additionalProperties: false
+      properties:
+        lat: { type: number, minimum: -90, maximum: 90, default: 0 }
+        lon: { type: number, minimum: -180, maximum: 180, default: 0 }
+    WorkResource:
+      type: object
+      additionalProperties: false
+      required: [id]
+      properties:
+        id: { type: string, minLength: 1, description: Nonblank and unique within resources }
+        location: { $ref: '#/components/schemas/WorkLocation' }
+        capacity: { type: number, minimum: 0, default: 0, description: Same scalar unit as job demand; zero accepts only zero demand }
+        max_jobs: { type: integer, minimum: 0, default: 0, description: Zero means unlimited }
+        skills: { type: array, items: { type: string } }
+        properties: { type: object, additionalProperties: true }
+    WorkJob:
+      type: object
+      additionalProperties: false
+      required: [id]
+      properties:
+        id: { type: string, minLength: 1, description: Nonblank and unique within jobs }
+        location: { $ref: '#/components/schemas/WorkLocation' }
+        demand: { type: number, minimum: 0, default: 0 }
+        priority: { type: integer, default: 0, description: Higher values assigned first; ties use ascending job ID }
+        required_skills: { type: array, items: { type: string }, description: All skills required; exact case-sensitive matching }
+        properties: { type: object, additionalProperties: true }
+    WorkPlan:
+      type: object
+      required: [algorithm, distance_model, manifests, unassigned]
+      properties:
+        algorithm: { type: string, const: priority-greedy }
+        distance_model: { type: string, const: great-circle-from-resource }
+        manifests:
+          type: array
+          items:
+            type: object
+            required: [resource_id, job_ids, load, remaining_capacity]
+            properties:
+              resource_id: { type: string }
+              job_ids: { type: array, items: { type: string }, description: 'Assignment order, not driving order' }
+              load: { type: number, minimum: 0 }
+              remaining_capacity: { type: number, minimum: 0 }
+        unassigned:
+          type: array
+          items:
+            type: object
+            required: [job_id, reason]
+            properties:
+              job_id: { type: string }
+              reason: { type: string, enum: [no_eligible_resource, capacity_exceeded] }
     Error:
       type: object
       properties:
@@ -678,6 +803,7 @@ components:
         generated_tiles: { type: integer, minimum: 0, description: Number of tiles generated from the PBF. }
         road_features: { type: integer, minimum: 0, description: Number of road features used by the generated map. }
         waterway_features: { type: integer, minimum: 0, description: Number of linear waterway features published in the local companion layer. }
+        building_features: { type: integer, minimum: 0, description: Number of building footprints in the local companion layer. }
     TinyTilesWaterwayFeatureCollection:
       type: object
       required: [type, features]

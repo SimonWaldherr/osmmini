@@ -303,7 +303,7 @@
             <span class="collapse-indicator" aria-hidden="true"><svg class="ui-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="#icon-chevron"/></svg></span>
           </button>
           <div id="tinyTilesSettings" style="display:none">
-            <p class="settings-hint">Erzeuge eine Offline-Karte aus deiner lokalen OSM-Datei. Die Zoomstufen bestimmen Größe und Detailgrad.</p>
+            <p class="settings-hint">Erzeuge eine Offline-Karte aus deiner lokalen OSM-Datei. Die Zoomstufen bestimmen Größe und Detailgrad. Flüsse, Bäche und Kanäle werden als lokale Vektorebene ergänzt.</p>
             <details id="offlineStyleEditor" class="offline-style-editor">
               <summary>Kartenstil anpassen</summary>
               <p class="settings-hint">Direkte Vorschau auf der Offline-Karte. Kein erneutes Erzeugen nötig; Speicherung in diesem Browser.</p>
@@ -546,6 +546,46 @@
         </div>
 
         <div class="sidebar-secondary" data-view-only="tools assistant" aria-label="Weitere Werkzeuge">
+        <details class="card gis-tools geo-workbench" id="geoWorkbench" data-view-only="tools">
+          <summary>GIS-Werkbank</summary>
+          <p class="settings-hint">GeoJSON prüfen, Attribute bearbeiten und Daten verknüpfen. Der Arbeitsstand bleibt in dieser Browser-Sitzung; zum Speichern exportieren.</p>
+          <label for="wbFile">Lokale GeoJSON-Datei (max. 10 MiB)</label>
+          <input id="wbFile" class="setting-input" type="file" accept=".geojson,.json,application/geo+json"/>
+          <label for="wbLayer">Importierter Server-Layer</label>
+          <select id="wbLayer" class="setting-input"><option value="">Liste aktualisieren</option></select>
+          <div class="gis-actions"><button id="wbRefresh" class="btn btn-ghost" type="button">Liste aktualisieren</button><button id="wbLoadLayer" class="btn btn-ghost" type="button">Arbeitskopie laden</button></div>
+          <p id="wbStats"></p>
+          <button id="wbZoom" class="btn btn-ghost" type="button" disabled>Auf Auswahl zoomen</button>
+          <label class="checkbox"><input id="wbShow" type="checkbox" checked/> Auswahl auf der Karte anzeigen</label>
+          <label for="wbFilterField">Nach Attribut filtern</label><select id="wbFilterField" class="setting-input"><option value="">Alle Objekte</option></select>
+          <label for="wbFilterValue">Exakter Wert (Groß-/Kleinschreibung beachten)</label><input id="wbFilterValue" class="setting-input" placeholder="z. B. inspection"/>
+          <div class="gis-actions"><button id="wbKeep" class="btn btn-ghost" type="button" disabled>Nur Auswahl behalten</button><button id="wbUndo" class="btn btn-ghost" type="button" disabled>Rückgängig</button></div>
+          <div class="wb-table-wrap" tabindex="0" role="region" aria-label="Attributtabelle, horizontal scrollbar"><table class="wb-table"><caption>Attribute der ausgewählten Objekte</caption><thead id="wbHead"></thead><tbody id="wbBody"></tbody></table></div>
+          <p id="wbColumns" class="settings-hint"></p>
+          <div class="gis-actions"><button id="wbPrevious" class="btn btn-ghost" type="button" disabled>Zurück</button><span id="wbPage"></span><button id="wbNext" class="btn btn-ghost" type="button" disabled>Weiter</button></div>
+          <details><summary>Attribut bearbeiten</summary>
+            <label for="wbEditIndex">Objektnummer (auch über die Tabelle auswählbar)</label><input id="wbEditIndex" class="setting-input" type="number" min="1" step="1" value="1"/>
+            <label for="wbEditField">Attribut</label><select id="wbEditField" class="setting-input"></select>
+            <label for="wbEditValue">Neuer Wert</label><input id="wbEditValue" class="setting-input"/>
+            <button id="wbEdit" class="btn btn-ghost" type="button" disabled>Attribut übernehmen</button>
+            <p class="settings-hint">Zahlen und boolesche Werte behalten ihren Typ. Verschachtelte Attribute sind nur lesbar.</p>
+          </details>
+          <details><summary>CSV verknüpfen</summary>
+            <label for="wbCSVFile">CSV-Datei (Komma als Trennzeichen, max. 10 MiB)</label><input id="wbCSVFile" class="setting-input" type="file" accept=".csv,text/csv"/>
+            <label for="wbJoinField">Schlüssel im GeoJSON</label><select id="wbJoinField" class="setting-input"></select>
+            <label for="wbCSVKey">Eindeutiger Schlüssel in der CSV</label><select id="wbCSVKey" class="setting-input"></select>
+            <button id="wbJoin" class="btn btn-ghost" type="button" disabled>Alle Objekte verknüpfen</button>
+            <p class="settings-hint">Exakter Textvergleich; führende Nullen bleiben erhalten. Neue Attribute erhalten csv_ als Präfix. Vorhandene Attribute werden nicht überschrieben.</p>
+          </details>
+          <details><summary>Linien vereinfachen</summary>
+            <label for="wbTolerance">Toleranz in Metern</label><input id="wbTolerance" class="setting-input" type="number" min="0" max="1000" step="1" value="10"/>
+            <button id="wbSimplify" class="btn btn-ghost" type="button" disabled>Alle Linien vereinfachen</button>
+            <p class="settings-hint">Douglas-Peucker in einer lokalen Projektion. Endpunkte bleiben erhalten. Flächen unverändert; gemeinsame Linien und Kreuzungen werden nicht topologisch geprüft.</p>
+          </details>
+          <label for="wbFields">Export-Attribute (Mehrfachauswahl; keine Auswahl = alle)</label><select id="wbFields" class="setting-input" multiple size="4"></select>
+          <div class="gis-actions"><button id="wbExport" class="btn btn-ghost" type="button" disabled>Auswahl als GeoJSON</button><button id="wbCSVExport" class="btn btn-ghost" type="button" disabled>Attribute als CSV</button></div>
+          <p id="wbStatus" role="status" aria-live="polite">Eine Datei oder einen Server-Layer laden. Bis zu fünf Bearbeitungen lassen sich rückgängig machen.</p>
+        </details>
         <details class="card gis-tools planning-tools" data-view-only="tools">
           <summary>Messen &amp; Planen</summary>
           <p class="settings-hint">Strecken, Bezugsflächen und Gebäudegrundrisse direkt auf der Karte zeichnen.</p>
@@ -830,8 +870,8 @@
                       <select id="microMapView" class="setting-select"><option value="flat">Flach · 0°</option><option value="perspective">Perspektive · 45°</option><option value="steep">Stark geneigt · 60°</option></select>
                     </div>
                     <div class="setting-item">
-                      <label class="setting-label" for="microMapBuildings">3D-Gebäude</label>
-                      <select id="microMapBuildings" class="setting-select"><option value="auto">Auto · WebGL</option><option value="canvas">Canvas 2D</option></select>
+                      <label class="setting-label" for="microMapBuildings">2,5D-Gebäude</label>
+                      <select id="microMapBuildings" class="setting-select"><option value="auto">Auto · WebGL</option><option value="canvas">Canvas · ohne WebGL</option></select>
                     </div>
                     <div class="setting-item">
                       <label class="setting-label" for="microMapSky">Himmel</label>
@@ -842,7 +882,7 @@
                       <select id="microMapInteraction" class="setting-select"><option value="full">Erlauben</option><option value="simple">Deaktivieren</option></select>
                     </div>
                   </div>
-                  <p class="settings-hint">3D-Gebäude benötigen eine passende Kartenquelle. Für PNG-Export: flache Ansicht nach Norden.</p>
+                  <p class="settings-hint">Die Offline-Karte zeigt 2,5D-Gebäude ab Zoom 14. In „Perspektive“ werden die Wände sichtbar. Ohne Höhenangabe gelten 8 m, für kleine Nebengebäude 3 m. Für PNG-Export: flache Ansicht nach Norden.</p>
                 </details>
               </div>
               <p class="settings-hint settings-save-hint">Gilt für diesen Server. Anzeigeänderungen laden die Karte neu; Position und Zoom bleiben erhalten.</p>
@@ -1149,8 +1189,10 @@
     <script src="/static/osm-hover.js?v={{.Version}}"></script>
     <script src="/static/map-post.js?v={{.Version}}"></script>
     <script src="/static/planning.js?v={{.Version}}"></script>
+    <script src="/static/geo-workbench.js?v={{.Version}}"></script>
     <script src="/static/ai-ui.js?v={{.Version}}&protocol=2"></script>
     <script src="/static/offline-style.js?v={{.Version}}"></script>
+    <script src="/static/offline-buildings.js?v={{.Version}}"></script>
     <script src="/static/map-renderer.js?v={{.Version}}"></script>
     <script>
       (function(){

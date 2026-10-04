@@ -37,6 +37,7 @@ const OfflineMapStyle = (() => {
     const paint = structuredClone(layer.paint || {});
     const colors = { background: ['background-color', style.background], water: ['fill-color', style.water], forest: ['fill-color', style.forest], buildings: ['fill-color', style.buildings] };
     if (colors[layer.id]) paint[colors[layer.id][0]] = colors[layer.id][1];
+    if (layer.id === 'offline-buildings-extrusion') paint['fill-extrusion-color'] = style.buildings;
     if (layer.id === 'farmland') paint['fill-color'] = ['match', ['get', 'class'], 'meadow', style.meadow, style.farmland];
     if (layer.id === 'roads') paint['line-color'] = ['match', ['get', 'class'], ['motorway', 'trunk'], style.motorway, ['primary', 'secondary'], style.primary, style.residential];
     if (layer.id.startsWith('offline-waterways-')) paint['line-color'] = style.water;
@@ -51,7 +52,7 @@ const OfflineMapStyle = (() => {
     for (const layer of layers) {
       if (!map.getLayer(layer.id)) continue;
       for (const [property, value] of Object.entries(paintFor(layer, draft))) map.setPaintProperty(layer.id, property, value);
-      if (layer.id === 'buildings') map.setLayoutProperty(layer.id, 'visibility', draft.showBuildings ? 'visible' : 'none');
+      if (layer.id === 'buildings' || layer.id === 'offline-buildings-extrusion') map.setLayoutProperty(layer.id, 'visibility', draft.showBuildings ? 'visible' : 'none');
       if (layer.id === 'paths') map.setLayoutProperty(layer.id, 'visibility', draft.showPaths ? 'visible' : 'none');
     }
     const element = map.getContainer();
@@ -64,7 +65,7 @@ const OfflineMapStyle = (() => {
   function activate(target, enabled) {
     map = target;
     active = enabled;
-    layers = enabled ? structuredClone(map.getStyle().layers.filter(layer => layer.source === 'tinytiles' || layer.source === 'offline-waterways' || layer.id === 'background')) : [];
+    layers = enabled ? structuredClone(map.getStyle().layers.filter(layer => layer.source === 'tinytiles' || layer.source === 'offline-waterways' || layer.source === 'offline-buildings' || layer.id === 'background')) : [];
     apply();
   }
   function bind(refreshLabels) {

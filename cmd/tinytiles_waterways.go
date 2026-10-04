@@ -18,7 +18,7 @@ import (
 // waterway geometry is an osmmini companion layer, not part of tinyTiles'
 // immutable artifact format. Bumping it lets us reject an incompatible local
 // sidecar without making an otherwise valid offline basemap unavailable.
-const tinyTilesWaterwaySidecarVersion = 2
+const tinyTilesWaterwaySidecarVersion = 3
 
 const (
 	// A quarter-degree cell keeps the index compact for country-sized extracts
@@ -57,12 +57,16 @@ type tinyTilesWaterwaySidecar struct {
 	Version                int                 `json:"version"`
 	ArtifactManifestSHA256 string              `json:"artifact_manifest_sha256,omitempty"`
 	Features               []tinyTilesWaterway `json:"features"`
+	Buildings              []tinyTilesBuilding `json:"buildings"`
+	Source                 string              `json:"source,omitempty"`
 }
 
 type tinyTilesWaterwayIndex struct {
 	features      []tinyTilesWaterway
 	cells         map[int64][]int
 	largeFeatures []int
+	buildings     *tinyTilesBuildingIndex
+	cellSize      float64
 }
 
 type tinyTilesWaterwayCandidate struct {
@@ -121,23 +125,47 @@ func tinyTilesWaterwayClass(value string) (class string, minZoom int, ok bool) {
 }
 
 // buildTinyTilesWaterwaySidecar extracts the linear water features that the
-// upstream tinyTiles minimal generator intentionally omits. It is a bounded,
-// two-pass PBF scan: first retain only selected waterway ways and their node
+// upstream tinyTiles minimal generator intentionally omits, together with building
+// footprints and heights. Both companion layers share a
+// two-pass PBF scan: first retain selected waterway/building ways and their node
 // IDs, then load coordinates only for those IDs. The finished sidecar is
 // written atomically and is activated alongside the .ttiles artifact.
 func buildTinyTilesWaterwaySidecar(pbfPath, outputPath string) (int, error) {
+	source, err := tinyTilesCompanionSource(pbfPath)
+	if err != nil {
+		return 0, err
+	}
+	// A zoom/postcode rebuild can reuse validated geometry for the same PBF.
+	cached, cacheErr := readTinyTilesWaterwaySidecar(tinyTilesWaterwaySidecarPath(filepath.Dir(outputPath)))
+	if cacheErr == nil && cached.Version == tinyTilesWaterwaySidecarVersion && cached.Source == source && cached.Buildings != nil {
+		if _, err := tinyTilesWaterwayIndexFromSidecar(cached); err == nil {
+			cached.ArtifactManifestSHA256 = ""
+			if err := writeTinyTilesWaterwaySidecar(outputPath, cached); err != nil {
+				return 0, err
+			}
+			return len(cached.Features), nil
+		}
+	}
+	var buildingCandidates []osmmini.Way
 	candidates := make([]tinyTilesWaterwayCandidate, 0, 256)
 	neededNodes := make(map[int64]struct{})
 	if err := osmmini.ExtractFile(pbfPath, osmmini.Options{
 		EmitWayNodeIDs: true,
 		TaggedWayKey: func(key string) bool {
-			return key == "waterway"
+			return key == "waterway" || key == "building" || key == "building:part"
 		},
 		KeepTag: func(key string) bool {
-			return key == "waterway" || key == "name"
+			return key == "waterway" || key == "name" || tinyTilesBuildingTag(key)
 		},
 	}, osmmini.Callbacks{
 		TaggedWay: func(way osmmini.Way) error {
+			if tinyTilesIsBuilding(way.Tags) && len(way.NodeIDs) >= 4 && way.NodeIDs[0] == way.NodeIDs[len(way.NodeIDs)-1] {
+				way.NodeIDs = append([]int64(nil), way.NodeIDs...)
+				buildingCandidates = append(buildingCandidates, way)
+				for _, id := range way.NodeIDs {
+					neededNodes[id] = struct{}{}
+				}
+			}
 			class, minZoom, ok := tinyTilesWaterwayClass(way.Tags["waterway"])
 			if !ok || len(way.NodeIDs) < 2 {
 				return nil
@@ -167,6 +195,32 @@ func buildTinyTilesWaterwaySidecar(pbfPath, outputPath string) (int, error) {
 		}); err != nil {
 			return 0, fmt.Errorf("extract waterway coordinates: %w", err)
 		}
+	}
+
+	buildings := make([]tinyTilesBuilding, 0, len(buildingCandidates))
+	for _, candidate := range buildingCandidates {
+		coordinates := make([][2]float64, 0, len(candidate.NodeIDs))
+		for _, id := range candidate.NodeIDs {
+			p, ok := nodes[id]
+			if !ok {
+				coordinates = nil
+				break
+			}
+			point := [2]float64{p.Lon, p.Lat}
+			if len(coordinates) == 0 || coordinates[len(coordinates)-1] != point {
+				coordinates = append(coordinates, point)
+			}
+		}
+		properties := tinyTilesBuildingProperties(candidate.Tags)
+		building := tinyTilesBuilding{ID: candidate.ID, Properties: properties, Coordinates: [][][2]float64{coordinates}}
+		if building.normalize() {
+			buildings = append(buildings, building)
+		}
+	}
+	sort.Slice(buildings, func(i, j int) bool { return buildings[i].ID < buildings[j].ID })
+	currentSource, err := tinyTilesCompanionSource(pbfPath)
+	if err != nil || currentSource != source {
+		return 0, fmt.Errorf("PBF changed while extracting companion layers")
 	}
 
 	// Stable ordering makes the sidecar deterministic for an unchanged PBF.
@@ -207,8 +261,10 @@ func buildTinyTilesWaterwaySidecar(pbfPath, outputPath string) (int, error) {
 	sortTinyTilesWaterways(features)
 
 	if err := writeTinyTilesWaterwaySidecar(outputPath, tinyTilesWaterwaySidecar{
-		Version:  tinyTilesWaterwaySidecarVersion,
-		Features: features,
+		Version:   tinyTilesWaterwaySidecarVersion,
+		Features:  features,
+		Buildings: buildings,
+		Source:    source,
 	}); err != nil {
 		return 0, err
 	}
@@ -285,7 +341,7 @@ func readTinyTilesWaterwaySidecar(path string) (tinyTilesWaterwaySidecar, error)
 	if err := json.Unmarshal(data, &sidecar); err != nil {
 		return tinyTilesWaterwaySidecar{}, fmt.Errorf("decode waterway sidecar: %w", err)
 	}
-	if sidecar.Version != tinyTilesWaterwaySidecarVersion {
+	if sidecar.Version != tinyTilesWaterwaySidecarVersion && sidecar.Version != 2 {
 		return tinyTilesWaterwaySidecar{}, fmt.Errorf("unsupported waterway sidecar version %d", sidecar.Version)
 	}
 	return sidecar, nil
@@ -300,7 +356,15 @@ func tinyTilesWaterwayIndexFromSidecar(sidecar tinyTilesWaterwaySidecar) (*tinyT
 		}
 		features = append(features, feature)
 	}
-	return newTinyTilesWaterwayIndex(features), nil
+	index := newTinyTilesWaterwayIndex(features)
+	if sidecar.Version == tinyTilesWaterwaySidecarVersion && sidecar.Buildings != nil {
+		var err error
+		index.buildings, err = newTinyTilesBuildingIndex(sidecar.Buildings)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return index, nil
 }
 
 func loadTinyTilesWaterwaySidecar(path string) (*tinyTilesWaterwayIndex, error) {
@@ -371,6 +435,10 @@ func tinyTilesArtifactManifestSHA256(artifact string) (string, error) {
 }
 
 func newTinyTilesWaterwayIndex(features []tinyTilesWaterway) *tinyTilesWaterwayIndex {
+	return newTinyTilesFeatureGrid(features, tinyTilesWaterwayCellSize)
+}
+
+func newTinyTilesFeatureGrid(features []tinyTilesWaterway, cellSize float64) *tinyTilesWaterwayIndex {
 	// Sidecars from the local disk are immutable once loaded, but keep an
 	// independent, priority-ordered copy so query limits behave correctly even
 	// if an older sidecar was written before prioritisation existed.
@@ -379,10 +447,11 @@ func newTinyTilesWaterwayIndex(features []tinyTilesWaterway) *tinyTilesWaterwayI
 	index := &tinyTilesWaterwayIndex{
 		features: ordered,
 		cells:    make(map[int64][]int),
+		cellSize: cellSize,
 	}
 	for featureIndex, feature := range ordered {
-		minX, minY := tinyTilesWaterwayCell(feature.bounds.minLon, feature.bounds.minLat)
-		maxX, maxY := tinyTilesWaterwayCell(feature.bounds.maxLon, feature.bounds.maxLat)
+		minX, minY := tinyTilesFeatureCell(feature.bounds.minLon, feature.bounds.minLat, cellSize)
+		maxX, maxY := tinyTilesFeatureCell(feature.bounds.maxLon, feature.bounds.maxLat, cellSize)
 		cellCount := (maxX - minX + 1) * (maxY - minY + 1)
 		if cellCount < 1 || cellCount > tinyTilesWaterwayMaxGridCells {
 			index.largeFeatures = append(index.largeFeatures, featureIndex)
@@ -415,8 +484,8 @@ func (index *tinyTilesWaterwayIndex) featuresIn(window osmmini.CoordWindow) []in
 	if index == nil {
 		return nil
 	}
-	minX, minY := tinyTilesWaterwayCell(window.MinLon, window.MinLat)
-	maxX, maxY := tinyTilesWaterwayCell(window.MaxLon, window.MaxLat)
+	minX, minY := tinyTilesFeatureCell(window.MinLon, window.MinLat, index.cellSize)
+	maxX, maxY := tinyTilesFeatureCell(window.MaxLon, window.MaxLat, index.cellSize)
 	seen := make(map[int]struct{})
 	for x := minX; x <= maxX; x++ {
 		for y := minY; y <= maxY; y++ {
@@ -437,7 +506,11 @@ func (index *tinyTilesWaterwayIndex) featuresIn(window osmmini.CoordWindow) []in
 }
 
 func tinyTilesWaterwayCell(lon, lat float64) (int, int) {
-	return int(math.Floor((lon + 180) / tinyTilesWaterwayCellSize)), int(math.Floor((lat + 90) / tinyTilesWaterwayCellSize))
+	return tinyTilesFeatureCell(lon, lat, tinyTilesWaterwayCellSize)
+}
+
+func tinyTilesFeatureCell(lon, lat, size float64) (int, int) {
+	return int(math.Floor((lon + 180) / size)), int(math.Floor((lat + 90) / size))
 }
 
 func tinyTilesWaterwayCellKey(x, y int) int64 {

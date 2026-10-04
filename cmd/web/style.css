@@ -2801,6 +2801,17 @@ button.section-header .section-header-title { text-align: left; }
   .panel-collapsed #mapsPanelToggle .ui-icon { transform: rotate(-90deg); }
 }
 #mapsPanelTitle { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.geo-workbench > details { margin: 12px 0; padding: 10px; border: 1px solid var(--border); border-radius: 8px; }
+.geo-workbench > details > summary { cursor: pointer; font-weight: 600; }
+.geo-workbench .setting-input { width: 100%; min-width: 0; }
+.geo-workbench .gis-actions { align-items: center; }
+.wb-table-wrap { max-width: 100%; overflow: auto; max-height: 320px; margin: 12px 0; border: 1px solid var(--border); border-radius: 8px; }
+.wb-table { border-collapse: collapse; font-size: 12px; width: 100%; min-width: 620px; }
+.wb-table caption { text-align: left; padding: 8px; font-weight: 600; }
+.wb-table th, .wb-table td { padding: 6px 8px; border-bottom: 1px solid var(--border); text-align: left; min-width: 72px; max-width: 200px; overflow-wrap: anywhere; }
+.wb-table th { position: sticky; top: 0; background: var(--card-bg); white-space: nowrap; }
+.wb-table .btn { min-width: 36px; padding: 4px 8px; }
+.wb-table-wrap:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 #mapsView #tinyTilesSettings > .settings-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 @media (max-width: 768px) {
   .maps-shell[data-view="maps"] :is(.maps-layers, .maps-location) { top: 12px; }

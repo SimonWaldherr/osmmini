@@ -35,7 +35,7 @@ import (
 	osmmini "simonwaldherr.de/go/osmmini"
 )
 
-//go:embed web/index.html web/style.css web/app.js web/ai-ui.js web/offline-style.js web/planning.js web/map-post.js web/osm-editor.js web/osm-presets.js web/osm-hover.js web/map-context.js web/map-renderer.js web/static api/openapi.yaml
+//go:embed web/index.html web/style.css web/app.js web/ai-ui.js web/offline-style.js web/offline-buildings.js web/planning.js web/map-post.js web/osm-editor.js web/osm-presets.js web/osm-hover.js web/map-context.js web/map-renderer.js web/static api/openapi.yaml
 var embedded embed.FS
 
 const buildVersion = "dev"
@@ -1684,12 +1684,14 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/api/v1/tile-sources", s.handleTileSources)
 	mux.HandleFunc("/api/v1/tinytiles/build", s.handleTinyTilesBuild)
 	mux.HandleFunc("/api/v1/tinytiles/waterways", s.handleTinyTilesWaterways)
+	mux.HandleFunc("/api/v1/tinytiles/buildings", s.handleTinyTilesBuildings)
 	mux.HandleFunc("/api/v1/offline-labels", s.handleOfflineLabels)
 	mux.HandleFunc("/api/v1/hydrants", s.handleHydrants)
 	mux.HandleFunc("/api/v1/fire-stations", s.handleFireStations)
 	mux.HandleFunc("/api/v1/fire-stations/import", s.handleFireStationsImport)
 	mux.HandleFunc("/api/v1/fire-stations/", s.handleFireStationByID)
 	mux.HandleFunc("/api/v1/operations", s.handleOperations)
+	mux.HandleFunc("/api/v1/dispatch/plan", s.handleWorkPlan)
 	mux.HandleFunc("/api/v1/deployment", s.handleDeployment)
 	mux.HandleFunc("/api/v1/profiles", s.handleProfiles)
 	mux.HandleFunc("/api/v1/use-cases", s.handleUseCases)
@@ -2353,7 +2355,7 @@ func readJSON(w http.ResponseWriter, r *http.Request, dst any, maxBytes int64) e
 // A stable "dev" version otherwise lets browsers reuse CSS/JS from older UIs.
 func webAssetVersion() string {
 	h := sha256.New()
-	for _, name := range []string{"style.css", "app.js", "ai-ui.js", "offline-style.js", "planning.js", "map-post.js", "osm-editor.js", "osm-presets.js", "osm-hover.js", "map-context.js", "map-renderer.js", "static/micromap/micromap.mjs"} {
+	for _, name := range []string{"style.css", "app.js", "ai-ui.js", "offline-style.js", "offline-buildings.js", "planning.js", "geo-workbench.js", "map-post.js", "osm-editor.js", "osm-presets.js", "osm-hover.js", "map-context.js", "map-renderer.js", "static/micromap/micromap.mjs"} {
 		data, err := os.ReadFile(filepath.Join("cmd", "web", name))
 		if err != nil {
 			data, _ = embedded.ReadFile("web/" + name)

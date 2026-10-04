@@ -51,6 +51,7 @@ type tinyTilesBuildStatus struct {
 	GeneratedTiles     int       `json:"generated_tiles,omitempty"`
 	RoadFeatures       int       `json:"road_features,omitempty"`
 	WaterwayFeatures   int       `json:"waterway_features,omitempty"`
+	BuildingFeatures   int       `json:"building_features,omitempty"`
 }
 
 type tinyTilesBuildRequest struct {
@@ -181,7 +182,7 @@ func (s *server) buildTinyTiles(status tinyTilesBuildStatus) {
 	}
 	defer os.Remove(stagedWaterwaysPath)
 
-	s.updateTinyTilesBuildProgress("waterways", 4, "Flüsse, Bäche und Kanäle werden vorbereitet…")
+	s.updateTinyTilesBuildProgress("waterways", 4, "Gewässer und 2,5D-Gebäude werden vorbereitet…")
 	waterwayFeatures, err := buildTinyTilesWaterwaySidecar(s.pbfPath, stagedWaterwaysPath)
 	if err != nil {
 		s.finishTinyTilesBuild("", "", 0, 0, 0, 0, err)
@@ -263,6 +264,9 @@ func (s *server) finishTinyTilesBuild(artifact, territoryLayer string, territory
 	}
 	if waterwayFeatures >= 0 {
 		s.tinyTilesBuild.WaterwayFeatures = waterwayFeatures
+		if s.tinyTilesWaterways != nil && s.tinyTilesWaterways.buildings != nil {
+			s.tinyTilesBuild.BuildingFeatures = len(s.tinyTilesWaterways.buildings.features)
+		}
 	}
 	if territoryLayer != "" {
 		s.tinyTilesBuild.Message = fmt.Sprintf("%d %s-Gebiete sind bereit.", territoryCount, territoryLayer)
@@ -376,11 +380,12 @@ func (s *server) loadTinyTilesIfPresent() {
 	}
 	minZoom, maxZoom := s.tinyTilesZoomRange()
 	waterwayFeatures := s.tinyTilesWaterwayCount()
-	waterwaySidecarLoaded := s.tinyTilesHasWaterwaySidecar()
+	waterwaySidecarLoaded := s.tinyTilesHasWaterwaySidecar() && s.tinyTilesHasBuildingSidecar()
 	message := "Vorhandene Offline-Karte ist bereit."
 	if !waterwaySidecarLoaded {
-		message = "Vorhandene Offline-Karte ist bereit. Gewässerlayer wird aus der PBF ergänzt…"
+		message = "Vorhandene Offline-Karte ist bereit. Gewässer und 2,5D-Gebäude werden aus der PBF ergänzt…"
 	}
+	buildingFeatures := s.tinyTilesBuildingCount()
 	s.tinyTilesMu.Lock()
 	s.tinyTilesBuild = tinyTilesBuildStatus{
 		State:       "ready",
@@ -400,6 +405,7 @@ func (s *server) loadTinyTilesIfPresent() {
 			return info.Size()
 		}(),
 		WaterwayFeatures: waterwayFeatures,
+		BuildingFeatures: buildingFeatures,
 	}
 	s.tinyTilesMu.Unlock()
 	if !waterwaySidecarLoaded {
@@ -518,7 +524,7 @@ func (s *server) backfillTinyTilesWaterways(artifact string) {
 	defer s.tinyTilesWaterwayBuildMu.Unlock()
 
 	sidecar := tinyTilesWaterwaySidecarPath(s.tinyTilesDir)
-	if _, err := loadTinyTilesWaterwaySidecarForArtifact(sidecar, artifact); err == nil {
+	if index, err := loadTinyTilesWaterwaySidecarForArtifact(sidecar, artifact); err == nil && index.buildings != nil {
 		return
 	}
 	pbfInfo, err := os.Stat(s.pbfPath)
@@ -587,7 +593,8 @@ func (s *server) backfillTinyTilesWaterways(artifact string) {
 		s.tinyTilesWaterways = index
 		if s.tinyTilesBuild.State == "ready" {
 			s.tinyTilesBuild.WaterwayFeatures = count
-			s.tinyTilesBuild.Message = "Vorhandene Offline-Karte ist bereit; Gewässerlayer wurde ergänzt."
+			s.tinyTilesBuild.BuildingFeatures = len(index.buildings.features)
+			s.tinyTilesBuild.Message = "Vorhandene Offline-Karte ist bereit; Gewässer und 2,5D-Gebäude wurden ergänzt."
 		}
 	}
 	s.tinyTilesMu.Unlock()
@@ -598,7 +605,7 @@ func (s *server) noteTinyTilesWaterwayBackfillFailure(err error) {
 	s.tinyTilesMu.Lock()
 	defer s.tinyTilesMu.Unlock()
 	if s.tinyTilesBuild.State == "ready" {
-		s.tinyTilesBuild.Message = "Offline-Karte ist bereit; Gewässerlayer konnte nicht ergänzt werden. Bitte Offline-Karte neu erzeugen."
+		s.tinyTilesBuild.Message = "Offline-Karte ist bereit; Gewässer und 2,5D-Gebäude konnten nicht ergänzt werden. Bitte Offline-Karte neu erzeugen."
 	}
 }
 

@@ -173,9 +173,9 @@ type Shipment struct {
 // AssignmentConstraint is the extension point for vehicle/shipment
 // assignment rules: capacity, package weight/volume, time windows, working
 // hours, territory membership, and so on. It deliberately does not
-// prescribe how constraints combine into a route or a full VRP solve --
-// today's assignment stage (AssignPoints/AssignPointsWithOptions) is
-// territory lookup only.
+// prescribe a full VRP solve. AssignPoints performs territory lookup only;
+// PlanWork combines constraints with skills and cumulative capacity to allocate
+// work across resources before routing their manifests separately.
 type AssignmentConstraint interface {
 	Accept(vehicle Vehicle, shipment Shipment) bool
 	Cost(vehicle Vehicle, shipment Shipment) float64

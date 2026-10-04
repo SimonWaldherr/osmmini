@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/csv"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -15,11 +17,10 @@ import (
 	osmmini "simonwaldherr.de/go/osmmini"
 )
 
-// runDispatchCLI implements `osmmini dispatch assign` and
-// `osmmini dispatch manifests`.
+// runDispatchCLI implements territory assignment, manifests and work planning.
 func runDispatchCLI(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: osmmini dispatch assign|manifests ...")
+		fmt.Fprintln(os.Stderr, "usage: osmmini dispatch assign|manifests|plan ...")
 		os.Exit(2)
 	}
 	switch args[0] {
@@ -27,9 +28,61 @@ func runDispatchCLI(args []string) {
 		runDispatchAssign(args[1:])
 	case "manifests":
 		runDispatchManifests(args[1:])
+	case "plan":
+		runDispatchPlan(args[1:])
 	default:
-		fmt.Fprintf(os.Stderr, "osmmini dispatch: unknown subcommand %q (want assign or manifests)\n", args[0])
+		fmt.Fprintf(os.Stderr, "osmmini dispatch: unknown subcommand %q (want assign, manifests or plan)\n", args[0])
 		os.Exit(2)
+	}
+}
+
+// runDispatchPlan requires no PBF or server. The same JSON payload can be sent
+// to the HTTP planner; territory constraints are supplied by CLI flags here.
+func runDispatchPlan(args []string) {
+	fs := flag.NewFlagSet("dispatch plan", flag.ExitOnError)
+	input := fs.String("input", "", "JSON resources and jobs file")
+	territories := fs.String("territories", "", "optional territory GeoJSON file")
+	layer := fs.String("layer", "delivery", "territory layer name")
+	key := fs.String("vehicle-key", "territory_id", "resource property containing territory ID")
+	fs.Parse(args)
+	if *input == "" {
+		log.Fatal("usage: osmmini dispatch plan --input work.json [--territories FILE.geojson] [--layer NAME] [--vehicle-key KEY]")
+	}
+	f, err := os.Open(*input)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || info.Size() > 4<<20 {
+		log.Fatal("dispatch plan: input must be at most 4 MiB")
+	}
+	var req osmmini.WorkPlanRequest
+	dec := json.NewDecoder(io.LimitReader(f, (4<<20)+1))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		log.Fatalf("dispatch plan: %v", err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		log.Fatal("dispatch plan: unexpected extra JSON or oversized input")
+	}
+	var constraints []osmmini.AssignmentConstraint
+	if *territories != "" {
+		store := osmmini.NewTerritoryStore()
+		if err := store.LoadLayer(*layer, *territories); err != nil {
+			log.Fatal(err)
+		}
+		constraints = append(constraints, osmmini.TerritoryConstraint{Store: store, Layer: *layer, VehicleKey: *key})
+	}
+	plan, err := osmmini.PlanWork(context.Background(), req, constraints...)
+	if err != nil {
+		log.Fatalf("dispatch plan: %v", err)
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(plan); err != nil {
+		log.Fatal(err)
 	}
 }
 

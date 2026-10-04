@@ -101,6 +101,21 @@ first enter it under **Einstellungen → Administrationsschutz**.
 - **Waterways:** a separate local sidecar adds rivers and canals from zoom 7,
   streams from zoom 11 and drainage details from zoom 13. Existing artifacts are
   upgraded in the background at startup if the PBF has not changed.
+- **2.5D buildings:** from zoom 14, a local companion layer provides building
+  footprints, heights and elevated bases to microMap and MapLibre. Choose
+  **Kartenanzeige → Perspektive** (45°) to see the walls; Canvas also works
+  without WebGL. Explicit `height`/`building:height` wins, followed by
+  `building:levels` × 3 m plus tagged roof height/levels. Missing heights use
+  8 m for ordinary buildings, 3 m for garages/sheds/carports/greenhouses, and
+  6 m for barns/warehouses/industrial buildings. These are visual estimates,
+  identified by `height_source`, not measured heights. Closed building and
+  building-part ways are supported; building multipolygon relations are not.
+- **Build efficiency:** buildings and waterways share two PBF scans and retain
+  only referenced node coordinates. Rebuilds reuse validated companion geometry
+  when the source path, size and modification time are unchanged. Viewport
+  queries use a spatial grid and bounded responses (3000 buildings/100000
+  vertices); existing maps gain the companion layer in the background at
+  startup when the source PBF is still available and has not changed.
 - **Postcodes:** if the build includes postcode boundaries, you can query them
   with `GET /tinytiles/postcode/search?q=940`, `/tinytiles/postcode/94032` and
   `/tinytiles/postcode/at?lon=13.46&lat=48.57`.
@@ -122,7 +137,8 @@ microMap has the presets **Standard**, **Sparsam** and **Perspektive**, plus
 individual settings for rendering resolution (1×, up to 1.5× or 2×), initial
 pitch (0°, 45° or 60°), WebGL/Canvas 2D buildings, sky visibility and rotation/
 pitch gestures. Its options are retained when switching to MapLibre.
-3D buildings depend on the selected map style supplying them.
+The offline map supplies its own 2.5D building layer; other map sources depend
+on the selected style supplying extrusions.
 
 `?renderer=maplibre` or `?renderer=micromap` temporarily overrides the saved
 selection; saving the form removes the override. MapLibre's local assets

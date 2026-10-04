@@ -43,3 +43,14 @@ test('saved style applies only to offline base layers and remains unchanged on r
  editor.activate(map,true);assert.equal(JSON.stringify(writes),first);
  writes.length=0;editor.activate(map,false);assert.equal(writes.length,0);
 });
+
+ test('offline building extrusions follow the saved building colour and visibility',()=>{
+ const editor=harness(JSON.stringify({buildings:'#123456',showBuildings:false}));
+ const writes=[];
+ const extrusion={id:'offline-buildings-extrusion',type:'fill-extrusion',source:'offline-buildings',paint:{'fill-extrusion-color':'#d8cec3','fill-extrusion-height':['get','render_height']}};
+ const map={getStyle:()=>({layers:[extrusion]}),getLayer:()=>true,setPaintProperty:(...v)=>writes.push(v),setLayoutProperty:(...v)=>writes.push(v),getContainer:()=>({style:{setProperty(){}}})};
+ editor.activate(map,true);
+ assert.ok(writes.some(v=>v[1]==='fill-extrusion-color'&&v[2]==='#123456'));
+ assert.ok(writes.some(v=>v[1]==='visibility'&&v[2]==='none'));
+ assert.equal(writes.some(v=>v[1]==='fill-color'),false);
+ });

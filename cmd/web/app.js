@@ -484,6 +484,7 @@ async function refreshOfflineWaterways() {
 }
 
 function setOfflineWaterwaysVisible(enabled) {
+  window.OfflineBuildings?.activate(map, enabled);
   if (offlineWaterwaysEnabled === enabled) {
     if (enabled) {
       ensureOfflineWaterwaysLayer();
@@ -3923,6 +3924,7 @@ function updateTinyTilesFacts(status, state, facts) {
   if (estimatedDisk) entries.push(['Geschätzter Speicher', estimatedDisk]);
   if (generatedTiles > 0) entries.push(['Erzeugte Kacheln', number.format(generatedTiles)]);
   if (roads > 0) entries.push(['Straßenobjekte', number.format(roads)]);
+  if (Number(status.building_features) > 0) entries.push(['Gebäudeobjekte', number.format(status.building_features)]);
   if (waterways > 0) entries.push(['Gewässerobjekte', number.format(waterways)]);
   if (duration) entries.push([state === 'building' ? 'Läuft seit' : 'Build-Dauer', duration]);
   facts.replaceChildren(...entries.map(([label, value]) => {
@@ -6533,6 +6535,9 @@ window.planningTools = PlanningTools.create(map, {
 registerMapLayerRehydrate(() => window.planningTools.render());
 
 window.mapPost = MapPost.create(map);
+
+window.geoWorkbench = GeoWorkbench.create(map, {download: downloadTextFile, fitPadding: mapsCameraPadding});
+registerMapLayerRehydrate(() => window.geoWorkbench.render());
 registerMapLayerRehydrate(() => window.mapPost.render());
 
 window.osmEditor = OSMEditor.create(map, {
