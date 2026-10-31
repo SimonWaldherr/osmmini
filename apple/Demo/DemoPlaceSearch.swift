@@ -290,10 +290,17 @@ struct DemoPlaceSearch: View {
           Label("Keine passenden Orte", systemImage: "magnifyingglass")
         } description: {
           Text(
-            "Für „\(trimmedQuery)“ gibt es keine Kartentreffer. Versuche einen kürzeren Namen oder eine andere Schreibweise."
+            "Für „\(trimmedQuery)“ gibt es in dieser Offline-Region keine Kartentreffer. Versuche eine andere Schreibweise oder öffne die Karte der gesuchten Region."
           )
         } actions: {
-          Button("Suchbegriff ändern") { focused = true }.buttonStyle(.bordered)
+          VStack(spacing: 8) {
+            Button("Suchbegriff ändern", systemImage: "pencil") { focused = true }
+              .frame(minHeight: 44).buttonStyle(.borderedProminent)
+            Button("Andere Offline-Karte öffnen", systemImage: "map") {
+              dismiss()
+              showRegions()
+            }.frame(minHeight: 44).buttonStyle(.bordered)
+          }
         }
       }
     }
@@ -313,6 +320,7 @@ struct DemoPlaceSearch: View {
                 .font(.caption).foregroundStyle(.secondary)
             }.frame(maxWidth: .infinity, alignment: .leading)
             Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+              .accessibilityHidden(true)
           }.padding(.vertical, 4).frame(minHeight: 44).contentShape(Rectangle())
         }
         .buttonStyle(.plain)

@@ -14,7 +14,12 @@ func BenchmarkTSPManyStops(b *testing.B) {
 		name  string
 		n     int
 		chain bool
-	}{{"exact16", 16, false}, {"greedy60", 60, false}, {"dependencies60", 60, true}} {
+	}{
+		{"exact16", 16, false},
+		{"dependencies16", 16, true},
+		{"greedy60", 60, false},
+		{"dependencies60", 60, true},
+	} {
 		b.Run(scenario.name, func(b *testing.B) {
 			s, stops, opt := tspFixture(scenario.n, 42)
 			pre := make([]uint64, scenario.n)

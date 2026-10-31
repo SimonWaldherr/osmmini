@@ -244,7 +244,35 @@ function usesDirectRaster(mapType, tiles) {
   }
 }
 
+let mapAvailabilityTiles = preloadedSettings?.tiles || {};
+
+function updateMapAvailabilityUI(status = window.tinyTilesLatestStatus) {
+  const notice = document.getElementById('mapAvailability');
+  if (!notice) return;
+  const state = status?.state;
+  const modeTitle = document.getElementById('mapModeTitle');
+  if (modeTitle && isTinyTilesSettings(mapAvailabilityTiles)) {
+    modeTitle.textContent = state === 'ready' ? 'Offline-Karte aktiv' : 'Offline-Karte ausgewählt';
+  }
+  notice.hidden = !isTinyTilesSettings(mapAvailabilityTiles) || !state || state === 'ready';
+  if (notice.hidden) return;
+
+  const building = state === 'building';
+  const failed = state === 'failed';
+  document.getElementById('mapAvailabilityTitle').textContent = building
+    ? 'Deine Karte wird vorbereitet'
+    : failed ? 'Die Karte konnte nicht vorbereitet werden' : 'Deine Offline-Karte fehlt noch';
+  document.getElementById('mapAvailabilityMessage').textContent = building
+    ? 'Du kannst die Suche und Routenplanung bereits nutzen. Den Fortschritt findest du unter Karten.'
+    : failed ? 'Öffne die Kartenvorbereitung für Details und einen neuen Versuch oder wähle eine Online-Karte.'
+      : 'Bereite die Karte deiner Region einmalig vor. Danach kannst du sie ohne Internet nutzen.';
+  document.getElementById('mapAvailabilityOffline').textContent = building
+    ? 'Fortschritt ansehen' : failed ? 'Vorbereitung öffnen' : 'Karte vorbereiten';
+}
+
 function updateMapModeUI(tiles = {}) {
+  mapAvailabilityTiles = tiles;
+  updateMapAvailabilityUI();
   const context = document.querySelector('.workspace-context');
   const icon = document.getElementById('mapModeIcon');
   const title = document.getElementById('mapModeTitle');
@@ -259,8 +287,8 @@ function updateMapModeUI(tiles = {}) {
 
   if (isTinyTiles) {
     icon.textContent = '📦';
-    title.textContent = 'Offline-Karte aktiv';
-    meta.textContent = 'tinyTiles + Routing: lokale PBF.';
+    title.textContent = window.tinyTilesLatestStatus?.state === 'ready' ? 'Offline-Karte aktiv' : 'Offline-Karte ausgewählt';
+    meta.textContent = 'Karte, Suche und Routen aus deiner Region.';
   } else if (isBavaria) {
     icon.textContent = '⌖';
     title.textContent = 'Bayern-Karte aktiv';
@@ -3877,6 +3905,8 @@ function openMapSourcePicker() {
 
 document.getElementById('mapWelcomeLater')?.addEventListener('click', () => hideMapWelcome({ defer: true }));
 document.getElementById('openMapSources')?.addEventListener('click', () => showMapSourcePicker());
+document.getElementById('mapAvailabilityOffline')?.addEventListener('click', openTinyTilesBuilder);
+document.getElementById('mapAvailabilityOnline')?.addEventListener('click', openMapSourcePicker);
 document.getElementById('mapWelcomeOffline')?.addEventListener('click', () => { void selectTinyTilesSource({ fromWelcome: true }); });
 document.getElementById('mapWelcomeOnline')?.addEventListener('click', () => {
   const main = document.getElementById('mapWelcomeMain');
@@ -4289,6 +4319,7 @@ function handleTinyTilesStatus(status) {
   const safeStatus = status || { state: 'idle', phase: 'idle', progress: 0 };
   tinyTilesLatestStatus = safeStatus;
   window.tinyTilesLatestStatus = tinyTilesLatestStatus;
+  updateMapAvailabilityUI(safeStatus);
   const state = updateTinyTilesUI(safeStatus);
   if (state === 'ready' && Number.isInteger(safeStatus.min_zoom) && Number.isInteger(safeStatus.max_zoom)) {
     const min = document.getElementById('tinyTilesMinZoom');

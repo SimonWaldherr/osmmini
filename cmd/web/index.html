@@ -1115,6 +1115,16 @@
 
       <div class="map-pane">
         <main id="map" aria-describedby="mapContextHint" class="map" aria-label="Interaktive Karte"></main>
+        <aside id="mapAvailability" class="map-availability" aria-label="Offline-Karte" hidden>
+          <div role="status" aria-live="polite" aria-atomic="true">
+            <strong id="mapAvailabilityTitle">Deine Offline-Karte fehlt noch</strong>
+            <p id="mapAvailabilityMessage">Bereite die Karte deiner Region einmalig vor. Danach kannst du sie ohne Internet nutzen.</p>
+          </div>
+          <div class="map-availability-actions">
+            <button id="mapAvailabilityOffline" type="button" class="btn btn-primary">Karte vorbereiten</button>
+            <button id="mapAvailabilityOnline" type="button" class="btn btn-ghost">Online-Karte wählen</button>
+          </div>
+        </aside>
         <div class="maps-categories" role="group" aria-label="Orte in der Nähe">
           <button type="button" data-place-category="cafe"><span aria-hidden="true">☕</span> Cafés</button>
           <button type="button" data-place-category="supermarket"><span aria-hidden="true">▤</span> Einkaufen</button>
@@ -1144,11 +1154,11 @@
         <div id="mapWelcomeMain">
           <span class="map-welcome-kicker">Kartenstart</span>
           <h2 id="mapWelcomeTitle">Wie möchtest du die Karte nutzen?</h2>
-          <p>Du kannst eine lokale Offline-Karte aus deiner PBF erzeugen oder eine Online-Karte verwenden. Die Auswahl lässt sich später jederzeit ändern.</p>
+          <p>Bereite deine Region einmalig für die Nutzung ohne Internet vor oder wähle eine Online-Karte. Du kannst später jederzeit wechseln.</p>
           <div class="map-welcome-options">
             <button id="mapWelcomeOffline" type="button" class="map-welcome-option map-welcome-option-offline">
               <span class="map-welcome-option-icon" aria-hidden="true">📦</span>
-              <span><strong>Lokale Offline-Karte</strong><small>tinyTiles aus der geladenen PBF erzeugen</small></span>
+              <span><strong>Offline-Karte</strong><small>Deine Region vorbereiten und ohne Internet nutzen</small></span>
               <span class="map-welcome-option-arrow" aria-hidden="true">›</span>
             </button>
             <button id="mapWelcomeOnline" type="button" class="map-welcome-option">

@@ -33,57 +33,70 @@ func tspFixture(n int, seed int64) (*server, []stopR, osmmini.RouteOptions) {
 }
 
 func TestTSPExactMatchesBruteForceDirectedCosts(t *testing.T) {
-	for seed := int64(0); seed < 10; seed++ {
-		s, stops, opt := tspFixture(5, seed)
-		if seed%2 != 0 {
-			opt.Objective = osmmini.ObjectiveDuration
-		}
-		pre := []uint64{0, 0, 1, 0, 2} // 0 before 2, 1 before 4
-		cost := make([][]float64, 7)
-		for i := range cost {
-			cost[i] = make([]float64, 7)
-			for j := range cost[i] {
-				c, err := s.router.RouteCostWithOptions(context.Background(), int64(i+1), int64(j+1), opt)
-				if err != nil {
-					t.Fatal(err)
-				}
-				cost[i][j] = c
+	for n := 1; n <= 7; n++ {
+		for seed := int64(0); seed < 10; seed++ {
+			s, stops, opt := tspFixture(n, seed)
+			if seed%2 != 0 {
+				opt.Objective = osmmini.ObjectiveDuration
 			}
-		}
-		evaluate := func(order []int) float64 {
-			total := 0.0
-			prev := 0
-			mask := uint64(0)
-			for _, idx := range order {
-				if mask&pre[idx] != pre[idx] {
-					return math.Inf(1)
-				}
-				mask |= 1 << uint(idx)
-				total += cost[prev][idx+1]
-				prev = idx + 1
-			}
-			return total + cost[prev][6]
-		}
-		best := math.Inf(1)
-		var visit func([]int, uint64)
-		visit = func(order []int, mask uint64) {
-			if len(order) == 5 {
-				best = math.Min(best, evaluate(order))
-				return
-			}
-			for i := 0; i < 5; i++ {
-				if mask&(1<<uint(i)) == 0 {
-					visit(append(order, i), mask|(1<<uint(i)))
+			pre := make([]uint64, n)
+			// Vary prerequisite direction and density, including unconstrained
+			// tours. Only earlier stops in this permutation can be prerequisites.
+			random := rand.New(rand.NewSource(seed))
+			permutation := random.Perm(n)
+			for i, stop := range permutation {
+				for _, earlier := range permutation[:i] {
+					if seed%3 != 0 && random.Intn(3) == 0 {
+						pre[stop] |= 1 << uint(earlier)
+					}
 				}
 			}
-		}
-		visit(nil, 0)
-		order, err := s.tspExact(context.Background(), 1, 7, stops, pre, opt)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(order) != 5 || evaluate(order) != best {
-			t.Fatalf("seed %d: order %v cost %v, optimum %v", seed, order, evaluate(order), best)
+			cost := make([][]float64, n+2)
+			for i := range cost {
+				cost[i] = make([]float64, n+2)
+				for j := range cost[i] {
+					c, err := s.router.RouteCostWithOptions(context.Background(), int64(i+1), int64(j+1), opt)
+					if err != nil {
+						t.Fatal(err)
+					}
+					cost[i][j] = c
+				}
+			}
+			evaluate := func(order []int) float64 {
+				total := 0.0
+				prev := 0
+				mask := uint64(0)
+				for _, idx := range order {
+					if idx < 0 || idx >= n || mask&(1<<uint(idx)) != 0 || mask&pre[idx] != pre[idx] {
+						return math.Inf(1)
+					}
+					mask |= 1 << uint(idx)
+					total += cost[prev][idx+1]
+					prev = idx + 1
+				}
+				return total + cost[prev][n+1]
+			}
+			best := math.Inf(1)
+			var visit func([]int, uint64)
+			visit = func(order []int, mask uint64) {
+				if len(order) == n {
+					best = math.Min(best, evaluate(order))
+					return
+				}
+				for i := 0; i < n; i++ {
+					if mask&(1<<uint(i)) == 0 {
+						visit(append(order, i), mask|(1<<uint(i)))
+					}
+				}
+			}
+			visit(nil, 0)
+			order, err := s.tspExact(context.Background(), 1, int64(n+2), stops, pre, opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(order) != n || evaluate(order) != best {
+				t.Fatalf("n=%d seed=%d: order %v cost %v, optimum %v", n, seed, order, evaluate(order), best)
+			}
 		}
 	}
 }

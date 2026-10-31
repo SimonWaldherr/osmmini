@@ -760,9 +760,9 @@ struct DemoMapScreen: View {
       if routeDetailsExpanded {
         HStack(spacing: 10) {
           VStack(spacing: 8) {
-            endpoint(.start, name: model.startLabel, title: "Start wählen", image: "a.circle.fill")
+            endpoint(.start, name: model.startLabel, title: "Start suchen", image: "a.circle.fill")
             endpoint(
-              .destination, name: model.destinationLabel, title: "Ziel wählen",
+              .destination, name: model.destinationLabel, title: "Ziel suchen",
               image: "b.circle.fill"
             )
           }
@@ -778,15 +778,11 @@ struct DemoMapScreen: View {
           .help("Start und Ziel tauschen")
           .disabled(model.busy || model.start == nil || model.destination == nil)
         }
-        Picker(
-          "Autoroute",
-          selection: Binding(
-            get: { model.routeObjective }, set: { model.setRouteObjective($0) }
-          )
-        ) {
-          Text("Kürzeste Strecke").tag(RouteObjective.distance)
-          Text("Schnellste Strecke").tag(RouteObjective.duration)
-        }.pickerStyle(.menu).disabled(model.busy)
+        if dynamicTypeSize.isAccessibilitySize {
+          routeObjectivePicker.pickerStyle(.menu)
+        } else {
+          routeObjectivePicker.pickerStyle(.segmented)
+        }
         if locationTarget == nil, model.start == nil, !model.busy {
           Button("Mein Standort als Start", systemImage: "location") {
             requestLocation(for: .start)
@@ -850,40 +846,60 @@ struct DemoMapScreen: View {
     RouteExporter(route: route).frame(minHeight: 44)
   }
 
+  private var routeObjectivePicker: some View {
+    Picker(
+      "Autoroute",
+      selection: Binding(
+        get: { model.routeObjective }, set: { model.setRouteObjective($0) }
+      )
+    ) {
+      Text("Kürzeste").accessibilityLabel("Kürzeste Strecke").tag(RouteObjective.distance)
+      Text("Schnellste").accessibilityLabel("Schnellste Strecke").tag(RouteObjective.duration)
+    }.disabled(model.busy)
+  }
+
   private func endpoint(_ point: DemoModel.RoutePoint, name: String?, title: String, image: String)
     -> some View
   {
-    Menu {
-      Button("Ort oder Adresse suchen", systemImage: "magnifyingglass") { openSearch(for: point) }
-      Button("Auf der Karte wählen", systemImage: "hand.tap") {
-        cancelLocationSelection()
-        model.chooseRoutePoint(point)
-        model.dismissPlace()
-        mapTarget = point
+    HStack(spacing: 0) {
+      Button { openSearch(for: point) } label: {
+        HStack(alignment: .center, spacing: 10) {
+          Image(systemName: image).foregroundStyle(point == .start ? Color.green : .red)
+            .accessibilityHidden(true)
+          VStack(alignment: .leading, spacing: 2) {
+            Text(point == .start ? "Start" : "Ziel").font(.caption).foregroundStyle(.secondary)
+            Text(name ?? title).font(.subheadline).foregroundStyle(.primary)
+              .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 3)
+              .fixedSize(horizontal: false, vertical: true)
+          }.frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.leading, 12).padding(.trailing, 4).padding(.vertical, 8)
+        .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
+        .contentShape(Rectangle())
       }
-      Button("Meinen Standort verwenden", systemImage: "location") { requestLocation(for: point) }
-    } label: {
-      HStack(alignment: .center, spacing: 10) {
-        Image(systemName: image).foregroundStyle(point == .start ? Color.green : .red)
-          .accessibilityHidden(true)
-        VStack(alignment: .leading, spacing: 2) {
-          Text(point == .start ? "Start" : "Ziel").font(.caption).foregroundStyle(.secondary)
-          Text(name ?? title).font(.subheadline).foregroundStyle(.primary).lineLimit(3)
-        }.frame(maxWidth: .infinity, alignment: .leading)
-        Image(systemName: "chevron.down").font(.caption).foregroundStyle(.secondary)
-          .accessibilityHidden(true)
-      }
-      .padding(.horizontal, 12).padding(.vertical, 8)
-      .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
-      .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
-      .contentShape(RoundedRectangle(cornerRadius: 10))
+      .buttonStyle(.plain)
       .accessibilityElement(children: .ignore)
       .accessibilityLabel("\(point == .start ? "Start" : "Ziel"): \(name ?? "Noch nicht gewählt")")
+      .accessibilityHint("Öffnet die Suche nach einem Ort oder einer Adresse")
+      .help(point == .start ? "Startpunkt suchen oder ändern" : "Zielpunkt suchen oder ändern")
+      Menu {
+        Button("Auf der Karte wählen", systemImage: "hand.tap") {
+          cancelLocationSelection()
+          model.chooseRoutePoint(point)
+          model.dismissPlace()
+          mapTarget = point
+        }
+        Button("Meinen Standort verwenden", systemImage: "location") { requestLocation(for: point) }
+      } label: {
+        Image(systemName: "ellipsis")
+          .frame(width: 44, height: 44).contentShape(Rectangle())
+      }
+      .menuStyle(.button).menuIndicator(.hidden).buttonStyle(.plain)
+      .accessibilityLabel(point == .start ? "Weitere Startoptionen" : "Weitere Zieloptionen")
+      .help("Kartenpunkt oder eigenen Standort auswählen")
     }
-    .menuStyle(.button).menuIndicator(.hidden)
-    .buttonStyle(.plain).frame(maxWidth: .infinity).disabled(model.busy)
-    .accessibilityLabel("\(point == .start ? "Start" : "Ziel"): \(name ?? "Noch nicht gewählt")")
-    .accessibilityHint("Suche, Kartenpunkt oder eigenen Standort auswählen")
+    .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+    .disabled(model.busy)
   }
 
   private var directionsSheet: some View {

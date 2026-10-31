@@ -182,7 +182,19 @@ func (s *server) tspExact(ctx context.Context, startNode, endNode int64, stops [
 
 	size := 1 << uint(n)
 	all := size - 1
-	dp := make([]float64, size*n)
+	// Store only endpoints present in each visited mask. Prefix offsets
+	// keep those endpoints contiguous while halving the exponential table.
+	offsets := make([]uint32, size)
+	states := 0
+	for mask := range offsets {
+		offsets[mask] = uint32(states)
+		states += bits.OnesCount(uint(mask))
+	}
+	stateIndex := func(mask, last int) int {
+		lower := (1 << uint(last)) - 1
+		return int(offsets[mask]) + bits.OnesCount(uint(mask&lower))
+	}
+	dp := make([]float64, states)
 	for i := range dp {
 		dp[i] = inf
 	}
@@ -190,30 +202,55 @@ func (s *server) tspExact(ctx context.Context, startNode, endNode int64, stops [
 	for i := 0; i < n; i++ {
 		if pre[i] == 0 && costStart[i] < inf {
 			m := 1 << uint(i)
-			dp[(m)*n+(i)] = costStart[i]
+			dp[stateIndex(m, i)] = costStart[i]
 		}
 	}
 
+	var nextState [16]int
 	for m := 0; m < size; m++ {
 		if m%256 == 0 {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
 		}
-		for remaining := uint(m); remaining != 0; remaining &= remaining - 1 {
-			last := bits.TrailingZeros(remaining)
-			if dp[(m)*n+(last)] >= inf {
+		// Dependency-heavy tours leave most subsets unreachable. Skip them
+		// before calculating outgoing transitions, and retain the first live row entry.
+		remaining := uint(m)
+		index := int(offsets[m])
+		for remaining != 0 && dp[index] >= inf {
+			remaining &= remaining - 1
+			index++
+		}
+		if remaining == 0 {
+			continue
+		}
+		// Eligibility and destination indices depend on the visited mask,
+		// not on its last stop. Calculate them once for all outgoing moves.
+		eligible := uint(all &^ m)
+		for next := eligible; next != 0; next &= next - 1 {
+			nxt := bits.TrailingZeros(next)
+			if uint64(m)&pre[nxt] != pre[nxt] {
+				eligible &^= 1 << uint(nxt)
 				continue
 			}
-			for next := uint(all &^ m); next != 0; next &= next - 1 {
+			nextState[nxt] = stateIndex(m|(1<<uint(nxt)), nxt)
+		}
+		if eligible == 0 {
+			continue
+		}
+		for ; remaining != 0; remaining &= remaining - 1 {
+			last := bits.TrailingZeros(remaining)
+			current := dp[index]
+			index++
+			if current >= inf {
+				continue
+			}
+			for next := eligible; next != 0; next &= next - 1 {
 				nxt := bits.TrailingZeros(next)
-				if (uint64(m) & pre[nxt]) != pre[nxt] {
-					continue
-				}
-				nm := m | (1 << uint(nxt))
-				c := dp[(m)*n+(last)] + costBetween[last][nxt]
-				if c < dp[(nm)*n+(nxt)] {
-					dp[(nm)*n+(nxt)] = c
+				index := nextState[nxt]
+				c := current + costBetween[last][nxt]
+				if c < dp[index] {
+					dp[index] = c
 				}
 			}
 		}
@@ -222,10 +259,10 @@ func (s *server) tspExact(ctx context.Context, startNode, endNode int64, stops [
 	best := inf
 	bestLast := -1
 	for last := 0; last < n; last++ {
-		if dp[(all)*n+(last)] >= inf || costEnd[last] >= inf {
+		if dp[stateIndex(all, last)] >= inf || costEnd[last] >= inf {
 			continue
 		}
-		c := dp[(all)*n+(last)] + costEnd[last]
+		c := dp[stateIndex(all, last)] + costEnd[last]
 		if c < best {
 			best = c
 			bestLast = last
@@ -248,7 +285,7 @@ func (s *server) tspExact(ctx context.Context, startNode, endNode int64, stops [
 		previous := -1
 		for candidates := uint(previousMask); candidates != 0; candidates &= candidates - 1 {
 			p := bits.TrailingZeros(candidates)
-			if dp[previousMask*n+p]+costBetween[p][cur] == dp[m*n+cur] {
+			if dp[stateIndex(previousMask, p)]+costBetween[p][cur] == dp[stateIndex(m, cur)] {
 				previous = p
 				break
 			}
