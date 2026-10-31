@@ -3801,6 +3801,9 @@ type stopR struct {
 }
 
 func (s *server) solveTrip(ctx context.Context, plan TripPlan, opt osmmini.RouteOptions) (TripSolveResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return TripSolveResponse{}, err
+	}
 	startCoord, startLabel, _, err := s.resolveLocation(plan.Start)
 	if err != nil {
 		return TripSolveResponse{}, fmt.Errorf("start: %w", err)
@@ -3912,17 +3915,64 @@ func (s *server) solveTrip(ctx context.Context, plan TripPlan, opt osmmini.Route
 
 	totalDist, totalDur, totalCost := 0.0, 0.0, 0.0
 	legs := make([]RouteResponse, 0, len(points)-1)
-	combined := make([]osmmini.Coord, 0, 4096)
 
+	// Repeated stops may share a directed graph leg, even with different labels.
+	type legKey struct{ from, to int64 }
+	jobs := make([]legKey, 0, len(points)-1)
+	jobIndex := make([]int, len(points)-1)
+	byNodes := make(map[legKey]int, len(points)-1)
+	for i := range jobIndex {
+		key := legKey{points[i].node, points[i+1].node}
+		index, exists := byNodes[key]
+		if !exists {
+			index = len(jobs)
+			byNodes[key] = index
+			jobs = append(jobs, key)
+		}
+		jobIndex[i] = index
+	}
+	type legResult struct {
+		res osmmini.RouteResult
+		err error
+	}
+	legResults, err := parallelMap(ctx, len(jobs), func(i int) legResult {
+		res, err := s.router.RouteWithOptions(ctx, jobs[i].from, jobs[i].to, opt)
+		res.Path = nil // The trip response retains coordinates, not graph node IDs.
+		return legResult{res, err}
+	})
+	if err != nil {
+		return TripSolveResponse{}, err
+	}
+
+	pathSize := 1
+	for i, index := range jobIndex {
+		if err := ctx.Err(); err != nil {
+			return TripSolveResponse{}, err
+		}
+		result := legResults[index]
+		if result.err != nil {
+			return TripSolveResponse{}, fmt.Errorf("leg %s->%s: %w", points[i].id, points[i+1].id, result.err)
+		}
+		if len(result.res.PathCoords) == 0 {
+			return TripSolveResponse{}, fmt.Errorf("leg %s->%s: empty path", points[i].id, points[i+1].id)
+		}
+		pathSize += len(result.res.PathCoords) - 1
+	}
+	// Exact capacity keeps the shared leg slices stable while assembling.
+	combined := make([]osmmini.Coord, 0, pathSize)
 	for i := 0; i < len(points)-1; i++ {
+		if err := ctx.Err(); err != nil {
+			return TripSolveResponse{}, err
+		}
 		a := points[i]
 		b := points[i+1]
-		rr, err := s.router.RouteWithOptions(ctx, a.node, b.node, opt)
-		if err != nil {
-			return TripSolveResponse{}, fmt.Errorf("leg %s->%s: %w", a.id, b.id, err)
-		}
-		if len(rr.PathCoords) == 0 {
-			return TripSolveResponse{}, fmt.Errorf("leg %s->%s: empty path", a.id, b.id)
+		rr := legResults[jobIndex[i]].res
+		begin := 0
+		if i == 0 {
+			combined = append(combined, rr.PathCoords...)
+		} else {
+			begin = len(combined) - 1
+			combined = append(combined, rr.PathCoords[1:]...)
 		}
 
 		legs = append(legs, RouteResponse{
@@ -3933,7 +3983,7 @@ func (s *server) solveTrip(ctx context.Context, plan TripPlan, opt osmmini.Route
 			Cost:          rr.Cost,
 			DistanceM:     rr.DistanceM,
 			DurationS:     rr.DurationS,
-			Path:          rr.PathCoords,
+			Path:          combined[begin:len(combined):len(combined)],
 			GoogleMapsURL: buildGoogleMapsURL([]osmmini.Coord{a.coord, b.coord}, 0),
 			AppleMapsURL:  buildAppleMapsURL([]osmmini.Coord{a.coord, b.coord}),
 		})
@@ -3941,12 +3991,6 @@ func (s *server) solveTrip(ctx context.Context, plan TripPlan, opt osmmini.Route
 		totalDist += rr.DistanceM
 		totalDur += rr.DurationS
 		totalCost += rr.Cost
-
-		if i == 0 {
-			combined = append(combined, rr.PathCoords...)
-		} else {
-			combined = append(combined, rr.PathCoords[1:]...)
-		}
 	}
 
 	orderIDs := make([]string, 0, len(orderIdx))

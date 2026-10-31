@@ -12,6 +12,7 @@ maplibre-gl*.mjs
 maplibre-gl.css
 leaflet-maplibre-gl.js
 osmmini-server
+/osmmini.test
 operations.json
 operators.json
 
