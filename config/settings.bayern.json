@@ -14,7 +14,7 @@
     }
   },
   "tiles": {
-    "cache_dir": "tiles-cache-bayern",
+    "cache_dir": "local/tiles-cache-bayern",
     "map_type": "vector",
     "style_url": "https://vtod1.bayernwolke.de/styles/by_style_standard.json",
     "upstream": "https://wmtsod1.bayernwolke.de/wmts/by_webkarte/smerc/{z}/{x}/{y}",

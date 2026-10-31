@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 // offlineMapLabel is deliberately a small, screen-oriented API. The local

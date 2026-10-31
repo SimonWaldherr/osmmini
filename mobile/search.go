@@ -17,7 +17,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	osm "simonwaldherr.de/go/osmmini"
+	osm "simonwaldherr.de/go/osmmini/core"
 )
 
 // SearchResult uses OSM IDs as signed 64-bit integers throughout the bridge.

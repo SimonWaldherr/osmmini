@@ -14,7 +14,7 @@ import (
 	"strings"
 	"testing"
 
-	osm "simonwaldherr.de/go/osmmini"
+	osm "simonwaldherr.de/go/osmmini/core"
 )
 
 func TestPlaceCatalogPreservesLegacyCompactAndCompressedSemantics(t *testing.T) {

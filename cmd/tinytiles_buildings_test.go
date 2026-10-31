@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 func TestTinyTilesBuildingHeights(t *testing.T) {

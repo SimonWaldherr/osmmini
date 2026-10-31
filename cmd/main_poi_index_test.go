@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 func TestCollectPOINodeReferencesKeepsOnlyIndexedGeometry(t *testing.T) {

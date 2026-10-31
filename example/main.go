@@ -5,7 +5,7 @@ import (
 	"log"
 	"strings"
 
-	"simonwaldherr.de/go/osmmini"
+	"simonwaldherr.de/go/osmmini/core"
 )
 
 func main() {
@@ -19,7 +19,7 @@ func main() {
 		},
 	}
 
-	err := osmmini.ExtractFile("region.osm.pbf", opts, osmmini.Callbacks{
+	err := osmmini.ExtractFile("local/region.osm.pbf", opts, osmmini.Callbacks{
 		HighwayWay: func(w osmmini.Way) error {
 			highways++
 			return nil

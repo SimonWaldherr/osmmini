@@ -13,7 +13,7 @@ import (
 	"strconv"
 	"strings"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 // regionBounds uses osmium's conventional left,bottom,right,top ordering.
@@ -111,7 +111,7 @@ func (b regionBounds) String() string {
 // from osmmini's Go binary.
 func runRegionExtractCLI(args []string) {
 	flags := flag.NewFlagSet("region-extract", flag.ExitOnError)
-	pbfPath := flags.String("pbf", "region.osm.pbf", "Path to the large OSM PBF")
+	pbfPath := flags.String("pbf", "local/region.osm.pbf", "Path to the large OSM PBF")
 	bbox := flags.String("bbox", "", "Region as minLon,minLat,maxLon,maxLat (required)")
 	output := flags.String("output", "", "Output regional .osm.pbf path (required)")
 	buildIndex := flags.Bool("index", true, "Build or refresh the source PBF spatial index before extracting")

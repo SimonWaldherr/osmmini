@@ -59,7 +59,7 @@ comparison by restoring only the two normalization formulas to `math.Mod`.
 
 ```sh
 GOMAXPROCS=1 OSMMINI_LONG_GRAPH=/path/to/niederbayern.graph \
-  go test -run '^$' -bench '^BenchmarkLongRoutes$' -benchmem -benchtime=3x -count=3 .
+  go test -run '^$' -bench '^BenchmarkLongRoutes$' -benchmem -benchtime=3x -count=3 ./core
 ```
 
 Alternatively, `OSMMINI_LONG_PBF=/path/to/niederbayern.osm.pbf` imports a temporary
@@ -79,4 +79,4 @@ bit for bit at turn thresholds, poles, the dateline and randomized coordinates.
 Fixture-free regression benchmarks are `BenchmarkLongRouteGrid` (600 × 600),
 `BenchmarkIndexedShortQueries`, `BenchmarkIndexedTurnSearch` and
 `BenchmarkNodeSnapping`. Validation also includes `make check` and
-`go test -race . ./mobile`.
+`go test -race ./core ./mobile`.

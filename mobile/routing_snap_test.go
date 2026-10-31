@@ -8,7 +8,7 @@ import (
 	"reflect"
 	"testing"
 
-	osm "simonwaldherr.de/go/osmmini"
+	osm "simonwaldherr.de/go/osmmini/core"
 )
 
 func snapFixture(t *testing.T, connectedLongitude float64, highway string, incomingOnly bool) (*osm.Router, map[int64]osm.Coord) {

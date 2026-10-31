@@ -1,12 +1,12 @@
 GO ?= go
 
 APP ?= osmmini
-BIN_DIR ?= bin
-PBF ?= region.osm.pbf
-SETTINGS ?= settings.json
+BIN_DIR ?= local/bin
+PBF ?= local/region.osm.pbf
+SETTINGS ?= config/settings.json
 LISTEN ?= :8080
 ADMIN_TOKEN ?=
-BAYERN_PBF ?= bayern.osm.pbf
+BAYERN_PBF ?= local/bayern.osm.pbf
 GEOFABRIK_URL ?= https://download.geofabrik.de/europe/germany/bayern-latest.osm.pbf
 PBF_URL ?= $(GEOFABRIK_URL)
 # sqliteimport enables tinySQL's pure-Go (modernc.org/sqlite, no cgo) MBTiles/
@@ -16,12 +16,12 @@ GOTAGS ?= sqliteimport
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build run bayern offline micromap-assets ensure-micromap-assets maplibre-assets ensure-maplibre-assets pbf-download offline-prep test test-js test-race vet fmt check check-js clean
+.PHONY: help build run bayern offline micromap-assets ensure-micromap-assets maplibre-assets ensure-maplibre-assets pbf-download offline-prep test test-js test-race vet fmt check check-js check-layout clean
 
 help: ## Show available commands.
 	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z0-9_-]+:.*##/ {printf "  %-12s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
-build: ensure-micromap-assets ensure-maplibre-assets ## Build the server into bin/osmmini.
+build: ensure-micromap-assets ensure-maplibre-assets ## Build the server into local/bin/osmmini.
 	@mkdir -p "$(BIN_DIR)"
 	$(GO) build -tags=$(GOTAGS) -o "$(BIN_DIR)/$(APP)" ./cmd
 
@@ -33,14 +33,14 @@ bayern: ## Run the Bavaria profile; set ADMIN_TOKEN and optionally BAYERN_PBF.
 		echo "Set ADMIN_TOKEN before starting the Bavaria profile."; \
 		exit 2; \
 	fi
-	OSMMINI_ADMIN_TOKEN="$(ADMIN_TOKEN)" $(GO) run -tags=$(GOTAGS) ./cmd -pbf "$(BAYERN_PBF)" -settings settings.bayern.json -listen "$(LISTEN)"
+	OSMMINI_ADMIN_TOKEN="$(ADMIN_TOKEN)" $(GO) run -tags=$(GOTAGS) ./cmd -pbf "$(BAYERN_PBF)" -settings config/settings.bayern.json -listen "$(LISTEN)"
 
 offline: ## Run the fully local tinyTiles profile; set ADMIN_TOKEN and PBF.
 	@if [ -z "$(ADMIN_TOKEN)" ]; then \
 		echo "Set ADMIN_TOKEN before starting the offline profile."; \
 		exit 2; \
 	fi
-	OSMMINI_ADMIN_TOKEN="$(ADMIN_TOKEN)" $(GO) run -tags=$(GOTAGS) ./cmd -pbf "$(PBF)" -settings settings.tinytiles.json -listen "$(LISTEN)"
+	OSMMINI_ADMIN_TOKEN="$(ADMIN_TOKEN)" $(GO) run -tags=$(GOTAGS) ./cmd -pbf "$(PBF)" -settings config/settings.tinytiles.json -listen "$(LISTEN)"
 
 micromap-assets: ## Rebuild microMap 0.3.0 from the pinned upstream commit (network required).
 	@set -e; stage=$$(mktemp -d); trap 'rm -rf "$$stage"' EXIT; \
@@ -71,6 +71,7 @@ ensure-maplibre-assets: ## Verify local MapLibre assets, downloading them when m
 	fi
 
 pbf-download: ## Download an OSM extract from PBF_URL into PBF (skips existing files; use FORCE=1 to refetch).
+	@mkdir -p "$(dir $(PBF))"
 	@if [ -e "$(PBF)" ] && [ "$(FORCE)" != "1" ]; then \
 		echo "$(PBF) already exists, skipping (use FORCE=1 to refetch)."; \
 	else \
@@ -104,7 +105,10 @@ vet: ## Run Go static analysis.
 fmt: ## Format all Go packages.
 	$(GO) fmt ./...
 
-check: test vet build check-js test-js ## Run Go checks, build, and browser JavaScript checks (requires Node.js).
+check: test vet build check-js test-js check-layout ## Run Go, browser and repository layout checks (requires Node.js).
+
+check-layout: ## Ensure the repository root has at most twenty entries, including hidden files.
+	bash scripts/check-layout.sh
 
 test-js: ## Run browser request and interaction regression tests (requires Node.js).
 	node --test cmd/web_test/*.test.cjs
@@ -125,13 +129,9 @@ test-apple: build-apple-macos ## Run the native Swift integration tests on macOS
 	swift test --package-path apple
 
 check-mobile: ## Test the offline Go library without SQLite or cgo.
-	CGO_ENABLED=0 $(GO) test . ./mobile
+	CGO_ENABLED=0 $(GO) test ./core ./mobile
 	@mkdir -p "$(BIN_DIR)"
 	CGO_ENABLED=0 $(GO) build -o "$(BIN_DIR)/prepare-region" ./cmd/prepare-region
 
-clean: ## Remove BIN_DIR plus top-level PBF files and osmmini binaries.
+clean: ## Remove compiled binaries from BIN_DIR; retain downloaded and prepared maps.
 	rm -rf "$(BIN_DIR)"
-	find . -maxdepth 1 \( -type f -o -type l \) \
-		\( -iname '*.pbf' -o -name 'osmmini' -o -name 'osmmini.exe' \
-		-o -name 'osmmini-server' -o -name 'osmmini-server.exe' -o -name 'osmmini.wasm' \) \
-		-exec rm -f -- {} +

@@ -8,14 +8,14 @@ import (
 	"os"
 	"path/filepath"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 // defaultTerritoryStatePath is where `territories load` records which
 // source file backs each layer, so a later, separate `territory lookup`
 // invocation (a fresh process -- this CLI has no daemon) can find it again
 // without repeating --input.
-const defaultTerritoryStatePath = ".osmmini/territories.json"
+const defaultTerritoryStatePath = "local/territory-state.json"
 
 type territoryManifest struct {
 	Layers map[string]string `json:"layers"`

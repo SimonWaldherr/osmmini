@@ -7,7 +7,7 @@ version="$1"; base="${2%/}"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9.-]+)?$ ]] || { echo "Invalid version" >&2; exit 2; }
 [[ "$base" == https://* ]] || { echo "Use an HTTPS release URL" >&2; exit 2; }
 test -d "$root/apple/COSMmini.xcframework" || { echo "Run make build-apple first" >&2; exit 1; }
-output="$root/bindings/apple/build/release-$version"
+output="$root/local/build/apple/release-$version"
 mkdir -p "$output"
 asset="COSMmini-$version.xcframework.zip"
 ditto -c -k --keepParent "$root/apple/COSMmini.xcframework" "$output/$asset"

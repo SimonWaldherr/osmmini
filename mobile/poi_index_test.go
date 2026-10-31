@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	osm "simonwaldherr.de/go/osmmini"
+	osm "simonwaldherr.de/go/osmmini/core"
 )
 
 func poiTestSource(t *testing.T, records []SearchResult, compressed bool) (*searchReader, string) {

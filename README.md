@@ -47,18 +47,15 @@ once; subsequent use needs no network connection.
 Use `make run PBF=/path/to/region.osm.pbf` for an existing extract.
 `go run ./cmd help` lists commands and flags.
 
-`make clean` deletes `bin/` (or `BIN_DIR`) and all PBF files directly in the
-current directory, plus root-level `osmmini`, `osmmini-server`, their `.exe`
-variants and `osmmini.wasm`. The PBF search does not descend into subdirectories.
-Symlinks are unlinked, leaving their targets untouched. Use
-`make -n clean` to preview the commands without deleting files.
+`make clean` removes compiled binaries from `local/bin/` (or `BIN_DIR`).
+Downloaded maps and prepared regions are retained.
 
 `PBF_URL` also accepts extracts from other providers, including
 [OpenStreetMap France](https://download.openstreetmap.fr/extracts/):
 
 ```sh
-make offline-prep PBF=gibraltar.osm.pbf PBF_URL='https://download.openstreetmap.fr/extracts/europe/gibraltar-latest.osm.pbf'
-make run PBF=gibraltar.osm.pbf
+make offline-prep PBF=local/gibraltar.osm.pbf PBF_URL='https://download.openstreetmap.fr/extracts/europe/gibraltar-latest.osm.pbf'
+make run PBF=local/gibraltar.osm.pbf
 ```
 
 The default remains the Geofabrik Bavaria extract. Existing `GEOFABRIK_URL`
@@ -72,11 +69,11 @@ prepared local basemap work offline afterward.
 | Profile | Command | Basemap |
 | --- | --- | --- |
 | Default | `make run` | Local tinyTiles map; other sources selectable in settings |
-| Bavaria | `make bayern ADMIN_TOKEN=… BAYERN_PBF=bayern.osm.pbf` | BayernAtlas vector/WMTS |
-| Offline | `make offline ADMIN_TOKEN=… PBF=region.osm.pbf` | Local tinyTiles only |
+| Bavaria | `make bayern ADMIN_TOKEN=…` | BayernAtlas vector/WMTS |
+| Offline | `make offline ADMIN_TOKEN=…` | Local tinyTiles only |
 
 Routing, search and POIs cover the loaded PBF, independently of the basemap.
-Offline maps are stored in `offline-tiles/basemap.ttiles`. Map settings control
+Offline maps are stored in `local/offline-tiles/basemap.ttiles`. Map settings control
 colours, layers, labels and road widths without rebuilding the data.
 
 The default renderer is [microMap](https://github.com/Karte-Bayern/microMap),
@@ -104,11 +101,11 @@ submission after connection loss. Storage follows `-deployment-mode`:
 | Mode | Storage |
 | --- | --- |
 | `browser-local` | Browser storage |
-| `single-user` | Server-side `operations.json` |
+| `single-user` | Server-side `local/operations.json` |
 | `multi-user` | Server history with personal operator tokens |
 
-For multi-user operation, configure [operators.example.json](operators.example.json)
-and start with `-deployment-mode multi-user -operators-file operators.json`.
+For multi-user operation, configure [operators.example.json](config/operators.example.json)
+and start with `-deployment-mode multi-user -operators-file local/operators.json`.
 
 ## HTTP API
 
@@ -135,7 +132,7 @@ curl 'http://localhost:8080/api/v1/search?q=Passau&limit=5'
 curl 'http://localhost:8080/api/v1/route?format=gpx' \
   -H 'Content-Type: application/json' \
   -d '{"from":{"lat":48.574,"lon":13.450},"to":{"lat":48.549,"lon":12.137}}' \
-  -o route.gpx
+  -o local/route.gpx
 ```
 
 Route and trip endpoints accept `format=gpx` or `format=geojson`. GeoJSON uses
@@ -155,8 +152,8 @@ Run `go run ./cmd <command> -h` for options.
 | `version`, `help` | Build information and command reference |
 
 ```sh
-go run ./cmd route -pbf region.osm.pbf \
-  -from 48.574,13.450 -to 48.549,12.137 -format gpx > route.gpx
+go run ./cmd route -pbf local/region.osm.pbf \
+  -from 48.574,13.450 -to 48.549,12.137 -format gpx > local/route.gpx
 ```
 
 ## Large PBF files
@@ -165,20 +162,20 @@ Prefer a regional extract to loading an entire country. `region-extract` needs
 [osmium](https://osmcode.org/osmium-tool/) and preserves complete ways:
 
 ```sh
-go run ./cmd region-extract -pbf germany-latest.osm.pbf \
-  -bbox 11.7,47.8,14.3,49.3 -output regions/local.osm.pbf
+go run ./cmd region-extract -pbf local/germany-latest.osm.pbf \
+  -bbox 11.7,47.8,14.3,49.3 -output local/regions/local.osm.pbf
 ```
 
-`go run ./cmd pbf-index -pbf germany-latest.osm.pbf` creates a reusable block index.
+`go run ./cmd pbf-index -pbf local/germany-latest.osm.pbf` creates a reusable block index.
 The index is invalidated when its source changes.
 
 ## Configuration
 
-[settings.json](settings.json) contains routing defaults, map sources, optional
+[settings.json](config/settings.json) contains routing defaults, map sources, optional
 AI endpoints and highway speeds. Most settings are editable in the UI.
 Graph-import filters require a restart. Additional profiles are provided in
-[settings.bayern.json](settings.bayern.json) and
-[settings.tinytiles.json](settings.tinytiles.json).
+[settings.bayern.json](config/settings.bayern.json) and
+[settings.tinytiles.json](config/settings.tinytiles.json).
 
 | Option | Purpose |
 | --- | --- |
@@ -216,7 +213,7 @@ signing and portable region packages. To prepare a package without Xcode:
 
 ```sh
 CGO_ENABLED=0 go run ./cmd/prepare-region \
-  -pbf region.osm.pbf -output regions/local
+  -pbf local/region.osm.pbf -output local/regions/local
 ```
 
 ## Routing and data limits
@@ -244,8 +241,24 @@ make test-js       # Browser tests
 missing. Browser tests use local fixtures. Benchmarks are included in the Go
 and Swift test suites; see the Apple guide for opt-in real-region checks.
 
-Core Go code is at the repository root, HTTP/UI code in `cmd/`, the offline
-library in `mobile/`, and native integration in `apple/` and `bindings/`.
+The repository uses these top-level directories:
+
+| Directory | Contents |
+| --- | --- |
+| `core/` | Go routing and import library |
+| `cmd/` | Server, browser UI and command-line tools |
+| `mobile/` | Offline region library |
+| `apple/`, `bindings/` | Swift SDK, native apps and C bridge |
+| `config/` | Server profiles and example operator configuration |
+| `docs/`, `testdata/` | Documentation and fixtures |
+| `scripts/`, `example/` | Build scripts and Go example |
+| `local/` | Ignored downloads, caches, builds and private local data |
+
+The Go module remains `simonwaldherr.de/go/osmmini`; import the library as
+`simonwaldherr.de/go/osmmini/core` and the offline library as
+`simonwaldherr.de/go/osmmini/mobile`. The root Swift package remains
+available. `make check-layout` enforces a maximum of twenty root entries, including
+hidden files and directories such as `.git`.
 
 ## Citation and map data
 

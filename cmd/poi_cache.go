@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 type poiCachePayload struct {

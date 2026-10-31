@@ -9,7 +9,7 @@ import (
 
 // 6. Unmatched destinations: all four documented policies.
 func TestAssignPointsUnassignedPolicies(t *testing.T) {
-	s := loadTestStore(t, "delivery", "testdata/territory/delivery-zones.geojson")
+	s := loadTestStore(t, "delivery", "../testdata/territory/delivery-zones.geojson")
 	outside := Point{ID: "P-out", Lat: 0, Lon: 0}
 	inside := Point{ID: "P-in", Lat: 48.65, Lon: 12.65}
 
@@ -64,7 +64,7 @@ func TestAssignPointsUnassignedPolicies(t *testing.T) {
 // 8. Large batch assignment: the layer's spatial index is built once at
 // load time and reused across the whole batch.
 func TestAssignPointsLargeBatch(t *testing.T) {
-	s := loadTestStore(t, "delivery", "testdata/territory/delivery-zones.geojson")
+	s := loadTestStore(t, "delivery", "../testdata/territory/delivery-zones.geojson")
 	const n = 20000
 	points := make([]Point, n)
 	for i := 0; i < n; i++ {
@@ -94,7 +94,7 @@ func TestAssignPointsLargeBatch(t *testing.T) {
 // 12. Deterministic assignment: the same store and the same points slice
 // always produce the same assignments, in the same order.
 func TestAssignPointsDeterministic(t *testing.T) {
-	s := loadTestStore(t, "delivery", "testdata/territory/delivery-zones.geojson")
+	s := loadTestStore(t, "delivery", "../testdata/territory/delivery-zones.geojson")
 	points := []Point{
 		{ID: "P1", Lat: 48.65, Lon: 12.65},
 		{ID: "P2", Lat: 48.62, Lon: 12.85},
@@ -110,7 +110,7 @@ func TestAssignPointsDeterministic(t *testing.T) {
 }
 
 func TestAssignPointsIncludeFieldSelection(t *testing.T) {
-	s := loadTestStore(t, "delivery", "testdata/territory/delivery-zones.geojson")
+	s := loadTestStore(t, "delivery", "../testdata/territory/delivery-zones.geojson")
 	got, err := s.AssignPointsWithOptions([]Point{{ID: "P1", Lat: 48.65, Lon: 12.65}}, AssignOptions{
 		Layer:   "delivery",
 		Include: []string{"territory_id", "depot", "vehicle"},
@@ -127,7 +127,7 @@ func TestAssignPointsIncludeFieldSelection(t *testing.T) {
 }
 
 func TestTerritoryConstraint(t *testing.T) {
-	s := loadTestStore(t, "delivery", "testdata/territory/delivery-zones.geojson")
+	s := loadTestStore(t, "delivery", "../testdata/territory/delivery-zones.geojson")
 	van1 := Vehicle{ID: "VAN-01", Properties: map[string]any{"territory_id": "Zone-1"}}
 	inZone1 := Shipment{ID: "S1", Lat: 48.65, Lon: 12.65}
 	inZone3 := Shipment{ID: "S3", Lat: 48.98, Lon: 13.0}

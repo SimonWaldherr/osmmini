@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 func TestWorkPlanCLI(t *testing.T) {

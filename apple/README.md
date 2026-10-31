@@ -260,7 +260,7 @@ application's readable sandbox:
 
 ```sh
 CGO_ENABLED=0 go run ./cmd/prepare-region \
-  -pbf region.osm.pbf -output regions/local -name "Local region"
+  -pbf local/region.osm.pbf -output local/regions/local -name "Local region"
 ```
 
 | File | Contents |

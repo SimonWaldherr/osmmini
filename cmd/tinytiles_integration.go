@@ -15,7 +15,7 @@ import (
 	tinytiles "github.com/Karte-Bayern/tinyTiles/v2"
 	tinytilesserver "github.com/Karte-Bayern/tinyTiles/v2/server"
 	tiles "github.com/SimonWaldherr/tinySQL/tiles"
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 const (

@@ -33,7 +33,7 @@ import (
 	tinytiles "github.com/Karte-Bayern/tinyTiles/v2"
 	tinytilesserver "github.com/Karte-Bayern/tinyTiles/v2/server"
 	tiles "github.com/SimonWaldherr/tinySQL/tiles"
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 //go:embed web/index.html web/style.css web/app.js web/ai-ui.js web/offline-style.js web/offline-buildings.js web/planning.js web/map-post.js web/osm-editor.js web/osm-presets.js web/osm-hover.js web/map-context.js web/map-renderer.js web/static api/openapi.yaml
@@ -1301,24 +1301,24 @@ func main() {
 	// Command-line flags. `-pbf` should point at the OSM PBF used to
 	// build the routing graph (e.g. a regional extract). If the file
 	// is missing the server will fail to build the router.
-	pbf := flag.String("pbf", "region.osm.pbf", "Path to OSM PBF")
+	pbf := flag.String("pbf", "local/region.osm.pbf", "Path to OSM PBF")
 	addressIndex := flag.Bool("address-index", false, "Pre-normalize address search fields for repeated queries (uses additional memory)")
 	listen := flag.String("listen", ":8080", "HTTP listen address")
-	settingsPath := flag.String("settings", "settings.json", "Settings JSON file")
-	tilesDir := flag.String("tiles-dir", "tiles-cache", "Tile cache directory")
+	settingsPath := flag.String("settings", "config/settings.json", "Settings JSON file")
+	tilesDir := flag.String("tiles-dir", "local/tiles-cache", "Tile cache directory")
 	tileUpstream := flag.String("tile-upstream", "", "Tile upstream template (empty uses the local offline map)")
 	buildCH := flag.Bool("build-ch", false, "Deprecated; rejected because experimental CH lacks shortcuts")
 	adminToken := flag.String("admin-token", os.Getenv("OSMMINI_ADMIN_TOKEN"), "Optional bearer token; when set, it is required for settings updates")
-	tinyTilesDir := flag.String("tinytiles-dir", "offline-tiles", "Directory for generated tinyTiles .ttiles artifacts")
-	territoriesDir := flag.String("territories-dir", "territories", "Directory of *.geojson territory layers (file name without extension = layer name); optional")
-	importedLayersDir := flag.String("imported-layers-dir", "imported-layers", "Directory of GeoJSON layers produced by GIS file imports (see /api/v1/geodata/import); optional")
-	customTilesDir := flag.String("geodata-tiles-dir", "geodata-tiles", "Directory for the imported MBTiles custom tile source (see /api/v1/geodata/mbtiles); optional")
-	confidentialObjectsFile := flag.String("confidential-objects-file", "confidential-objects.json", "Local JSON file for OSM-editor objects marked confidential (never exported, requires -admin-token)")
+	tinyTilesDir := flag.String("tinytiles-dir", "local/offline-tiles", "Directory for generated tinyTiles .ttiles artifacts")
+	territoriesDir := flag.String("territories-dir", "local/territories", "Directory of *.geojson territory layers (file name without extension = layer name); optional")
+	importedLayersDir := flag.String("imported-layers-dir", "local/imported-layers", "Directory of GeoJSON layers produced by GIS file imports (see /api/v1/geodata/import); optional")
+	customTilesDir := flag.String("geodata-tiles-dir", "local/geodata-tiles", "Directory for the imported MBTiles custom tile source (see /api/v1/geodata/mbtiles); optional")
+	confidentialObjectsFile := flag.String("confidential-objects-file", "local/confidential-objects.json", "Local JSON file for OSM-editor objects marked confidential (never exported, requires -admin-token)")
 	tinyTilesMaxMemoryMB := flag.Int64("tinytiles-max-memory-mb", 768, "Maximum memory (MB) tinyTiles may use while importing a .ttiles artifact; raise this for larger PBF regions")
 	tinyTilesReaders := flag.Int("tinytiles-readers", 4, "Concurrent tinyTiles readers for the offline map")
 	tinyTilesReaderMemoryMB := flag.Int64("tinytiles-reader-memory-mb", 32, "Page-cache memory (MB) per tinyTiles reader while serving the offline map")
 	tinyTilesTileCacheMB := flag.Int64("tinytiles-tile-cache-mb", 64, "Bounded hot-tile cache (MB) for the offline map; -1 disables it")
-	operationsFile := flag.String("operations-file", "operations.json", "Local JSON file for delivery proofs and maintenance records")
+	operationsFile := flag.String("operations-file", "local/operations.json", "Local JSON file for delivery proofs and maintenance records")
 	deploymentModeFlag := flag.String("deployment-mode", deploymentModeSingleUser, "Deployment mode: browser-local, single-user, or multi-user")
 	operatorsFile := flag.String("operators-file", "", "JSON map of operator name to token; required for multi-user mode")
 
@@ -1439,7 +1439,7 @@ func main() {
 		territoriesDir:          *territoriesDir,
 		importedLayersDir:       *importedLayersDir,
 		customTilesDir:          *customTilesDir,
-		fireStations:            NewFireStationStore("fire-stations.json"),
+		fireStations:            NewFireStationStore("local/fire-stations.json"),
 		operations:              NewOperationsStore(*operationsFile),
 		confidential:            NewConfidentialObjectStore(*confidentialObjectsFile),
 		deploymentMode:          deploymentMode,

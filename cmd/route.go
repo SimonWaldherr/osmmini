@@ -8,7 +8,7 @@ import (
 	"log"
 	"os"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 // runRouteCLI implements the standalone `osmmini route` subcommand. It
@@ -19,7 +19,7 @@ import (
 // into that JSON API too is a small, separate follow-up.
 func runRouteCLI(args []string) {
 	fs := flag.NewFlagSet("route", flag.ExitOnError)
-	pbf := fs.String("pbf", "region.osm.pbf", "path to OSM PBF")
+	pbf := fs.String("pbf", "local/region.osm.pbf", "path to OSM PBF")
 	from := fs.String("from", "", "start coordinate, \"lat,lon\"")
 	to := fs.String("to", "", "end coordinate, \"lat,lon\"")
 	territoryLayer := fs.String("territory-layer", "", "territory layer name to report route transitions for")

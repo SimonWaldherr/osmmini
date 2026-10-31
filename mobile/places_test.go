@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	osm "simonwaldherr.de/go/osmmini"
+	osm "simonwaldherr.de/go/osmmini/core"
 )
 
 func openPlaceCatalog(t *testing.T, records []SearchResult) *searchReader {

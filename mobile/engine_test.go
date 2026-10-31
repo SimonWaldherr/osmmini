@@ -10,7 +10,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
-	osm "simonwaldherr.de/go/osmmini"
+	osm "simonwaldherr.de/go/osmmini/core"
 	"strings"
 	"testing"
 	"time"

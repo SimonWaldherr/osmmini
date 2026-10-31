@@ -1,7 +1,7 @@
 package main
 
 import (
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 	"strings"
 	"unicode"
 )

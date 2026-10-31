@@ -15,7 +15,7 @@ import (
 	"regexp"
 	"testing"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 func encodedPNG(t *testing.T) []byte {

@@ -6,7 +6,7 @@ import (
 	"runtime"
 	"testing"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 func BenchmarkTSPManyStops(b *testing.B) {

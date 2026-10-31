@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 // loadTerritories loads every top-level *.geojson file in dir as a named

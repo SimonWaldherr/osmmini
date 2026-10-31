@@ -5,7 +5,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	osm "simonwaldherr.de/go/osmmini"
+	osm "simonwaldherr.de/go/osmmini/core"
 )
 
 // PlaceDetails contains source tags, not inferred addresses or interpreted

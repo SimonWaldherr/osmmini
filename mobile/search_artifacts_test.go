@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	osm "simonwaldherr.de/go/osmmini"
+	osm "simonwaldherr.de/go/osmmini/core"
 )
 
 func TestStreamingSearchArtifactsMatchCatalogScans(t *testing.T) {

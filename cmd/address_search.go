@@ -1,6 +1,6 @@
 package main
 
-import osmmini "simonwaldherr.de/go/osmmini"
+import osmmini "simonwaldherr.de/go/osmmini/core"
 
 // The prepared index is immutable and shared across requests. Keeping the
 // fallback supports small/ad-hoc server instances without an extra RAM cache.

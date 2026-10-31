@@ -10,7 +10,7 @@ import (
 	"sync"
 	"unicode"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 // FireVehicle is one vehicle stationed at a fire station, keyed by its

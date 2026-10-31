@@ -25,7 +25,7 @@
     }
   },
   "tiles": {
-    "cache_dir": "tiles-cache",
+    "cache_dir": "local/tiles-cache",
     "upstream": "",
     "user_agent": "osmmini-routerd/1.0 (offline routing)",
     "map_type": "vector",

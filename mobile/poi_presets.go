@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	osm "simonwaldherr.de/go/osmmini"
+	osm "simonwaldherr.de/go/osmmini/core"
 )
 
 // POIPreset selects the searchable points of interest prepared for a region.

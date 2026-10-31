@@ -78,10 +78,10 @@ func TestGeometryContainsBoundary(t *testing.T) {
 // cross-project interop check, not just a synthetic fixture.
 func TestOverlappingIndependentLayers(t *testing.T) {
 	s := NewTerritoryStore()
-	if err := s.LoadLayer("delivery", "testdata/territory/delivery-zones.geojson"); err != nil {
+	if err := s.LoadLayer("delivery", "../testdata/territory/delivery-zones.geojson"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.LoadLayer("sales", "testdata/territory/sales-territories.geojson"); err != nil {
+	if err := s.LoadLayer("sales", "../testdata/territory/sales-territories.geojson"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -100,7 +100,7 @@ func TestOverlappingIndependentLayers(t *testing.T) {
 // arbitrary guess. AssignPoints policy behavior is covered in
 // dispatch_test.go.
 func TestFindTerritoryUnmatched(t *testing.T) {
-	s := loadTestStore(t, "delivery", "testdata/territory/delivery-zones.geojson")
+	s := loadTestStore(t, "delivery", "../testdata/territory/delivery-zones.geojson")
 	if got := s.FindTerritory("delivery", 0, 0); got != nil {
 		t.Fatalf("expected no match far outside every territory, got %v", got)
 	}
@@ -110,7 +110,7 @@ func TestFindTerritoryUnmatched(t *testing.T) {
 // genuine MultiPolygon with two geographically separate parts (tinyTiles'
 // dissolve keeps unrelated touching-groups apart rather than merging them).
 func TestFindTerritoryDisconnectedMultiPolygon(t *testing.T) {
-	s := loadTestStore(t, "delivery", "testdata/territory/delivery-zones.geojson")
+	s := loadTestStore(t, "delivery", "../testdata/territory/delivery-zones.geojson")
 	a := s.FindTerritory("delivery", 48.65, 12.85)
 	b := s.FindTerritory("delivery", 48.35, 13.3)
 	if a == nil || a.ID != "Zone-2" {
@@ -128,7 +128,7 @@ func TestFindTerritoryDisconnectedMultiPolygon(t *testing.T) {
 // scalar, some list-valued where tinyTiles' aggregation found disagreeing
 // source values) come through unchanged.
 func TestTerritoryMetadataPropagation(t *testing.T) {
-	s := loadTestStore(t, "delivery", "testdata/territory/delivery-zones.geojson")
+	s := loadTestStore(t, "delivery", "../testdata/territory/delivery-zones.geojson")
 
 	z1 := s.FindTerritoryByID("delivery", "Zone-1")
 	if z1 == nil {
@@ -155,7 +155,7 @@ func TestTerritoryMetadataPropagation(t *testing.T) {
 // a boundary (postcode 84131, in Zone-1, sits directly against 84140, in
 // Zone-2); Zone-3 is geographically far away and must not be a neighbor.
 func TestNeighbors(t *testing.T) {
-	s := loadTestStore(t, "delivery", "testdata/territory/delivery-zones.geojson")
+	s := loadTestStore(t, "delivery", "../testdata/territory/delivery-zones.geojson")
 	neighbors := s.Neighbors("delivery", "Zone-1")
 	found := false
 	for _, id := range neighbors {
@@ -175,7 +175,7 @@ func TestNeighbors(t *testing.T) {
 // identical results. Deterministic *assignment* (batch API) is covered in
 // dispatch_test.go.
 func TestFindTerritoryDeterministic(t *testing.T) {
-	s := loadTestStore(t, "delivery", "testdata/territory/delivery-zones.geojson")
+	s := loadTestStore(t, "delivery", "../testdata/territory/delivery-zones.geojson")
 	first := s.FindTerritory("delivery", 48.65, 12.65)
 	for i := 0; i < 5; i++ {
 		got := s.FindTerritory("delivery", 48.65, 12.65)

@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 const geodataSamplePointFC = `{"type":"FeatureCollection","features":[

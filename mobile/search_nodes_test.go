@@ -9,7 +9,7 @@ import (
 	"slices"
 	"testing"
 
-	osm "simonwaldherr.de/go/osmmini"
+	osm "simonwaldherr.de/go/osmmini/core"
 )
 
 func TestSearchNodeSortMergesDuplicateReferencesInBoundedRuns(t *testing.T) {

@@ -11,7 +11,7 @@ import (
 	"sort"
 	"strings"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 // tinyTilesWaterwaySidecarVersion deliberately has its own version number:

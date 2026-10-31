@@ -1,33 +1,14 @@
-tiles-cache
-tiles-cache-*
-offline-tiles/
-bin/
-region.osm.pbf
+# Downloads, caches, binaries and private operational data.
+/local/
+*.poi.json
+.DS_Store
+*.test
+
+# Generated browser runtimes and downloaded MapLibre assets.
 osmmini.wasm
 wasm_exec.js
-leaflet.css
-leaflet.js
-maplibre-gl.js
-maplibre-gl*.mjs
-maplibre-gl.css
-leaflet-maplibre-gl.js
-osmmini-server
-/osmmini.test
-operations.json
-operators.json
-
-# Local operational data (never for the public repo: real fire-department
-# rosters, internal documents, generated PLZ/POI caches from a loaded PBF,
-# imported GIS layers, and confidential OSM-editor objects).
-ffw/
-fire-stations.json
-territories/
-*.poi.json
-imported-layers/
-confidential-objects.json
-geodata-tiles/
-ROADMAP.md
-.claude
+/cmd/web/static/maplibre/maplibre-gl*.mjs
+/cmd/web/static/maplibre/maplibre-gl.css
 
 # Apple SDK build products. Keep generated native binaries out of source control.
 apple/COSMmini.xcframework/
@@ -35,11 +16,8 @@ apple/.build/
 apple/.swiftpm/
 .build/
 .swiftpm/
-bindings/apple/build/
 *.xcuserstate
 xcuserdata/
-!apple/Tests/OSMminiTests/Fixtures/region.osm.pbf
-!apple/Tests/OSMminiDemoTests/Fixtures/region.osm.pbf
 
 # Personal Xcode signing settings.
 /apple/Demo/Configuration/Signing.local.xcconfig

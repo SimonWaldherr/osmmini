@@ -11,7 +11,7 @@ import (
 	"sort"
 	"testing"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 func geoTestServer() *server {

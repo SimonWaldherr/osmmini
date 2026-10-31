@@ -7,7 +7,7 @@ import (
 	"slices"
 	"testing"
 
-	osm "simonwaldherr.de/go/osmmini"
+	osm "simonwaldherr.de/go/osmmini/core"
 )
 
 func benchmarkSearchWayReferences(count int, emit func([]int64) error) error {

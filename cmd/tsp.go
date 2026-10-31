@@ -9,7 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 // Costs are scoped to one solve and its options; one-way roads stay directed.

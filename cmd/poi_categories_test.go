@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 func TestPOICategoryPromptBoundariesAndAliases(t *testing.T) {

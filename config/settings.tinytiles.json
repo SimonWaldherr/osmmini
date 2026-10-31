@@ -5,7 +5,7 @@
     "pro": false
   },
   "tiles": {
-    "cache_dir": "tiles-cache-tinytiles",
+    "cache_dir": "local/tiles-cache-tinytiles",
     "map_type": "vector",
     "style_url": "/static/styles/tinytiles-minimal.json",
     "attribution": "© OpenStreetMap contributors",

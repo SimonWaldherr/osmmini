@@ -3,7 +3,7 @@ package main
 import (
 	"testing"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 func TestGroupPostalTerritoriesByPrefix(t *testing.T) {

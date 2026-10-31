@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"strings"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 // hydrant is a small, screen-oriented view of an emergency=fire_hydrant node,

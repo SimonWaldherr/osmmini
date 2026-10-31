@@ -6,7 +6,7 @@ import (
 	"errors"
 	"slices"
 
-	osm "simonwaldherr.de/go/osmmini"
+	osm "simonwaldherr.de/go/osmmini/core"
 )
 
 const (

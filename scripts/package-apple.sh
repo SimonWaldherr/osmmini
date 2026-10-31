@@ -2,12 +2,12 @@
 # Produce a self-contained Swift package ZIP for local SwiftPM/Xcode import.
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null && pwd -P)"
-output="${1:-$root/bindings/apple/build/OSMmini-Apple.zip}"
+output="${1:-$root/local/build/apple/OSMmini-Apple.zip}"
 test -d "$root/apple/COSMmini.xcframework" || { echo "Run make build-apple first." >&2; exit 1; }
 mkdir -p "$(dirname "$output")"
 output="$(cd "$(dirname "$output")" >/dev/null && pwd -P)/$(basename "$output")"
-mkdir -p "$root/bindings/apple/build"
-stage="$(mktemp -d "$root/bindings/apple/build/package.XXXXXX")"
+mkdir -p "$root/local/build/apple"
+stage="$(mktemp -d "$root/local/build/apple/package.XXXXXX")"
 trap 'rm -rf "$stage"' EXIT
 mkdir -p "$stage/OSMmini"
 cp -R "$root/apple/Sources" "$root/apple/Tests" "$root/apple/COSMmini.xcframework" "$stage/OSMmini/"

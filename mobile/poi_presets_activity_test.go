@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	osm "simonwaldherr.de/go/osmmini"
+	osm "simonwaldherr.de/go/osmmini/core"
 )
 
 func TestActivityPresetsSelectObjectsRatherThanWholeTagKeys(t *testing.T) {

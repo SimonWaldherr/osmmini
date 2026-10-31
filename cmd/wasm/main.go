@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"syscall/js"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 var r *osmmini.Router

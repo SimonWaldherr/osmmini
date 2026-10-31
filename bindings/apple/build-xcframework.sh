@@ -11,7 +11,7 @@ if [[ "$(uname -s)" != Darwin ]]; then
 fi
 command -v go >/dev/null
 command -v xcodebuild >/dev/null
-build="$root/bindings/apple/build"
+build="$root/local/build/apple"
 package="$root/apple"
 mkdir -p "$build"
 # Use a unique staging directory; retain the last complete framework on failure.

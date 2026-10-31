@@ -8,7 +8,7 @@ import (
 	"slices"
 	"testing"
 
-	osm "simonwaldherr.de/go/osmmini"
+	osm "simonwaldherr.de/go/osmmini/core"
 )
 
 func engineWithPlaceCatalog(t *testing.T, path string) *Engine {

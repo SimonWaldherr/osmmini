@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http/httptest"
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 	"testing"
 )
 

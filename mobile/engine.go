@@ -18,7 +18,7 @@ import (
 	"time"
 
 	tinytiles "github.com/Karte-Bayern/tinyTiles/v2"
-	osm "simonwaldherr.de/go/osmmini"
+	osm "simonwaldherr.de/go/osmmini/core"
 )
 
 const FormatVersion = 4

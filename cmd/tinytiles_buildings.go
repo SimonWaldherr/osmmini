@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 const tinyTilesBuildingMinZoom = 14

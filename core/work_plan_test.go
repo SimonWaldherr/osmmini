@@ -71,7 +71,7 @@ func TestWorkPlanCapacitySkillsPriorityAndDeterminism(t *testing.T) {
 }
 
 func TestWorkPlanNearestAndTerritory(t *testing.T) {
-	s := loadTestStore(t, "delivery", "testdata/territory/delivery-zones.geojson")
+	s := loadTestStore(t, "delivery", "../testdata/territory/delivery-zones.geojson")
 	req := WorkPlanRequest{
 		Resources: []WorkResource{
 			{ID: "near", Location: Coord{48.65, 12.65}, Capacity: 10, Properties: map[string]any{"territory_id": "Zone-2"}},

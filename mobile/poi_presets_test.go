@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	osm "simonwaldherr.de/go/osmmini"
+	osm "simonwaldherr.de/go/osmmini/core"
 )
 
 func TestPOIPresetCategoryRulesDoNotTreatEmergencyVehicleAccessAsAnObject(t *testing.T) {

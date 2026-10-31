@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	osm "simonwaldherr.de/go/osmmini"
+	osm "simonwaldherr.de/go/osmmini/core"
 )
 
 // Prepare map labels and spatial POI postings while the importer already owns

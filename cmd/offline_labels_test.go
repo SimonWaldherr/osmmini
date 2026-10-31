@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 func TestOfflineLabelsWindow(t *testing.T) {

@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 // ---- Route result cache ----

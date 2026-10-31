@@ -6,13 +6,14 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 func main() {
-	pbf := flag.String("pbf", "region.osm.pbf", "Path to OSM PBF")
-	out := flag.String("out", "graph.json", "Output JSON file")
+	pbf := flag.String("pbf", "local/region.osm.pbf", "Path to OSM PBF")
+	out := flag.String("out", "local/graph.json", "Output JSON file")
 	flag.Parse()
 
 	if _, err := os.Stat(*pbf); err != nil {
@@ -59,6 +60,9 @@ func main() {
 		}
 	}
 
+	if err := os.MkdirAll(filepath.Dir(*out), 0o755); err != nil {
+		log.Fatalf("create output directory: %v", err)
+	}
 	outf, err := os.Create(*out)
 	if err != nil {
 		log.Fatalf("create out: %v", err)

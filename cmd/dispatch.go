@@ -14,7 +14,7 @@ import (
 	"strconv"
 	"strings"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 // runDispatchCLI implements territory assignment, manifests and work planning.

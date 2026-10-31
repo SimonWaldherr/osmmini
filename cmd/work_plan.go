@@ -3,7 +3,7 @@ package main
 import (
 	"net/http"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 func (s *server) handleWorkPlan(w http.ResponseWriter, r *http.Request) {

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 // Route export formats. JSON is the regular API response; GPX and GeoJSON

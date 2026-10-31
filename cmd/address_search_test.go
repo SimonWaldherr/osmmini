@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 func TestPreparedAddressIndexPreservesServerResults(t *testing.T) {

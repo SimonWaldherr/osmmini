@@ -8,7 +8,7 @@ import (
 	"sort"
 	"strings"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 // publishPostalTerritories converts tinyTiles' real five-digit postal-boundary

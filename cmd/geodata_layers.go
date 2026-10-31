@@ -10,7 +10,7 @@ import (
 	"regexp"
 	"strings"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 // maxGeodataImportBytes bounds a single GIS file upload. Shapefile ZIPs and

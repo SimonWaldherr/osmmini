@@ -9,12 +9,12 @@ import (
 	"strings"
 	"time"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 func runPBFIndexCLI(args []string) {
 	flags := flag.NewFlagSet("pbf-index", flag.ExitOnError)
-	pbfPath := flags.String("pbf", "region.osm.pbf", "Path to OSM PBF")
+	pbfPath := flags.String("pbf", "local/region.osm.pbf", "Path to OSM PBF")
 	indexPath := flags.String("output", "", "Output index path (default: <pbf base>.idx)")
 	_ = flags.Parse(args)
 

@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 func tspFixture(n int, seed int64) (*server, []stopR, osmmini.RouteOptions) {

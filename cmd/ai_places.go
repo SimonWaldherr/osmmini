@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 	"slices"
 	"strings"
 )

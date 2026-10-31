@@ -8,7 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
-	osmmini "simonwaldherr.de/go/osmmini"
+	osmmini "simonwaldherr.de/go/osmmini/core"
 )
 
 // runGeodataCLI implements `osmmini geodata import`, a standalone (no
@@ -23,8 +23,8 @@ func runGeodataCLI(args []string) {
 	layer := fs.String("layer", "", "layer name (letters, digits, - or _)")
 	input := fs.String("input", "", "source GIS file (GeoJSON, KML, KMZ, or a Shapefile ZIP)")
 	format := fs.String("format", "auto", "auto|geojson|kml|kmz|shp")
-	importedLayersDir := fs.String("imported-layers-dir", "imported-layers", "Directory imported layers are written to")
-	territoriesDir := fs.String("territories-dir", "territories", "Directory polygon-only imported layers are mirrored into (for dispatch/routing-cost lookups)")
+	importedLayersDir := fs.String("imported-layers-dir", "local/imported-layers", "Directory imported layers are written to")
+	territoriesDir := fs.String("territories-dir", "local/territories", "Directory polygon-only imported layers are mirrored into (for dispatch/routing-cost lookups)")
 	fs.Parse(args[1:])
 
 	if *layer == "" || *input == "" {

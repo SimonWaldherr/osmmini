@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	osm "simonwaldherr.de/go/osmmini"
+	osm "simonwaldherr.de/go/osmmini/core"
 )
 
 // Includes integrity checks, graph validation, search/place loading and tile

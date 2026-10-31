@@ -1,7 +1,7 @@
 name: Apple SDK
 on:
   pull_request:
-    paths: ['apple/**', 'bindings/**', 'mobile/**', '*.go', 'cmd/prepare-region/**', 'scripts/**', 'Package.swift', 'Makefile', 'go.mod', 'go.sum', '.github/workflows/apple.yml']
+    paths: ['apple/**', 'bindings/**', 'mobile/**', 'core/**', 'cmd/prepare-region/**', 'scripts/**', 'Package.swift', 'Makefile', 'go.mod', 'go.sum', '.github/workflows/apple.yml']
   workflow_dispatch:
 permissions:
   contents: read
