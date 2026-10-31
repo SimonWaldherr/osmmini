@@ -4218,7 +4218,7 @@ func parseLatLon(raw string) (osmmini.Coord, bool) {
 	if err1 != nil || err2 != nil {
 		return osmmini.Coord{}, false
 	}
-	if lat < -90 || lat > 90 || lon < -180 || lon > 180 {
+	if math.IsNaN(lat) || math.IsNaN(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180 {
 		return osmmini.Coord{}, false
 	}
 	return osmmini.Coord{Lat: lat, Lon: lon}, true

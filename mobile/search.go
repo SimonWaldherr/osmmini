@@ -354,11 +354,28 @@ func readSearchWay(ctx context.Context, r *bufio.Reader, lookup func(int64) (osm
 	if length == 0 || length > maxSearchRecordBytes {
 		return result, fmt.Errorf("invalid temporary search way length")
 	}
-	data := make([]byte, length)
-	if _, err := io.ReadFull(r, data); err != nil {
+	// Most records fit the reader's existing buffer. Decode before discarding
+	// that view; json.Unmarshal owns the strings stored in the result.
+	buffered := int(length) <= r.Size()
+	var data []byte
+	var err error
+	if buffered {
+		data, err = r.Peek(int(length))
+		if err == io.EOF && len(data) > 0 {
+			err = io.ErrUnexpectedEOF
+		}
+	} else {
+		data = make([]byte, length)
+		_, err = io.ReadFull(r, data)
+	}
+	if err != nil {
 		return result, fmt.Errorf("read temporary search way: %w", err)
 	}
-	if err := json.Unmarshal(data, &result); err != nil {
+	err = json.Unmarshal(data, &result)
+	if buffered {
+		_, _ = r.Discard(int(length)) // Peek already confirmed the complete record.
+	}
+	if err != nil {
 		return result, err
 	}
 	var c osm.Coord
@@ -783,15 +800,16 @@ func (s *searchReader) search(ctx context.Context, query string, limit int) ([]S
 		if err != nil {
 			return nil, err
 		}
-		// Normalized words contain only letters/digits and therefore have no
-		// JSON escape sequences. A missing raw word cannot match Text. This
-		// cheap filter avoids decoding every POI for a broad prefix; the full
-		// Text check below retains the established substring semantics.
+		// Our writer emits normalized text directly, so raw bytes usually rule
+		// out nonmatches without decoding. Other valid JSON writers may escape
+		// letters as \uXXXX; decode those records before checking their Text.
 		matches := true
-		for _, word := range words {
-			if !bytes.Contains(b, []byte(word)) {
-				matches = false
-				break
+		if !bytes.ContainsRune(b, '\\') {
+			for _, word := range words {
+				if !bytes.Contains(b, []byte(word)) {
+					matches = false
+					break
+				}
 			}
 		}
 		if !matches {

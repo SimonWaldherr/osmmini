@@ -78,6 +78,10 @@ func Extract(r io.Reader, opts Options, cb Callbacks) error {
 
 // ---- Top-Level PBF Block I/O ----
 
+const maxPBFDecodedBytes = 32 << 20
+const maxPBFEncodedBytes = 64 << 20 // Allow protobuf/compression overhead beyond the decoded limit.
+
+// Returned raw bytes are valid until the next block read with this decoder.
 func readNextBlock(r *bufio.Reader, decoder *pbfBlobDecoder) (typ string, raw []byte, err error) {
 	var lenBuf [4]byte
 	_, err = io.ReadFull(r, lenBuf[:])
@@ -93,7 +97,10 @@ func readNextBlock(r *bufio.Reader, decoder *pbfBlobDecoder) (typ string, raw []
 		return "", nil, fmt.Errorf("invalid BlobHeader size: %d", hdrLen)
 	}
 
-	hdrBytes := make([]byte, hdrLen)
+	if cap(decoder.header) < int(hdrLen) {
+		decoder.header = make([]byte, hdrLen)
+	}
+	hdrBytes := decoder.header[:hdrLen]
 	if _, err := io.ReadFull(r, hdrBytes); err != nil {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
@@ -112,12 +119,14 @@ func readNextBlock(r *bufio.Reader, decoder *pbfBlobDecoder) (typ string, raw []
 		return "", nil, fmt.Errorf("zero datasize")
 	}
 
-	blobBytes := make([]byte, dataSize)
-	if _, err := io.ReadFull(r, blobBytes); err != nil {
-		if err == io.EOF {
-			err = io.ErrUnexpectedEOF
-		}
+	blobBytes, err := decoder.readBlob(r, dataSize)
+	if err != nil {
 		return "", nil, err
+	}
+	// Extensions may use compression that the OSM entity decoder does not
+	// support. Their framing is enough to skip them without interpreting it.
+	if typ != "OSMHeader" && typ != "OSMData" {
+		return typ, nil, nil
 	}
 
 	raw, err = decoder.decode(blobBytes)
@@ -187,10 +196,28 @@ func parseBlobHeader(b []byte) (typ string, datasize int, err error) {
 	return typ, datasize, nil
 }
 
-// Each sequential scan owns its decoder. Reusing zlib's sliding window avoids
-// allocating a new decompressor for every block without retaining it globally.
+// Each sequential scan owns its decoder and framing buffers. No buffers are
+// shared between concurrent imports or retained globally after a scan ends.
 type pbfBlobDecoder struct {
-	reader io.ReadCloser
+	reader  io.ReadCloser
+	header  []byte
+	encoded bytes.Buffer
+}
+
+func (d *pbfBlobDecoder) readBlob(r io.Reader, size int) ([]byte, error) {
+	if size <= 0 || size > maxPBFEncodedBytes {
+		return nil, fmt.Errorf("invalid serialized PBF blob size: %d (limit %d)", size, maxPBFEncodedBytes)
+	}
+	d.encoded.Reset()
+	// Grow from bytes actually read, not an untrusted size declaration. This
+	// also reuses the previous block's capacity for the rest of the scan.
+	if _, err := d.encoded.ReadFrom(io.LimitReader(r, int64(size))); err != nil {
+		return nil, err
+	}
+	if d.encoded.Len() != size {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return d.encoded.Bytes(), nil
 }
 
 func (d *pbfBlobDecoder) close() {
@@ -287,10 +314,16 @@ func (d *pbfBlobDecoder) decode(b []byte) ([]byte, error) {
 	}
 
 	if raw != nil {
+		if len(raw) > maxPBFDecodedBytes {
+			return nil, fmt.Errorf("PBF blob exceeds decoded size limit of %d bytes", maxPBFDecodedBytes)
+		}
 		return raw, nil
 	}
 
 	if zlibData != nil {
+		if rawSize > maxPBFDecodedBytes {
+			return nil, fmt.Errorf("zlib blob size mismatch: size hint exceeds limit of %d bytes", maxPBFDecodedBytes)
+		}
 		compressed := bytes.NewReader(zlibData)
 		if d.reader == nil {
 			var err error
@@ -305,18 +338,22 @@ func (d *pbfBlobDecoder) decode(b []byte) ([]byte, error) {
 
 		var out []byte
 		var err error
-		if rawSize > 0 && rawSize <= 32<<20 {
+		limited := io.LimitReader(zr, maxPBFDecodedBytes+1)
+		if rawSize > 0 {
 			// PBF supplies the decoded size. Leave ReadFrom one read's spare
 			// capacity so checking EOF does not grow an exactly full buffer.
-			// Larger or missing hints retain the streaming fallback.
+			// Missing size hints use the same bounded streaming fallback.
 			buf := bytes.NewBuffer(make([]byte, 0, rawSize+bytes.MinRead))
-			_, err = buf.ReadFrom(zr)
+			_, err = buf.ReadFrom(limited)
 			out = buf.Bytes()
 		} else {
-			out, err = io.ReadAll(zr)
+			out, err = io.ReadAll(limited)
 		}
 		if err != nil {
 			return nil, err
+		}
+		if len(out) > maxPBFDecodedBytes {
+			return nil, fmt.Errorf("PBF blob exceeds decoded size limit of %d bytes", maxPBFDecodedBytes)
 		}
 
 		if rawSize > 0 && len(out) != rawSize {

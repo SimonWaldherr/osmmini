@@ -41,8 +41,9 @@ make run
 ```
 
 Open <http://localhost:8080/>. Routing and search become available after the graph
-loads. In **Einstellungen → Offline-Karte erzeugen**, build the local basemap
-once; subsequent use needs no network connection.
+loads. In **Karten → Offline**, choose **Offline-Karte erzeugen** to prepare the
+local basemap once. Subsequent use needs no network connection. If the basemap
+is missing, the map also offers **Karte vorbereiten** directly.
 
 Use `make run PBF=/path/to/region.osm.pbf` for an existing extract.
 `go run ./cmd help` lists commands and flags.
@@ -167,7 +168,20 @@ go run ./cmd region-extract -pbf local/germany-latest.osm.pbf \
 ```
 
 `go run ./cmd pbf-index -pbf local/germany-latest.osm.pbf` creates a reusable block index.
-The index is invalidated when its source changes.
+Reuse checks compare the source size and modification time. Rebuild the index
+if you replace the PBF while preserving both; the recorded SHA-256 identifies
+the indexed bytes but is not recomputed for each freshness check.
+
+Keep the input PBF unchanged while indexing. A failed build leaves an existing
+index intact. The reader reuses encoded-block buffers and rejects truncated
+blocks, decoded payloads above 32 MiB and serialized blobs above 64 MiB. The
+decoded limit follows the [OSM PBF format](https://wiki.openstreetmap.org/wiki/PBF_Format#File_format);
+the serialized limit leaves room for compression and protobuf overhead. These
+limits apply to individual blocks, not to the size of the complete region.
+
+The coordinate-only `go run ./cmd route` and `go run ./cmd/export-graph` tools
+omit the address-search catalog during import. The server still builds it for
+address and POI queries.
 
 ## Configuration
 
@@ -240,6 +254,16 @@ make test-js       # Browser tests
 `make check` requires Go and Node.js and downloads pinned MapLibre assets if
 missing. Browser tests use local fixtures. Benchmarks are included in the Go
 and Swift test suites; see the Apple guide for opt-in real-region checks.
+
+Targeted import benchmarks use generated fixtures and do not download maps:
+
+```sh
+go test ./core -run '^$' -bench '^BenchmarkPBFSpatialIndexBlocks$' -benchmem
+go test ./mobile -run '^$' -bench '^BenchmarkReadSearchWay$' -benchmem
+```
+
+These report individual decoding/indexing costs, not total import time or peak
+application memory. Use a representative PBF to assess end-to-end performance.
 
 The repository uses these top-level directories:
 

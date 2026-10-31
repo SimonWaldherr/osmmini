@@ -1,6 +1,4 @@
-// Optimized App JS with preloaded settings
-
-// Load settings from inline script (server-rendered)
+// Read server-rendered settings before initializing the map.
 let preloadedSettings = null;
 try {
   const settingsEl = document.getElementById('initialSettings');

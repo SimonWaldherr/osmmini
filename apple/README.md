@@ -26,7 +26,7 @@ For device signing, create the ignored local configuration from the template
 if it does not exist, then replace `YOUR_TEAM_ID`:
 
 ```sh
-cp apple/Demo/Configuration/Signing.local.xcconfig.example apple/Demo/Configuration/Signing.local.xcconfig
+cp -n apple/Demo/Configuration/Signing.local.xcconfig.example apple/Demo/Configuration/Signing.local.xcconfig
 ```
 
 Edit an existing local configuration directly. Simulator and unsigned builds
@@ -51,6 +51,12 @@ before an iOS build. No Go installation is needed on the destination device.
 3. Search for a place or select a map position, then choose **Als Start** or
    **Route hierher**. The latter requests your location when no start is set.
    Plan a route by distance or duration and export GPX/GeoJSON.
+
+In the route planner, tap **Start** or **Ziel** to open search directly. The
+adjacent **…** menu also offers a map point or your location. **Kürzeste** and
+**Schnellste** switch the objective; at accessibility text sizes these choices
+use a menu. If a search finds no places, **Andere Offline-Karte öffnen** returns
+to the region list.
 
 Each source has its own cached catalog, available offline after loading. The
 OpenStreetMap France catalog uses the polygon list from its
@@ -304,6 +310,11 @@ additional temporary disk space; completion and cancellation remove the files,
 and resumed imports discard abandoned scratch data. The upstream tinyTiles
 geometry generator still retains region-wide structures before artifact
 writing, so `TileMemoryBytes` is not a cap on that generation phase.
+
+Temporary way records normally decode from the existing reader buffer. Larger
+records use a separate allocation, and decoded strings remain valid after buffer
+reuse. The published region and search-index formats are unchanged. See the
+[targeted import benchmarks](../README.md#development) for reproducible checks.
 
 ## Rendering and scope
 

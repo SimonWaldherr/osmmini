@@ -14,9 +14,8 @@ import (
 // runRouteCLI implements the standalone `osmmini route` subcommand. It
 // builds a router directly from a PBF (the same way cmd/export-graph does)
 // rather than talking to a running server, and optionally reports
-// territory-layer transitions along the computed path. It is kept separate
-// from the HTTP /api/v1/route handler in main.go -- wiring territory events
-// into that JSON API too is a small, separate follow-up.
+// territory-layer transitions along the computed path. Coordinates are resolved
+// directly; no address-search catalog is needed for this command.
 func runRouteCLI(args []string) {
 	fs := flag.NewFlagSet("route", flag.ExitOnError)
 	pbf := fs.String("pbf", "local/region.osm.pbf", "path to OSM PBF")
@@ -35,6 +34,9 @@ func runRouteCLI(args []string) {
 	}
 	if *territoryEvents && *format != routeFormatJSON {
 		log.Fatalf("route: --territory-events requires --format json")
+	}
+	if *territoryEvents && *territoryLayer == "" {
+		log.Fatalf("route: --territory-events requires --territory-layer")
 	}
 
 	if *from == "" || *to == "" {
@@ -65,7 +67,7 @@ func runRouteCLI(args []string) {
 		log.Fatalf("route: pbf file not found: %v", err)
 	}
 	log.Printf("Building router from PBF %s (this may take a while)...", *pbf)
-	router, _, err := osmmini.BuildRouterWithAddressesOptions(*pbf, osmmini.BuildOptions{})
+	router, _, err := osmmini.BuildRouterWithAddressesOptions(*pbf, osmmini.BuildOptions{SkipAddresses: true})
 	if err != nil {
 		log.Fatalf("route: build router: %v", err)
 	}
@@ -113,9 +115,6 @@ func runRouteCLI(args []string) {
 		"path":       res.PathCoords,
 	}
 	if *territoryEvents {
-		if store == nil {
-			log.Fatalf("route: --territory-events requires --territory-layer")
-		}
 		out["territories"] = osmmini.TerritoryEventsForPath(store, *territoryLayer, res.PathCoords)
 	}
 

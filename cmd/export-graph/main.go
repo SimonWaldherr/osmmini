@@ -21,7 +21,7 @@ func main() {
 	}
 
 	log.Printf("Building router from PBF %s (this may take a while)...", *pbf)
-	r, _, err := osmmini.BuildRouterWithAddressesOptions(*pbf, osmmini.BuildOptions{})
+	r, _, err := osmmini.BuildRouterWithAddressesOptions(*pbf, osmmini.BuildOptions{SkipAddresses: true})
 	if err != nil {
 		log.Fatalf("build router: %v", err)
 	}

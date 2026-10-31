@@ -63,8 +63,8 @@ type PBFSourceFingerprint struct {
 	SHA256          string `json:"sha256"`
 }
 
-// PBFSpatialIndex is a compact, disk-backed locator for node-bearing PBF
-// blocks. It intentionally does not copy OSM entities: range queries return
+// PBFSpatialIndex is an in-memory directory of node-bearing PBF blocks,
+// persisted as JSON. It does not copy OSM entities: range queries return
 // byte ranges that a later streaming extractor can seek and decode.
 type PBFSpatialIndex struct {
 	FormatVersion int                  `json:"format_version"`
@@ -83,8 +83,8 @@ type PBFSpatialIndexProgress struct {
 }
 
 // BuildPBFSpatialIndex streams pbfPath once and atomically publishes an
-// index at indexPath. It holds at most one decoded PBF blob plus the compact
-// block directory in memory; the source PBF is never loaded wholesale.
+// index at indexPath. Encoded-block buffers are reused; decoded blocks are
+// consumed one at a time alongside the compact directory of block bounds.
 func BuildPBFSpatialIndex(ctx context.Context, pbfPath, indexPath string, progress func(PBFSpatialIndexProgress)) (*PBFSpatialIndex, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -99,18 +99,35 @@ func BuildPBFSpatialIndex(ctx context.Context, pbfPath, indexPath string, progre
 	if indexPath == "" {
 		indexPath = PBFSpatialIndexPath(pbfPath)
 	}
+	if target, err := os.Stat(indexPath); err == nil {
+		if os.SameFile(info, target) {
+			return nil, fmt.Errorf("index output must not replace the source PBF")
+		}
+		if target.IsDir() {
+			return nil, fmt.Errorf("index output is a directory")
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("stat index output: %w", err)
+	}
 	file, err := os.Open(pbfPath)
 	if err != nil {
 		return nil, fmt.Errorf("open PBF: %w", err)
 	}
 	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat open PBF: %w", err)
+	}
+	if !os.SameFile(info, opened) || info.Size() != opened.Size() || !info.ModTime().Equal(opened.ModTime()) {
+		return nil, fmt.Errorf("PBF changed while opening")
+	}
 
 	hash := sha256.New()
+	source := io.TeeReader(file, hash)
 	readExact := func(buf []byte) error {
-		if _, err := io.ReadFull(file, buf); err != nil {
+		if _, err := io.ReadFull(source, buf); err != nil {
 			return err
 		}
-		_, _ = hash.Write(buf)
 		return nil
 	}
 	index := &PBFSpatialIndex{
@@ -144,7 +161,10 @@ func BuildPBFSpatialIndex(ctx context.Context, pbfPath, indexPath string, progre
 		if headerLength == 0 || headerLength > 64<<10 {
 			return nil, fmt.Errorf("invalid PBF BlobHeader size %d at byte %d", headerLength, offset)
 		}
-		header := make([]byte, headerLength)
+		if cap(decoder.header) < int(headerLength) {
+			decoder.header = make([]byte, headerLength)
+		}
+		header := decoder.header[:headerLength]
 		if err := readExact(header); err != nil {
 			return nil, fmt.Errorf("read PBF BlobHeader at byte %d: %w", offset, err)
 		}
@@ -156,8 +176,11 @@ func BuildPBFSpatialIndex(ctx context.Context, pbfPath, indexPath string, progre
 		if dataSize <= 0 {
 			return nil, fmt.Errorf("invalid PBF blob size %d at byte %d", dataSize, offset)
 		}
-		blob := make([]byte, dataSize)
-		if err := readExact(blob); err != nil {
+		if int64(dataSize) > info.Size()-bytesRead {
+			return nil, fmt.Errorf("read PBF blob at byte %d: %w", offset, io.ErrUnexpectedEOF)
+		}
+		blob, err := decoder.readBlob(source, dataSize)
+		if err != nil {
 			return nil, fmt.Errorf("read PBF blob at byte %d: %w", offset, err)
 		}
 		bytesRead += int64(len(blob))
@@ -167,7 +190,7 @@ func BuildPBFSpatialIndex(ctx context.Context, pbfPath, indexPath string, progre
 			if err != nil {
 				return nil, fmt.Errorf("decode PBF blob at byte %d: %w", offset, err)
 			}
-			bounds, nodes, err := pbfBlockNodeBounds(raw)
+			bounds, nodes, err := pbfBlockNodeBounds(ctx, raw)
 			if err != nil {
 				return nil, fmt.Errorf("index PBF blob at byte %d: %w", offset, err)
 			}
@@ -184,6 +207,13 @@ func BuildPBFSpatialIndex(ctx context.Context, pbfPath, indexPath string, progre
 	if bytesRead != info.Size() {
 		return nil, fmt.Errorf("PBF changed while indexing: read %d of %d bytes", bytesRead, info.Size())
 	}
+	current, err := os.Stat(pbfPath)
+	if err != nil {
+		return nil, fmt.Errorf("stat indexed PBF: %w", err)
+	}
+	if !os.SameFile(info, current) || current.Size() != info.Size() || !current.ModTime().Equal(info.ModTime()) {
+		return nil, fmt.Errorf("PBF changed while indexing")
+	}
 	index.Source.SHA256 = hex.EncodeToString(hash.Sum(nil))
 	if err := writePBFSpatialIndex(indexPath, index); err != nil {
 		return nil, err
@@ -191,10 +221,13 @@ func BuildPBFSpatialIndex(ctx context.Context, pbfPath, indexPath string, progre
 	return index, nil
 }
 
-func pbfBlockNodeBounds(raw []byte) (PBFBlockBounds, int64, error) {
+func pbfBlockNodeBounds(ctx context.Context, raw []byte) (PBFBlockBounds, int64, error) {
+	if err := ctx.Err(); err != nil {
+		return PBFBlockBounds{}, 0, err
+	}
 	bounds := PBFBlockBounds{MinLat: math.Inf(1), MaxLat: math.Inf(-1), MinLon: math.Inf(1), MaxLon: math.Inf(-1)}
 	var count int64
-	err := processOSMData(raw, false, true, false, false, false, false, Options{}, Callbacks{
+	err := processOSMData(raw, false, true, false, false, false, false, Options{Context: ctx}, Callbacks{
 		Node: func(_ int64, lat, lon float64) error {
 			bounds.MinLat = min(bounds.MinLat, lat)
 			bounds.MaxLat = max(bounds.MaxLat, lat)
