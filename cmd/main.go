@@ -4176,6 +4176,23 @@ func (s *server) resolveLocation(loc Location) (osmmini.Coord, string, string, e
 		}
 		return addr.Coord, formatAddressLabel(addr.Tags), raw, nil
 	}
+	if q.Housenumber != "" || q.Postcode != "" || q.City != "" {
+		// Suggestions deliberately include partial address matches. They must
+		// not bypass FindBestAddress's checks through the single-result or
+		// street-centre fallback when a requested address field disagrees.
+		suggestions := s.buildLocationSuggestions(raw, 6)
+		message := "Adresse nicht gefunden"
+		if len(suggestions) > 0 {
+			message = "Adresse nicht eindeutig gefunden, bitte auswählen"
+		}
+		return osmmini.Coord{}, "", "", &locationResolveError{
+			Message:     message,
+			Query:       raw,
+			Ambiguous:   len(suggestions) > 1,
+			Suggestions: suggestions,
+		}
+	}
+
 	if q.Street != "" {
 		if nodeID, okStreet := s.router.StreetNode(q.Street); okStreet {
 			c, _ := s.router.Coord(nodeID)

@@ -91,6 +91,12 @@ Search for an address, POI or coordinate, or select a point on the map. Set rout
 endpoints, add stops, and enable **Reihenfolge optimieren** to optimise a trip.
 Routes can be fitted, cleared or exported as GPX/GeoJSON.
 
+Address queries accept `Lange Gasse 12a, 80331 München` or
+`Lange Gasse 12a München`. Multiword street and town names stay intact. The
+suggestion list can include partial matches; automatic route resolution requires
+the requested house number and locality to agree. If an address cannot be
+resolved, choose a suggestion explicitly or select a point on the map.
+
 The GIS tools support POI export, distance measurement and local layers.
 OSM-Edit keeps drafts in the browser, supports undo/redo, and exports changes
 for review in an OSM editor. Confidential objects stay on the server and require
@@ -183,6 +189,58 @@ The coordinate-only `go run ./cmd route` and `go run ./cmd/export-graph` tools
 omit the address-search catalog during import. The server still builds it for
 address and POI queries.
 
+## WebAssembly
+
+Build the standalone browser router and export a road graph:
+
+```sh
+make build-wasm
+go run ./cmd/export-graph -pbf local/region.osm.pbf -out local/graph.json
+```
+
+Serve the four files in `local/wasm/` together with the exported graph over HTTP.
+The generated `wasm_exec.js` matches the Go compiler used for the build. The
+worker uses streaming compilation with `application/wasm`; other MIME types
+fall back to an ArrayBuffer load.
+
+```js
+import { createRouter } from './wasm/client.mjs';
+
+const router = await createRouter({ graphURL: './graph.json' });
+const result = await router.route(48.001, 12.001, 48.003, 12.003);
+// result.path contains {lat, lon}; distance_m and duration_s describe the route.
+router.dispose();
+```
+
+Graph import and routing run in a dedicated worker. Calls return promises;
+errors reject them. Pass an AbortSignal as `signal` to cancel loading or later
+work, or call `dispose()` after loading. Both terminate the worker and release
+its heap. The graph stays in memory, so select an extract sized for the target
+device. The server-backed web UI uses its existing routing endpoint.
+
+Direct callers can still use `osmInit(jsonString)` and
+`osmRoute(lat1, lon1, lat2, lon2, engine, objective)`. Initialization also accepts
+UTF-8 JSON in a Uint8Array. `osmReset()` releases the current Go graph for reuse
+of its heap; WASM linear memory does not necessarily shrink. Invalid graph
+replacements leave the previous router available. Graph records require numeric
+coordinates and distances; duplicate node IDs and dangling edges are rejected.
+OSM IDs are decoded as int64, including IDs beyond JavaScript's safe integer
+range. Preserve those IDs in the JSON bytes instead of parsing and reserializing
+them as JavaScript numbers.
+
+Run `make test-wasm` for real-module and worker integration tests. Optional
+measurements use synthetic fixtures:
+
+```sh
+go test ./cmd/wasm/internal/graphjson -run '^$' -bench BenchmarkGraphRead -benchmem
+node cmd/wasm/tests/benchmark.cjs
+```
+
+The graph benchmark compares allocated Go bytes and decoding time. Streaming
+avoids flat node/edge arrays but may take longer to decode; these measurements
+are separate from browser peak memory and worker startup/download latency. The
+Node benchmark measures WASM import and routing including the JS result bridge.
+
 ## Configuration
 
 [settings.json](config/settings.json) contains routing defaults, map sources, optional
@@ -245,7 +303,7 @@ source hashes identify the input snapshot, not its freshness.
 ## Development
 
 ```sh
-make check         # Go tests, vet, build and browser checks
+make check         # Go tests, vet, builds, browser and WASM checks
 make test-race     # Go race detector
 make check-mobile  # Offline library without SQLite/cgo
 make test-js       # Browser tests
@@ -255,15 +313,19 @@ make test-js       # Browser tests
 missing. Browser tests use local fixtures. Benchmarks are included in the Go
 and Swift test suites; see the Apple guide for opt-in real-region checks.
 
-Targeted import benchmarks use generated fixtures and do not download maps:
+Targeted import and search benchmarks use generated fixtures and do not download
+maps:
 
 ```sh
 go test ./core -run '^$' -bench '^BenchmarkPBFSpatialIndexBlocks$' -benchmem
 go test ./mobile -run '^$' -bench '^BenchmarkReadSearchWay$' -benchmem
+go test ./core -run '^$' -bench '^BenchmarkAddressIndexSearch$' -benchmem
+go test ./mobile -run '^$' -bench '^BenchmarkMobileSearchDuplicatePrefixes$' -benchmem
 ```
 
-These report individual decoding/indexing costs, not total import time or peak
-application memory. Use a representative PBF to assess end-to-end performance.
+These report individual decoding, indexing and query costs, not total import
+time or peak application memory. Use a representative PBF to assess end-to-end
+performance.
 
 The repository uses these top-level directories:
 

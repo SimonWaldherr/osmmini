@@ -28,3 +28,28 @@ func TestPreparedAddressIndexPreservesServerResults(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveLocationDoesNotReplaceMissingHouseWithSuggestion(t *testing.T) {
+	entries := []osmmini.AddressEntry{
+		{ID: 1, Coord: osmmini.Coord{Lat: 48, Lon: 12}, Tags: osmmini.Tags{"addr:street": "Hauptstraße", "addr:housenumber": "7", "addr:city": "München"}},
+	}
+	for _, indexed := range []bool{false, true} {
+		s := &server{router: &osmmini.Router{}, addrs: entries}
+		if indexed {
+			s.addressIndex = osmmini.NewAddressIndex(entries)
+		}
+		for _, query := range []string{"Hauptstraße 5, München", "Hauptstraße 7, Bonn", "Hauptstraße, Bonn", "Hauptstraße, 99999 München"} {
+			if _, _, _, err := s.resolveLocation(Location{Query: query}); err == nil {
+				t.Fatalf("indexed=%v: %q silently resolved to another address", indexed, query)
+			}
+		}
+		got, _, _, err := s.resolveLocation(Location{Query: "Hauptstraße 7, München"})
+		if err != nil || got != entries[0].Coord {
+			t.Fatalf("indexed=%v: exact house = %+v, %v", indexed, got, err)
+		}
+		// Suggestions remain available when the caller must choose a place.
+		if got := s.searchLocationResults("Hauptstraße 5, München", 10); len(got) != 1 {
+			t.Fatalf("suggestions = %+v", got)
+		}
+	}
+}

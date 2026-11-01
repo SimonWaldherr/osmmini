@@ -105,7 +105,7 @@ vet: ## Run Go static analysis.
 fmt: ## Format all Go packages.
 	$(GO) fmt ./...
 
-check: test vet build check-js test-js check-layout ## Run Go, browser and repository layout checks (requires Node.js).
+check: test vet build check-js test-js check-layout test-wasm ## Run Go, browser, WASM and repository layout checks (requires Node.js).
 
 check-layout: ## Ensure the repository root has at most twenty entries, including hidden files.
 	bash scripts/check-layout.sh
@@ -117,6 +117,8 @@ check-js: ## Validate the browser JavaScript syntax (requires Node.js).
 	node --check cmd/web/app.js
 	node --check cmd/web/map-renderer.js
 	node --check cmd/web/offline-style.js
+	node --check cmd/wasm/client.mjs
+	node --check cmd/wasm/worker.js
 
 .PHONY: build-apple build-apple-macos test-apple check-mobile
 build-apple: ## Build the Swift XCFramework for iPhone, Simulator and Mac (requires Xcode).
@@ -135,3 +137,14 @@ check-mobile: ## Test the offline Go library without SQLite or cgo.
 
 clean: ## Remove compiled binaries from BIN_DIR; retain downloaded and prepared maps.
 	rm -rf "$(BIN_DIR)"
+
+WASM_DIR ?= local/wasm
+.PHONY: build-wasm test-wasm
+build-wasm: ## Build the browser router, matching Go runtime and worker client.
+	@mkdir -p "$(WASM_DIR)"
+	GOOS=js GOARCH=wasm $(GO) build -trimpath -ldflags="-s -w" -o "$(WASM_DIR)/osmmini.wasm" ./cmd/wasm
+	cp "$$($(GO) env GOROOT)/lib/wasm/wasm_exec.js" "$(WASM_DIR)/wasm_exec.js"
+	cp cmd/wasm/client.mjs cmd/wasm/worker.js "$(WASM_DIR)/"
+
+test-wasm: build-wasm ## Exercise the real WASM module and worker using Node.js.
+	OSMMINI_WASM_DIR="$(WASM_DIR)" node --test cmd/wasm/tests/*.test.cjs

@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // Sentinel routing errors. Callers (e.g. the HTTP API) can match these with
@@ -963,90 +965,97 @@ type AddressQuery struct {
 	Raw         string
 }
 
+// ParseAddressGuess recognizes a street/house number followed by an optional
+// comma or German five-digit postcode and locality. Raw is retained for POI
+// matching: free-form names cannot always be distinguished from addresses.
 func ParseAddressGuess(raw string) AddressQuery {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return AddressQuery{}
 	}
 	q := AddressQuery{Raw: raw}
-	if parts := strings.SplitN(raw, ",", 2); len(parts) == 2 {
-		q.Street = strings.TrimSpace(parts[0])
-		q.City = strings.TrimSpace(parts[1])
-	}
-	fields := strings.Fields(addressSeparators.Replace(raw))
-	for _, f := range fields {
+	street, locality, comma := strings.Cut(raw, ",")
+	fields := strings.Fields(addressSeparators.Replace(street))
+	// A postcode gives an unambiguous boundary even without a comma. Keep
+	// multiword street and city names together instead of moving the last
+	// street word into the city field.
+	for i, f := range fields {
 		if len(f) == 5 && allDigits(f) {
 			q.Postcode = f
+			q.City = strings.Join(fields[i+1:], " ")
+			fields = fields[:i]
+			break
+		}
+	}
+	if comma {
+		city := strings.Fields(addressSeparators.Replace(locality))
+		if len(city) > 0 && len(city[0]) == 5 && allDigits(city[0]) {
+			q.Postcode = city[0]
+			city = city[1:]
+		}
+		q.City = strings.Join(city, " ")
+	}
+	for i := len(fields) - 1; i >= 0; i-- {
+		if !isHouseNumberToken(fields[i]) {
 			continue
 		}
-		if hasDigit(f) && q.Housenumber == "" {
-			q.Housenumber = f
-			continue
+		q.Housenumber = fields[i]
+		if i == 0 && len(fields) > 1 {
+			// Also accept number-first input without discarding the street.
+			fields = fields[1:]
+		} else {
+			if !comma && q.City == "" {
+				q.City = strings.Join(fields[i+1:], " ")
+			}
+			fields = fields[:i]
 		}
+		break
 	}
-
-	streetParts := []string{}
-	cityParts := []string{}
-	seenPostcode := false
-	for _, f := range fields {
-		switch {
-		case len(f) == 5 && allDigits(f):
-			seenPostcode = true
-		case !seenPostcode:
-			streetParts = append(streetParts, f)
-		default:
-			cityParts = append(cityParts, f)
-		}
-	}
-
-	cleanedStreet := []string{}
-	for _, f := range streetParts {
-		if q.Housenumber != "" && f == q.Housenumber {
-			continue
-		}
-		cleanedStreet = append(cleanedStreet, f)
-	}
-
-	if q.Street != "" || q.City != "" {
-		// Comma-separated input already gave us a strong street/city split, so it
-		// intentionally wins over the looser token-based fallback below.
-		return q
-	}
-
-	if q.City == "" && len(cityParts) == 0 && len(cleanedStreet) > 1 && (q.Housenumber != "" || q.Postcode != "") {
-		q.City = cleanedStreet[len(cleanedStreet)-1]
-		cleanedStreet = cleanedStreet[:len(cleanedStreet)-1]
-	}
-
-	q.Street = strings.TrimSpace(strings.Join(cleanedStreet, " "))
-	q.City = strings.TrimSpace(strings.Join(cityParts, " "))
+	q.Street = strings.Join(fields, " ")
 	return q
 }
 
-func FindBestAddress(entries []AddressEntry, q AddressQuery) (AddressEntry, bool) {
-	var best AddressEntry
-	bestScore := -1
-	query := normalizeAddressQuery(q)
-	for _, e := range entries {
-		score := matchScoreNormalized(e, query)
-		if score > bestScore {
-			bestScore = score
-			best = e
+// Ordinals (17.) and road numbers (B12) belong to the street/name. Accept
+// numeric house numbers with letter suffixes and ranges such as 12a or 12/1.
+func isHouseNumberToken(s string) bool {
+	i := 0
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	if i == 0 {
+		return false
+	}
+	if i < len(s) && (s[i] == '/' || s[i] == '-') {
+		i++
+		start := i
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			i++
+		}
+		if i == start {
+			return false
 		}
 	}
-	if bestScore <= 0 {
-		return AddressEntry{}, false
+	for _, r := range s[i:] {
+		if !unicode.IsLetter(r) {
+			return false
+		}
 	}
-	// A house number alone is never a safe destination. In a regional extract
-	// there can be hundreds of identical numbers, and choosing the first one
-	// silently can send a route to a completely different town. A valid match
-	// with a house number must also match at least one other address or POI
-	// field (street, city, name, brand, ...).
-	const houseNumberOnlyScore = 4
-	if query.housenumber != "" && bestScore <= houseNumberOnlyScore {
-		return AddressEntry{}, false
+	return true
+}
+
+// FindBestAddress resolves a destination rather than a suggestion. Explicit
+// address fields must agree; SearchAddresses can still offer partial matches.
+func FindBestAddress(entries []AddressEntry, q AddressQuery) (AddressEntry, bool) {
+	query := normalizeAddressQuery(q)
+	var best AddressEntry
+	bestScore := 0
+	for _, e := range entries {
+		score := normalizedAddressFieldsFromTags(e.Tags, query).destinationScore(query)
+		if score > bestScore || score > 0 && score == bestScore && e.ID < best.ID {
+			bestScore, best = score, e
+		}
 	}
-	return best, true
+	return best, bestScore > 0
 }
 
 func matchScore(e AddressEntry, q AddressQuery) int {
@@ -1055,15 +1064,24 @@ func matchScore(e AddressEntry, q AddressQuery) int {
 
 type normalizedAddressQuery struct {
 	street, housenumber, postcode, city, raw string
+	guessed                                  bool
 }
 
 func normalizeAddressQuery(q AddressQuery) normalizedAddressQuery {
+	// Only fields produced by the free-form parser may be disregarded for an
+	// exact numeric name. Structured callers' explicit fields stay mandatory.
+	guessed := false
+	if q.Raw != "" && (q.Housenumber != "" || q.Postcode != "" || q.City != "") {
+		parsed := ParseAddressGuess(q.Raw)
+		guessed = q.Street == parsed.Street && q.Housenumber == parsed.Housenumber && q.Postcode == parsed.Postcode && q.City == parsed.City
+	}
 	return normalizedAddressQuery{
 		street:      normalize(q.Street),
 		housenumber: normalize(q.Housenumber),
 		postcode:    normalize(q.Postcode),
 		city:        normalize(q.City),
 		raw:         normalize(strings.TrimSpace(q.Raw)),
+		guessed:     guessed,
 	}
 }
 
@@ -1085,8 +1103,8 @@ func SearchAddresses(entries []AddressEntry, q AddressQuery, limit int) []Addres
 
 func searchAddressEntries(entries []AddressEntry, query normalizedAddressQuery, limit int, score func(int, normalizedAddressQuery) int) []AddressEntry {
 	type scored struct {
-		e AddressEntry
-		s int
+		index int
+		s     int
 	}
 	if limit <= 0 || limit > len(entries) {
 		limit = len(entries)
@@ -1097,18 +1115,19 @@ func searchAddressEntries(entries []AddressEntry, query normalizedAddressQuery, 
 	// Address search runs on every type-ahead request. Keep a bounded ordered
 	// result set instead of allocating and sorting every matching address.
 	// With the UI's small limits this has the same ranking at a fraction of
-	// the work for a large regional address index.
+	// the work for a large regional address index. Store only catalog offsets
+	// while ranking; copy entry metadata once for the selected results.
 	sc := make([]scored, 0, limit)
 	allResults := limit == len(entries)
 	better := func(a, b scored) bool {
-		return a.s > b.s || (a.s == b.s && a.e.ID < b.e.ID)
+		return a.s > b.s || (a.s == b.s && entries[a.index].ID < entries[b.index].ID)
 	}
-	for i, e := range entries {
+	for i := range entries {
 		s := score(i, query)
 		if s <= 0 {
 			continue
 		}
-		candidate := scored{e: e, s: s}
+		candidate := scored{index: i, s: s}
 		if allResults {
 			sc = append(sc, candidate)
 			continue
@@ -1141,7 +1160,7 @@ func searchAddressEntries(entries []AddressEntry, query normalizedAddressQuery, 
 	}
 	res := make([]AddressEntry, len(sc))
 	for i := range sc {
-		res[i] = sc[i].e
+		res[i] = entries[sc[i].index]
 	}
 	return res
 }
@@ -2473,7 +2492,7 @@ func normalize(s string) string {
 	// string, a Replacer result and a rune slice for every indexed field.
 	clean := true
 	for _, r := range s {
-		if r >= 'A' && r <= 'Z' || r == ' ' || r == '-' || r == ',' || r == '.' || r == ';' || r == ':' || r > 127 {
+		if r >= 'A' && r <= 'Z' || r == ' ' || r >= '\t' && r <= '\r' || r == '-' || r == ',' || r == '.' || r == ';' || r == ':' || r > 127 {
 			clean = false
 			break
 		}
@@ -2481,12 +2500,15 @@ func normalize(s string) string {
 	if clean {
 		return s
 	}
+	// Apple input and OSM strings may use different Unicode compositions.
+	// Compose combining accents before applying the existing search folding.
+	s = norm.NFC.String(s)
 	var out strings.Builder
 	out.Grow(len(s))
 	for _, r := range s {
 		r = unicode.ToLower(r)
 		switch r {
-		case ' ', '-', ',', '.', ';', ':':
+		case ' ', '\t', '\n', '\r', '\v', '\f', '-', ',', '.', ';', ':':
 			continue
 		case 'ß':
 			out.WriteString("ss")
@@ -2497,7 +2519,9 @@ func normalize(s string) string {
 		case 'ü':
 			out.WriteString("ue")
 		default:
-			out.WriteRune(r)
+			if !unicode.IsSpace(r) {
+				out.WriteRune(r)
+			}
 		}
 	}
 	return out.String()
@@ -2510,15 +2534,6 @@ func allDigits(s string) bool {
 		}
 	}
 	return len(s) > 0
-}
-
-func hasDigit(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] >= '0' && s[i] <= '9' {
-			return true
-		}
-	}
-	return false
 }
 
 // haversineMeters returns the great-circle distance in meters.

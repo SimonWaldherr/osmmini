@@ -154,3 +154,31 @@ func TestRealRegionSearchResults(t *testing.T) {
 		}
 	}
 }
+
+// Prefixes can reach one record through many different terms. The second word
+// occurs in JSON field names, but not in the searchable text, forcing decoding.
+func BenchmarkMobileSearchDuplicatePrefixes(b *testing.B) {
+	results := make([]SearchResult, 512)
+	for i := range results {
+		results[i] = SearchResult{ID: int64(i + 1), Kind: "node", Label: "cafe cafeteria cake camel camera camp canal candy"}
+	}
+	path := writeSearchCatalog(b, results)
+	compact := compactSearchCatalog(b, path)
+	for _, scenario := range []struct{ name, path string }{{"legacy", path}, {"compact", compact}, {"compressed", compressedSearchCatalog(b, compact)}} {
+		b.Run(scenario.name, func(b *testing.B) {
+			reader, err := openSearch(scenario.path)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer reader.close()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				got, err := reader.search(context.Background(), "ca x", 20)
+				if err != nil || len(got) != 0 {
+					b.Fatalf("results = %v, %v", got, err)
+				}
+			}
+		})
+	}
+}

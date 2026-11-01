@@ -28,6 +28,8 @@ import Testing
   let engine = try await OfflineEngine.open(destination)
   let results = try await engine.search("cafe")
   #expect(results.contains { $0.label.contains("Café") })
+  let decomposedResults = try await engine.search("Cafe\u{301}")
+  #expect(decomposedResults.map(\.identity) == results.map(\.identity))
   let cafe = try #require(results.first { $0.category == "cafe" })
   #expect(cafe.details?.address?.isEmpty == false)
   let route = try await engine.route(

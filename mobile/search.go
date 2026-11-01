@@ -17,6 +17,8 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"golang.org/x/text/unicode/norm"
+
 	osm "simonwaldherr.de/go/osmmini/core"
 )
 
@@ -53,6 +55,9 @@ func normalized(s string) string {
 	if clean {
 		return s
 	}
+	// Apple input and OSM strings may use different Unicode compositions.
+	// Compose combining accents before applying the existing search folding.
+	s = norm.NFC.String(s)
 	var out strings.Builder
 	out.Grow(len(s))
 	separator := false
@@ -748,13 +753,33 @@ func openSearch(path string) (*searchReader, error) {
 	return reader, nil
 }
 func (s *searchReader) close() { s.data.Close(); s.index.Close() }
-func (s *searchReader) search(ctx context.Context, query string, limit int) ([]SearchResult, error) {
-	aliases := map[string]string{"apotheke": "pharmacy", "tankstelle": "fuel", "krankenhaus": "hospital", "supermarkt": "supermarket", "feuerwehr": "fire_station"}
-	query = normalized(query)
-	if alias := aliases[query]; alias != "" {
-		query = normalized(alias)
+
+// Translate whole category words, including those in a locality query. The
+// catalog already indexes normalized category names, so existing regions need
+// no rebuild. Prefixes and longer words (Apothekenstraße) stay unchanged.
+func searchQueryWords(query string) []string {
+	words := strings.Fields(normalized(query))
+	for i, word := range words {
+		switch word {
+		case "apotheke":
+			words[i] = "pharmacy"
+		case "tankstelle":
+			words[i] = "fuel"
+		case "krankenhaus":
+			words[i] = "hospital"
+		case "supermarkt":
+			words[i] = "supermarket"
+		case "feuerwehr":
+			// fire_station is stored as two normalized terms.
+			words[i] = "fire"
+			words = append(words, "station")
+		}
 	}
-	words := strings.Fields(query)
+	return words
+}
+
+func (s *searchReader) search(ctx context.Context, query string, limit int) ([]SearchResult, error) {
+	words := searchQueryWords(query)
 	if len(words) == 0 {
 		return []SearchResult{}, nil
 	}
@@ -767,8 +792,10 @@ func (s *searchReader) search(ctx context.Context, query string, limit int) ([]S
 			key = word
 		}
 	}
+	// Postings retain only the leading bytes of long terms. Use that prefix
+	// to find candidates, then validate every complete query word below.
 	if len(key) > searchKeyBytes {
-		return []SearchResult{}, nil
+		key = key[:searchKeyBytes]
 	}
 	scratch := searchScratchPool.Get().(*searchScratch)
 	defer searchScratchPool.Put(scratch)
@@ -796,6 +823,11 @@ func (s *searchReader) search(ctx context.Context, query string, limit int) ([]S
 		if !bytes.HasPrefix(term, keyBytes) {
 			return out, nil
 		}
+		// A record may be reached through several prefix terms. Check before
+		// reading/decompressing it again, including previously decoded misses.
+		if seen[offset] {
+			continue
+		}
 		b, err := records.read(offset, length)
 		if err != nil {
 			return nil, err
@@ -813,9 +845,6 @@ func (s *searchReader) search(ctx context.Context, query string, limit int) ([]S
 			}
 		}
 		if !matches {
-			continue
-		}
-		if seen[offset] {
 			continue
 		}
 		seen[offset] = true

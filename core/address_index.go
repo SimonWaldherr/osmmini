@@ -137,6 +137,40 @@ func (f normalizedAddressFields) score(q normalizedAddressQuery) int {
 	return score
 }
 
+// A high suggestion score is insufficient for automatic routing: a different
+// house on the requested street, or the same number in another town, must not
+// silently become the destination. Exact POI and street names remain usable
+// when a number in the name was tentatively parsed as a house number.
+func (f normalizedAddressFields) destinationScore(q normalizedAddressQuery) int {
+	if q.guessed && q.raw != "" && (f.name == q.raw || f.brand == q.raw || f.operator == q.raw || f.street == q.raw) {
+		return f.score(q)
+	}
+	if q.postcode != "" && f.postcode != q.postcode || q.city != "" && f.city != q.city && f.place != q.city {
+		return 0
+	}
+	if q.housenumber != "" {
+		if f.house != q.housenumber {
+			return 0
+		}
+		if q.street != "" && f.street != q.street && f.name != q.street && f.brand != q.street && f.operator != q.street {
+			return 0
+		}
+	}
+	if q.street != "" && q.housenumber == "" {
+		// A matching city/postcode cannot make an unrelated street or POI
+		// a valid destination on its own.
+		if f.score(normalizedAddressQuery{street: q.street}) == 0 {
+			return 0
+		}
+	}
+	score := f.score(q)
+	// Matching only a house number is never enough to choose a destination.
+	if q.housenumber != "" && score <= 4 {
+		return 0
+	}
+	return score
+}
+
 // NewAddressIndex snapshots entry metadata and prepares each nonempty search
 // field once. Search result tags refer to the supplied catalog's read-only maps.
 func NewAddressIndex(entries []AddressEntry) *AddressIndex {
@@ -196,22 +230,19 @@ func (x *AddressIndex) Search(q AddressQuery, limit int) []AddressEntry {
 	return searchAddressEntries(x.entries, normalizeAddressQuery(q), limit, func(i int, q normalizedAddressQuery) int { return x.fields(i).score(q) })
 }
 
-// FindBest applies the same house-number safeguards as FindBestAddress.
+// FindBest applies the same destination safeguards as FindBestAddress.
 func (x *AddressIndex) FindBest(q AddressQuery) (AddressEntry, bool) {
 	if x == nil {
 		return AddressEntry{}, false
 	}
 	query := normalizeAddressQuery(q)
 	var best AddressEntry
-	bestScore := -1
+	bestScore := 0
 	for i, entry := range x.entries {
-		score := x.fields(i).score(query)
-		if score > bestScore {
+		score := x.fields(i).destinationScore(query)
+		if score > bestScore || score > 0 && score == bestScore && entry.ID < best.ID {
 			best, bestScore = entry, score
 		}
 	}
-	if bestScore <= 0 || query.housenumber != "" && bestScore <= 4 {
-		return AddressEntry{}, false
-	}
-	return best, true
+	return best, bestScore > 0
 }

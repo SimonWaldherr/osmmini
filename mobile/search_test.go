@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -17,6 +18,8 @@ func TestSearchNormalization(t *testing.T) {
 		"ÄÖÜẞ ÉCOLE":                             "aouss ecole",
 		"αθήνα 東京 ٢٣":                            "αθήνα 東京 ٢٣",
 		"--___\n":                                "",
+		"Mu\u0308nchen Hauptstraße":              "munchen hauptstrasse",
+		"Cafe\u0301 Mueller":                     "cafe mueller",
 		"a  b":                                   "a b",
 		"a\x00b":                                 "a b",
 	}
@@ -116,6 +119,72 @@ func TestDiskSearchRejectsInvalidRecordBounds(t *testing.T) {
 		s.close()
 		if err == nil {
 			t.Fatalf("accepted invalid record offset %d", offset)
+		}
+	}
+}
+
+func TestDiskSearchCategoryAliasesWithLocalities(t *testing.T) {
+	path := writeSearchCatalog(t, []SearchResult{
+		{ID: 1, Label: "Sonnen-Apotheke", Category: "pharmacy", Text: "München"},
+		{ID: 2, Label: "Süd", Category: "fuel", Text: "München"},
+		{ID: 3, Label: "Klinikum", Category: "hospital", Text: "München"},
+		{ID: 4, Label: "Markt", Category: "supermarket", Text: "München"},
+		{ID: 5, Label: "Wache", Category: "fire_station", Text: "München"},
+		{ID: 6, Label: "Sonnen-Apotheke", Category: "pharmacy", Text: "Berlin"},
+		{ID: 7, Label: "Apothekenstraße", Category: "street", Text: "München"},
+	})
+	compact := compactSearchCatalog(t, path)
+	for _, scenario := range []struct{ name, path string }{{"legacy", path}, {"compact", compact}, {"compressed", compressedSearchCatalog(t, compact)}} {
+		t.Run(scenario.name, func(t *testing.T) {
+			reader, err := openSearch(scenario.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reader.close()
+			for _, tc := range []struct {
+				query string
+				id    int64
+			}{
+				{"Apotheke München", 1}, {"Apotheke Mu\u0308nchen", 1}, {"München Apotheke", 1},
+				{"München Tankstelle", 2}, {"Krankenhaus München", 3},
+				{"Supermarkt München", 4}, {"München Feuerwehr", 5},
+				{"Feuerwehr Feuerwehr München", 5}, {"Apothekenstraße München", 7},
+			} {
+				got, err := reader.search(t.Context(), tc.query, 20)
+				if err != nil || len(got) != 1 || got[0].ID != tc.id {
+					t.Errorf("%q: %+v, %v", tc.query, got, err)
+				}
+			}
+		})
+	}
+}
+
+func TestDiskSearchLongTermsVerifyFullQuery(t *testing.T) {
+	// The second prefix ends inside a three-byte rune at the byte limit.
+	for _, prefix := range []string{strings.Repeat("a", searchKeyBytes), "a" + strings.Repeat("東", 32)} {
+		path := writeSearchCatalog(t, []SearchResult{
+			{ID: 1, Label: prefix + "alpha"},
+			{ID: 2, Label: prefix + "beta"},
+		})
+		compact := compactSearchCatalog(t, path)
+		for _, scenario := range []struct{ name, path string }{{"legacy", path}, {"compact", compact}, {"compressed", compressedSearchCatalog(t, compact)}} {
+			t.Run(scenario.name+"/"+prefix, func(t *testing.T) {
+				reader, err := openSearch(scenario.path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer reader.close()
+				for _, tc := range []struct {
+					suffix string
+					count  int
+					id     int64
+				}{{"", 2, 1}, {"alp", 1, 1}, {"beta", 1, 2}, {"missing", 0, 0}} {
+					got, err := reader.search(t.Context(), prefix+tc.suffix, 20)
+					if err != nil || len(got) != tc.count || len(got) > 0 && got[0].ID != tc.id {
+						t.Errorf("suffix %q: %+v, %v", tc.suffix, got, err)
+					}
+				}
+			})
 		}
 	}
 }

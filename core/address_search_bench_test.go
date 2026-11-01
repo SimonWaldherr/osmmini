@@ -30,9 +30,13 @@ func BenchmarkSearchAddressesTopK(b *testing.B) {
 
 func TestNormalizePreservesGermanSearchEquivalence(t *testing.T) {
 	tests := map[string]string{
-		"Hauptstraße 5": "hauptstrasse5",
-		"KÖLN-NORD":     "koelnnord",
-		"alreadyclean":  "alreadyclean",
+		"Hauptstraße 5":      "hauptstrasse5",
+		"KÖLN-NORD":          "koelnnord",
+		"Mu\u0308nchen":      "muenchen",
+		"alreadyclean":       "alreadyclean",
+		"Bad\tGriesbach":     "badgriesbach",
+		"Bad\u00a0Griesbach": "badgriesbach",
+		" Bad\nGriesbach\r ": "badgriesbach",
 	}
 	for input, want := range tests {
 		if got := normalize(input); got != want {

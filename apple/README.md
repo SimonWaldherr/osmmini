@@ -58,6 +58,12 @@ adjacent **…** menu also offers a map point or your location. **Kürzeste** an
 use a menu. If a search finds no places, **Andere Offline-Karte öffnen** returns
 to the region list.
 
+Search accepts category and locality together, such as `Apotheke München`,
+`Tankstelle Passau` or `Feuerwehr Landshut`. These aliases also work with existing
+regions, provided the chosen import profile includes the category. Composed and
+decomposed accents in queries are equivalent; a missing address or POI in the
+source data cannot be resolved offline.
+
 Each source has its own cached catalog, available offline after loading. The
 OpenStreetMap France catalog uses the polygon list from its
 [official extract repository](https://github.com/osm-fr/osm-extract-replication)
