@@ -1873,6 +1873,12 @@ type routeTransition struct {
 	turnDirections  bool
 	bearings        *routeBearingCache[int64]
 	currentID       int64
+	// Most turns are classified by fast without trigonometry. The exact
+	// incoming bearing is computed only when fast declines (near a threshold).
+	fast          fastTurn
+	previous      Coord
+	previousID    int64
+	incomingReady bool
 }
 
 func (eval *routeEvaluator) prepareTransition(r *Router, prev, cur int64) routeTransition {
@@ -1894,14 +1900,25 @@ func (eval *routeEvaluator) prepareCachedTransition(r *Router, prev, cur int64, 
 	c, ok2 := r.g.coord(cur)
 	if ok1 && ok2 {
 		transition.current = c
-		if bearings != nil {
-			transition.incomingBearing = bearings.bearing(prev, cur, p, c)
-		} else {
-			transition.incomingBearing = bearingDeg(p.Lat, p.Lon, c.Lat, c.Lon)
-		}
+		transition.previous, transition.previousID = p, prev
+		transition.fast = newFastTurn(p, c)
 		transition.turnDirections = true
 	}
 	return transition
+}
+
+// exactIncomingBearing computes the reference bearing on first use.
+func (transition *routeTransition) exactIncomingBearing() float64 {
+	if !transition.incomingReady {
+		p, c := transition.previous, transition.current
+		if transition.bearings != nil {
+			transition.incomingBearing = transition.bearings.bearing(transition.previousID, transition.currentID, p, c)
+		} else {
+			transition.incomingBearing = bearingDeg(p.Lat, p.Lon, c.Lat, c.Lon)
+		}
+		transition.incomingReady = true
+	}
+	return transition.incomingBearing
 }
 
 func (transition *routeTransition) penalty(r *Router, next int64) float64 {
@@ -1912,6 +1929,9 @@ func (transition *routeTransition) penalty(r *Router, next int64) float64 {
 	n, ok := r.g.coord(next)
 	if !ok {
 		return pen
+	}
+	if kind, decided := transition.fast.classify(n); decided {
+		return transition.penaltyKind(kind)
 	}
 	if transition.bearings != nil {
 		outgoing := transition.bearings.bearing(transition.currentID, next, transition.current, n)
@@ -1927,9 +1947,13 @@ func (transition *routeTransition) penaltyCoordinate(n Coord) float64 {
 }
 
 func (transition *routeTransition) penaltyBearing(outgoing float64) float64 {
+	return transition.penaltyKind(turnKindForBearings(transition.exactIncomingBearing(), outgoing))
+}
+
+func (transition *routeTransition) penaltyKind(kind turnKind) float64 {
 	pen := transition.crossing
 	w := transition.weights
-	switch turnKindForBearings(transition.incomingBearing, outgoing) {
+	switch kind {
 	case turnLeft:
 		if w.NoLeftTurn {
 			pen += noLeftTurnPenalty

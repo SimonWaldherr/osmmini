@@ -78,14 +78,14 @@ func (r *Router) indexTurnSearch(ctx context.Context, from, to int64, opt RouteO
 			return path, current.dist, nil
 		}
 		transition := routeTransition{weights: &eval.options.Weights}
+		var previousCoord Coord
 		if previous != zeroNode {
 			if _, count := d.edgeRange(int(node)); eval.crossingPenalty > 0 && count > 2 {
 				transition.crossing = eval.crossingPenalty
 			}
 			if eval.turnDirections {
-				p, c := d.coordAt(int(previous)), d.coordAt(int(node))
-				transition.current = c
-				transition.incomingBearing = bearings.bearing(previous, node, p, c)
+				previousCoord, transition.current = d.coordAt(int(previous)), d.coordAt(int(node))
+				transition.fast = newFastTurn(previousCoord, transition.current)
 				transition.turnDirections = true
 			}
 		}
@@ -97,8 +97,17 @@ func (r *Router) indexTurnSearch(ctx context.Context, from, to int64, opt RouteO
 			}
 			penalty := transition.crossing
 			if transition.turnDirections {
-				outgoing := bearings.bearing(node, next, transition.current, d.coordAt(int(next)))
-				penalty = transition.penaltyBearing(outgoing)
+				nextCoord := d.coordAt(int(next))
+				kind, decided := transition.fast.classify(nextCoord)
+				if !decided {
+					if !transition.incomingReady {
+						transition.incomingBearing = bearings.bearing(previous, node, previousCoord, transition.current)
+						transition.incomingReady = true
+					}
+					outgoing := bearings.bearing(node, next, transition.current, nextCoord)
+					kind = turnKindForBearings(transition.incomingBearing, outgoing)
+				}
+				penalty = transition.penaltyKind(kind)
 			}
 			cost := current.dist + base + penalty
 			state := uint64(node)<<32 | uint64(next)
