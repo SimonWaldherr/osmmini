@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/bits"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -360,7 +361,7 @@ func (s *server) tspGreedy(ctx context.Context, startNode, endNode int64, stops 
 
 	// 2-opt improvement: try swapping segments to find shorter tours
 	if n >= 4 {
-		order = tsp2optCosts(ctx, startNode, endNode, stops, pre, order, cost)
+		order = tsp2optSearch(ctx, startNode, endNode, stops, pre, order, cost, true)
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -374,14 +375,30 @@ func (s *server) tspGreedy(ctx context.Context, startNode, endNode int64, stops 
 // while respecting dependency constraints. Route costs are cached to avoid
 // redundant pathfinding computations.
 func (s *server) tsp2opt(ctx context.Context, startNode, endNode int64, stops []stopR, pre []uint64, opt osmmini.RouteOptions, order []int) []int {
-	return tsp2optCosts(ctx, startNode, endNode, stops, pre, order, s.tripCosts(ctx, opt))
+	return tsp2optSearch(ctx, startNode, endNode, stops, pre, order, s.tripCosts(ctx, opt), true)
 }
 
+// tsp2optCosts evaluates moves with a caller-supplied cost function strictly
+// sequentially, so the function need not be safe for concurrent use.
 func tsp2optCosts(ctx context.Context, startNode, endNode int64, stops []stopR, pre []uint64, order []int, cost func(int64, int64) (float64, error)) []int {
+	return tsp2optSearch(ctx, startNode, endNode, stops, pre, order, cost, false)
+}
+
+type tripLeg struct{ from, to int64 }
+
+// tsp2optSearch is the 2-opt local search. With prefetch set, cost must be safe
+// for concurrent use (see tripCosts): before each row of candidate moves the
+// legs that row will price are searched in parallel, so the sequential move
+// evaluation below only finds cache hits. Prefetching never changes which moves
+// are evaluated or accepted, only when each (deterministic) cost is computed.
+func tsp2optSearch(ctx context.Context, startNode, endNode int64, stops []stopR, pre []uint64, order []int, cost func(int64, int64) (float64, error), prefetch bool) []int {
 	n := len(order)
 	if n < 4 {
 		return order
 	}
+	// Prefetching prices somewhat more legs than the lazy search needs. That
+	// only pays off when they run concurrently.
+	prefetch = prefetch && min(runtime.GOMAXPROCS(0), maxTripRouteWorkers) > 1
 
 	cachedCost := func(from, to int64) float64 {
 		c, err := cost(from, to)
@@ -418,10 +435,66 @@ func tsp2optCosts(ctx context.Context, startNode, endNode int64, stops []stopR, 
 	}
 	bestCost := tourCost()
 
+	// warmRow prices, in parallel, every leg the moves (l, r) for r >= first
+	// will need under the current tour: the tour edges, the two new joins and the
+	// reversed interior edges, up to the first prerequisite conflict. A leg is
+	// requested once; an accepted move changes the tour and re-warms the rest of
+	// its row. Any leg missed here is still priced lazily below.
+	warmed := map[tripLeg]struct{}{}
+	var pending []tripLeg
+	warmRow := func(l, first int) {
+		if !prefetch {
+			return
+		}
+		segment := uint64(0)
+		for k := l; k < first; k++ {
+			segment |= 1 << uint(order[k])
+		}
+		last := first - 1
+		for r := first; r < n; r++ {
+			if pre[order[r]]&segment != 0 {
+				break
+			}
+			segment |= 1 << uint(order[r])
+			last = r
+		}
+		if last < first {
+			return
+		}
+		pending = pending[:0]
+		add := func(from, to int64) {
+			leg := tripLeg{from, to}
+			if _, done := warmed[leg]; !done {
+				warmed[leg] = struct{}{}
+				pending = append(pending, leg)
+			}
+		}
+		for k := l; k <= last+1; k++ {
+			add(nodes[k], nodes[k+1])
+		}
+		for r := first; r <= last; r++ {
+			add(nodes[l], nodes[r+1])
+			add(nodes[l+1], nodes[r+2])
+		}
+		for k := l + 1; k <= last; k++ {
+			add(nodes[k+1], nodes[k])
+		}
+		// One leg is not worth a worker handoff.
+		if len(pending) < 2 {
+			return
+		}
+		legs := slices.Clone(pending)
+		_, _ = parallelMap(ctx, len(legs), func(i int) struct{} {
+			_, _ = cost(legs[i].from, legs[i].to)
+			return struct{}{}
+		})
+	}
+
 	const maxPasses = 64
 	for pass := 0; pass < maxPasses; pass++ {
 		improved := false
 		for l := 0; l < n-1; l++ {
+			warmRow(l, l+1)
 			segment := uint64(1) << uint(order[l])
 			for r := l + 1; r < n; r++ {
 				if ctx.Err() != nil {
@@ -452,6 +525,7 @@ func tsp2optCosts(ctx context.Context, startNode, endNode int64, stops []stopR, 
 				if candidateCost < bestCost && ctx.Err() == nil {
 					bestCost = candidateCost
 					improved = true
+					warmRow(l, r+1)
 				} else {
 					reverse(l, r)
 				}
