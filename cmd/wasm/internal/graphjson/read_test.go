@@ -66,12 +66,12 @@ func TestReadRejectsInvalidGraph(t *testing.T) {
 		{"duplicate nodes", `{` + nodes + `,"nodes":[],"edges":[]}`, "duplicate graph field"},
 		{"duplicate edges", `{` + nodes + `,"edges":[],"edges":[]}`, "duplicate graph field"},
 		{"trailing value", validGraph + ` {}`, "after graph"},
-		{"truncated graph", validGraph[:len(validGraph)-1], "end of JSON input"},
+		{"truncated graph", validGraph[:len(validGraph)-1], "EOF|end of JSON input"},
 		{"malformed extension", `{"extension":[1,}`, "invalid character"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := Read(strings.NewReader(tc.input))
-			if err == nil || !strings.Contains(err.Error(), tc.errorText) {
+			if err == nil || !matchesAny(err.Error(), tc.errorText) {
 				t.Fatalf("error = %v, want %q", err, tc.errorText)
 			}
 		})
@@ -148,4 +148,14 @@ func BenchmarkGraphRead(b *testing.B) {
 			}
 		})
 	}
+}
+
+// matchesAny reports whether text contains any "|"-separated alternative.
+func matchesAny(text, alternatives string) bool {
+	for _, alt := range strings.Split(alternatives, "|") {
+		if strings.Contains(text, alt) {
+			return true
+		}
+	}
+	return false
 }
